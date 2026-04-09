@@ -7,18 +7,52 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
 
 // 定义全局版本号变量（默认值设为 dev，编译时会被覆盖）
 var Version = "dev"
+
+// 全局 Zap Logger 实例，默认赋予一个空操作 Logger 以防空指针
+var zlog *zap.SugaredLogger = zap.NewNop().Sugar()
+
+// initLogger 初始化全局 Zap Logger
+func initLogger(levelStr string) {
+	var level zapcore.Level
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		level = zapcore.DebugLevel
+	case "info":
+		level = zapcore.InfoLevel
+	case "warn":
+		level = zapcore.WarnLevel
+	case "error":
+		level = zapcore.ErrorLevel
+	default:
+		level = zapcore.InfoLevel
+	}
+
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder // 终端带颜色的级别输出
+
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(encoderConfig),
+		zapcore.AddSync(os.Stdout),
+		level,
+	)
+
+	logger := zap.New(core)
+	zlog = logger.Sugar()
+}
 
 // ==========================================
 // gRPC 数据帧封装器 (核心黑科技)
@@ -112,8 +146,11 @@ func runServer(args []string) {
 	tlsKey := serverCmd.String("key", "", "TLS 私钥文件路径")
 	path := serverCmd.String("path", "/tunnel", "代理路径，需与客户端一致")
 	allowLocal := serverCmd.Bool("local-only", true, "安全选项：是否只允许转发到服务端的 127.0.0.1 (强烈建议开启)")
+	logLevel := serverCmd.String("loglevel", "info", "日志等级: debug, info, warn, error")
 
 	serverCmd.Parse(args)
+	initLogger(*logLevel)
+	defer zlog.Sync()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(*path, func(w http.ResponseWriter, r *http.Request) {
@@ -125,17 +162,21 @@ func runServer(args []string) {
 			Addr:    *listenAddr,
 			Handler: mux,
 		}
-		log.Printf("[H2 Server] 🟢 启动标准 HTTP/2 隧道 (TLS 加密), 监听: %s, 路径: %s\n", *listenAddr, *path)
-		log.Fatal(server.ListenAndServeTLS(*tlsCert, *tlsKey))
+		zlog.Infof("[H2 Server] 🟢 启动标准 HTTP/2 隧道 (TLS 加密), 监听: %s, 路径: %s", *listenAddr, *path)
+		if err := server.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
+			zlog.Fatalf("启动失败: %v", err)
+		}
 	} else {
 		h2s := &http2.Server{}
 		server := &http.Server{
 			Addr:    *listenAddr,
 			Handler: h2c.NewHandler(mux, h2s),
 		}
-		log.Printf("[H2C Server] 🟡 启动明文 HTTP/2 隧道 (无加密), 监听: %s, 路径: %s\n", *listenAddr, *path)
-		log.Printf("[H2C Server] ⚠️ 警告：明文传输通常仅用于配合 Nginx 等前置反代使用\n")
-		log.Fatal(server.ListenAndServe())
+		zlog.Infof("[H2C Server] 🟡 启动明文 HTTP/2 隧道 (无加密), 监听: %s, 路径: %s", *listenAddr, *path)
+		zlog.Warnf("[H2C Server] ⚠️ 警告：明文传输通常仅用于配合 Nginx 等前置反代使用")
+		if err := server.ListenAndServe(); err != nil {
+			zlog.Fatalf("启动失败: %v", err)
+		}
 	}
 }
 
@@ -154,7 +195,7 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 
 	// 安全限制
 	if allowLocal && !strings.HasPrefix(target, "127.0.0.1:") && !strings.HasPrefix(target, "localhost:") {
-		log.Printf("[Reject] 拒绝连接到非本地目标: %s\n", target)
+		zlog.Warnf("[Reject] 拒绝连接到非本地目标: %s", target)
 		http.Error(w, "Target forbidden", http.StatusForbidden)
 		return
 	}
@@ -169,11 +210,11 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 		w.Header().Add("Trailer", "Grpc-Message")
 	}
 
-	log.Printf("[Connect] 收到 %s 隧道请求 -> 目标: %s\n", protoName, target)
+	zlog.Infof("[Connect] 收到 %s 隧道请求 -> 目标: %s", protoName, target)
 
 	targetConn, err := net.Dial("tcp", target)
 	if err != nil {
-		log.Printf("[Error] 拨号目标 %s 失败: %v\n", target, err)
+		zlog.Errorf("[Error] 拨号目标 %s 失败: %v", target, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
@@ -181,7 +222,7 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		log.Println("[Error] 客户端/中间件不支持 HTTP 流式传输")
+		zlog.Error("[Error] 客户端/中间件不支持 HTTP 流式传输")
 		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 		return
 	}
@@ -233,7 +274,7 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 		w.Header().Set("Grpc-Message", "OK")
 	}
 
-	log.Printf("[Disconnect] %s 隧道已释放 -> 目标: %s\n", protoName, target)
+	zlog.Infof("[Disconnect] %s 隧道已释放 -> 目标: %s", protoName, target)
 }
 
 // ==========================================
@@ -247,11 +288,12 @@ func runClient(args []string) {
 	targetAddr := clientCmd.String("target", "127.0.0.1:22", "要求远端服务器代理访问的最终目标 TCP 地址")
 	insecure := clientCmd.Bool("insecure", true, "是否跳过 TLS 证书校验 (适用于自签证书)")
 	customHost := clientCmd.String("host", "", "自定义伪装的 SNI / Host 域名 (用于突破 CDN 或前置反代)")
-	
-	// 🌟 新增：gRPC 模式开关
 	useGRPC := clientCmd.Bool("grpc", false, "开启 gRPC 协议伪装 (适用于严格审查的 CDN 或 nginx grpc_pass)")
+	logLevel := clientCmd.String("loglevel", "info", "日志等级: debug, info, warn, error")
 
 	clientCmd.Parse(args)
+	initLogger(*logLevel)
+	defer zlog.Sync()
 
 	reqUrl := strings.TrimRight(*serverUrl, "/") + *path
 	isHTTPS := strings.HasPrefix(reqUrl, "https://")
@@ -276,24 +318,24 @@ func runClient(args []string) {
 
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
-		log.Fatalf("[Client Error] 无法监听本地端口 %s: %v\n", *listenAddr, err)
+		zlog.Fatalf("[Client Error] 无法监听本地端口 %s: %v", *listenAddr, err)
 	}
 	defer listener.Close()
 
-	log.Printf("[Client] 🚀 客户端已启动，监听本地: %s\n", *listenAddr)
-	log.Printf("[Client] 🔗 隧道目标: %s\n", reqUrl)
-	log.Printf("[Client] 🎯 最终目标: %s\n", *targetAddr)
+	zlog.Infof("[Client] 🚀 客户端已启动，监听本地: %s", *listenAddr)
+	zlog.Infof("[Client] 🔗 隧道目标: %s", reqUrl)
+	zlog.Infof("[Client] 🎯 最终目标: %s", *targetAddr)
 	if *customHost != "" {
-		log.Printf("[Client] 🎭 伪装 Host/SNI: %s\n", *customHost)
+		zlog.Infof("[Client] 🎭 伪装 Host/SNI: %s", *customHost)
 	}
 	if *useGRPC {
-		log.Printf("[Client] 🧬 已启用 gRPC 模式伪装\n")
+		zlog.Infof("[Client] 🧬 已启用 gRPC 模式伪装")
 	}
 
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("[Client Error] 接收连接失败: %v\n", err)
+			zlog.Errorf("[Client Error] 接收连接失败: %v", err)
 			continue
 		}
 		go handleClientConn(localConn, httpClient, reqUrl, *targetAddr, *customHost, *useGRPC)
@@ -302,7 +344,8 @@ func runClient(args []string) {
 
 func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string, target string, customHost string, useGRPC bool) {
 	defer localConn.Close()
-	log.Printf("[Client] 🟢 接收到本地连接，正在打通隧道...\n")
+	// 使用 Debug 级别，防止大流量下终端刷屏
+	zlog.Debugf("[Client] 🟢 接收到本地连接，正在打通隧道...")
 
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -310,7 +353,7 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 
 	req, err := http.NewRequestWithContext(ctx, "POST", reqUrl, pr)
 	if err != nil {
-		log.Printf("[Client Error] 创建请求失败: %v\n", err)
+		zlog.Errorf("[Client Error] 创建请求失败: %v", err)
 		return
 	}
 
@@ -336,22 +379,22 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 	// 上行：Local TCP -> Request
 	go func() {
 		io.Copy(writer, localConn)
-		pw.Close() 
+		pw.Close()
 	}()
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("[Client Error] 隧道请求失败: %v\n", err)
+		zlog.Errorf("[Client Error] 隧道请求失败: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[Client Error] 服务端拒绝连接, 状态码: %d\n", resp.StatusCode)
+		zlog.Errorf("[Client Error] 服务端拒绝连接, 状态码: %d", resp.StatusCode)
 		return
 	}
 
-	log.Printf("[Client] ✅ 隧道已建立，开始传输数据\n")
+	zlog.Infof("[Client] ✅ 隧道已建立，开始传输数据")
 
 	var reader io.Reader = resp.Body
 	// 🌟 如果是 gRPC 协议，套上解包器
@@ -361,5 +404,5 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 
 	// 下行：Response -> Local TCP
 	io.Copy(localConn, reader)
-	log.Printf("[Client] 🔴 隧道连接已断开\n")
+	zlog.Debugf("[Client] 🔴 隧道连接已断开")
 }
