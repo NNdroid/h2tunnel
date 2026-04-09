@@ -161,7 +161,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # 启动命令 (使用动态读取的隧道路径)
-ExecStart=$BIN_PATH server -listen 0.0.0.0:443 -cert $CONF_DIR/server.crt -key $CONF_DIR/server.key -path $TUNNEL_PATH -local-only
+ExecStart=$BIN_PATH server -listen 0.0.0.0:443 -cert $CONF_DIR/server.crt -key $CONF_DIR/server.key -path $TUNNEL_PATH -local-only -loglevel warn
 
 Restart=always
 RestartSec=5
