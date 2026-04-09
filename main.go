@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -19,14 +20,61 @@ import (
 // 定义全局版本号变量（默认值设为 dev，编译时会被覆盖）
 var Version = "dev"
 
+// ==========================================
+// gRPC 数据帧封装器 (核心黑科技)
+// ==========================================
+
+// grpcWriter 负责将普通 TCP 流量打包为 gRPC 数据帧
+type grpcWriter struct {
+	w io.Writer
+}
+
+func (g *grpcWriter) Write(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	// gRPC 帧头: 1 byte 压缩标志 (0) + 4 bytes 长度 (BigEndian)
+	buf := make([]byte, 5+len(p))
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(p)))
+	copy(buf[5:], p)
+
+	if _, err := g.w.Write(buf); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// grpcReader 负责从 gRPC 数据帧中解包出普通 TCP 流量
+type grpcReader struct {
+	r    io.Reader
+	left uint32
+}
+
+func (g *grpcReader) Read(p []byte) (n int, err error) {
+	for g.left == 0 {
+		var header [5]byte
+		if _, err := io.ReadFull(g.r, header[:]); err != nil {
+			return 0, err
+		}
+		g.left = binary.BigEndian.Uint32(header[1:5])
+	}
+
+	toRead := uint32(len(p))
+	if toRead > g.left {
+		toRead = g.left
+	}
+
+	n, err = g.r.Read(p[:toRead])
+	g.left -= uint32(n)
+	return n, err
+}
+
 func main() {
-	// 确保用户输入了子命令
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	// 根据子命令分发逻辑
 	switch os.Args[1] {
 	case "server":
 		runServer(os.Args[2:])
@@ -111,7 +159,17 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 		return
 	}
 
-	log.Printf("[Connect] 收到隧道请求 -> 目标: %s\n", target)
+	// 🌟 核心：检测是否为 gRPC 流量
+	isGRPC := r.Header.Get("Content-Type") == "application/grpc"
+	protoName := "HTTP/2"
+	if isGRPC {
+		protoName = "gRPC"
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Add("Trailer", "Grpc-Status")
+		w.Header().Add("Trailer", "Grpc-Message")
+	}
+
+	log.Printf("[Connect] 收到 %s 隧道请求 -> 目标: %s\n", protoName, target)
 
 	targetConn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -131,14 +189,24 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	var writer io.Writer = w
+	var reader io.Reader = r.Body
+
+	// 🌟 如果是 gRPC 协议，套上封包解包器
+	if isGRPC {
+		writer = &grpcWriter{w: w}
+		reader = &grpcReader{r: r.Body}
+	}
+
 	errChan := make(chan error, 2)
 
+	// 下行：TCP -> Response
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := targetConn.Read(buf)
 			if n > 0 {
-				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				if _, writeErr := writer.Write(buf[:n]); writeErr != nil {
 					errChan <- writeErr
 					return
 				}
@@ -151,14 +219,23 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 		}
 	}()
 
+	// 上行：Request -> TCP
 	go func() {
-		_, err := io.Copy(targetConn, r.Body)
+		_, err := io.Copy(targetConn, reader)
 		errChan <- err
 	}()
 
 	<-errChan
-	log.Printf("[Disconnect] 隧道已释放 -> 目标: %s\n", target)
+
+	// gRPC 规范：流结束时必须追加 Trailer
+	if isGRPC {
+		w.Header().Set("Grpc-Status", "0")
+		w.Header().Set("Grpc-Message", "OK")
+	}
+
+	log.Printf("[Disconnect] %s 隧道已释放 -> 目标: %s\n", protoName, target)
 }
+
 // ==========================================
 // 客户端逻辑 (Client)
 // ==========================================
@@ -169,23 +246,21 @@ func runClient(args []string) {
 	path := clientCmd.String("path", "/tunnel", "请求路径，需与服务端一致")
 	targetAddr := clientCmd.String("target", "127.0.0.1:22", "要求远端服务器代理访问的最终目标 TCP 地址")
 	insecure := clientCmd.Bool("insecure", true, "是否跳过 TLS 证书校验 (适用于自签证书)")
-	
-	// 🌟 新增：支持自定义 SNI 和 Host
 	customHost := clientCmd.String("host", "", "自定义伪装的 SNI / Host 域名 (用于突破 CDN 或前置反代)")
+	
+	// 🌟 新增：gRPC 模式开关
+	useGRPC := clientCmd.Bool("grpc", false, "开启 gRPC 协议伪装 (适用于严格审查的 CDN 或 nginx grpc_pass)")
 
 	clientCmd.Parse(args)
 
-	// 处理完整的请求 URL
 	reqUrl := strings.TrimRight(*serverUrl, "/") + *path
 	isHTTPS := strings.HasPrefix(reqUrl, "https://")
 
-	// 定制 HTTP/2 Transport
 	transport := &http2.Transport{}
 	if isHTTPS {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: *insecure,
 		}
-		// 🌟 核心：如果在命令行指定了 host，则覆盖 TLS 握手时的 SNI
 		if *customHost != "" {
 			tlsConfig.ServerName = *customHost
 		}
@@ -199,7 +274,6 @@ func runClient(args []string) {
 
 	httpClient := &http.Client{Transport: transport}
 
-	// 启动本地 TCP 监听
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("[Client Error] 无法监听本地端口 %s: %v\n", *listenAddr, err)
@@ -212,6 +286,9 @@ func runClient(args []string) {
 	if *customHost != "" {
 		log.Printf("[Client] 🎭 伪装 Host/SNI: %s\n", *customHost)
 	}
+	if *useGRPC {
+		log.Printf("[Client] 🧬 已启用 gRPC 模式伪装\n")
+	}
 
 	for {
 		localConn, err := listener.Accept()
@@ -219,11 +296,11 @@ func runClient(args []string) {
 			log.Printf("[Client Error] 接收连接失败: %v\n", err)
 			continue
 		}
-		go handleClientConn(localConn, httpClient, reqUrl, *targetAddr, *customHost)
+		go handleClientConn(localConn, httpClient, reqUrl, *targetAddr, *customHost, *useGRPC)
 	}
 }
 
-func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string, target string, customHost string) {
+func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string, target string, customHost string, useGRPC bool) {
 	defer localConn.Close()
 	log.Printf("[Client] 🟢 接收到本地连接，正在打通隧道...\n")
 
@@ -237,22 +314,31 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 		return
 	}
 
-	// 🌟 核心：强制修改 HTTP/2 请求的 Host 头部
 	if customHost != "" {
 		req.Host = customHost
 	}
 
-	// 设定伪装 UA，并传递目标路由信息
+	// 🌟 核心：为 gRPC 设置专属 Header
+	if useGRPC {
+		req.Header.Set("Content-Type", "application/grpc")
+		req.Header.Set("TE", "trailers")
+	}
+
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 	req.Header.Set("X-Target", target)
 
-	// 上行链路：Local TCP -> Pipe -> HTTP Request Body
+	var writer io.Writer = pw
+	// 🌟 如果是 gRPC 协议，套上封包器
+	if useGRPC {
+		writer = &grpcWriter{w: pw}
+	}
+
+	// 上行：Local TCP -> Request
 	go func() {
-		io.Copy(pw, localConn)
-		pw.Close() // TCP 端断开时，关闭 Pipe 写入端，通知服务端 EOF
+		io.Copy(writer, localConn)
+		pw.Close() 
 	}()
 
-	// 发起 HTTP/2 请求
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("[Client Error] 隧道请求失败: %v\n", err)
@@ -267,7 +353,13 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 
 	log.Printf("[Client] ✅ 隧道已建立，开始传输数据\n")
 
-	// 下行链路：HTTP Response Body -> Local TCP
-	io.Copy(localConn, resp.Body)
+	var reader io.Reader = resp.Body
+	// 🌟 如果是 gRPC 协议，套上解包器
+	if useGRPC {
+		reader = &grpcReader{r: resp.Body}
+	}
+
+	// 下行：Response -> Local TCP
+	io.Copy(localConn, reader)
 	log.Printf("[Client] 🔴 隧道连接已断开\n")
 }
