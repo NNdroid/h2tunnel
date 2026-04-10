@@ -11,23 +11,22 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/webtransport-go"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
 
-// 定义全局版本号变量（默认值设为 dev，编译时会被覆盖）
 var Version = "dev"
 
-// 全局 Zap Logger 实例，默认赋予一个空操作 Logger 以防空指针
 var zlog *zap.SugaredLogger = zap.NewNop().Sugar()
 
-// initLogger 初始化全局 Zap Logger
 func initLogger(levelStr string) {
 	var level zapcore.Level
 	switch strings.ToLower(levelStr) {
@@ -45,7 +44,7 @@ func initLogger(levelStr string) {
 
 	encoderConfig := zap.NewProductionEncoderConfig()
 	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder // 终端带颜色的级别输出
+	encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 
 	core := zapcore.NewCore(
 		zapcore.NewConsoleEncoder(encoderConfig),
@@ -58,10 +57,9 @@ func initLogger(levelStr string) {
 }
 
 // ==========================================
-// gRPC 数据帧封装器 (核心黑科技)
+// gRPC 数据帧封装器
 // ==========================================
 
-// grpcWriter 负责将普通 TCP 流量打包为 gRPC 数据帧
 type grpcWriter struct {
 	w io.Writer
 }
@@ -70,7 +68,6 @@ func (g *grpcWriter) Write(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	// gRPC 帧头: 1 byte 压缩标志 (0) + 4 bytes 长度 (BigEndian)
 	buf := make([]byte, 5+len(p))
 	binary.BigEndian.PutUint32(buf[1:5], uint32(len(p)))
 	copy(buf[5:], p)
@@ -81,7 +78,6 @@ func (g *grpcWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// grpcReader 负责从 gRPC 数据帧中解包出普通 TCP 流量
 type grpcReader struct {
 	r    io.Reader
 	left uint32
@@ -134,9 +130,6 @@ func printUsage() {
 	fmt.Println("  server    启动隧道服务端")
 	fmt.Println("  client    启动隧道客户端")
 	fmt.Println("  version   查看当前版本号")
-	fmt.Println("\n示例:")
-	fmt.Println("  h2tunnel server -h")
-	fmt.Println("  h2tunnel client -h")
 }
 
 // ==========================================
@@ -144,70 +137,67 @@ func printUsage() {
 // ==========================================
 func runServer(args []string) {
 	serverCmd := flag.NewFlagSet("server", flag.ExitOnError)
-	listenAddr := serverCmd.String("listen", ":8443", "服务端监听地址 (如 :8443 或 0.0.0.0:8443)")
-	tlsCert := serverCmd.String("cert", "", "TLS 证书文件路径 (为空则启动 h2c 明文模式)")
+	listenAddr := serverCmd.String("listen", ":8443", "服务端监听地址")
+	tlsCert := serverCmd.String("cert", "", "TLS 证书文件路径")
 	tlsKey := serverCmd.String("key", "", "TLS 私钥文件路径")
-	path := serverCmd.String("path", "/tunnel", "代理路径，需与客户端一致")
-	allowLocal := serverCmd.Bool("local-only", true, "安全选项：是否只允许转发到服务端的 127.0.0.1 (强烈建议开启)")
-	logLevel := serverCmd.String("loglevel", "info", "日志等级: debug, info, warn, error")
-	enableH3 := serverCmd.Bool("h3", false, "是否在相同端口同时开启 HTTP/3 (UDP/QUIC) 监听 (必须配置证书)")
+	path := serverCmd.String("path", "/tunnel", "代理路径")
+	allowLocal := serverCmd.Bool("local-only", true, "是否只允许转发到本地")
+	logLevel := serverCmd.String("loglevel", "info", "日志等级")
+	enableH3 := serverCmd.Bool("h3", false, "是否在相同端口开启 HTTP/3 与 WebTransport (必须配置证书)")
 
 	serverCmd.Parse(args)
 	initLogger(*logLevel)
 	defer zlog.Sync()
 
 	mux := http.NewServeMux()
+
+	var wtServer *webtransport.Server
+	if *enableH3 {
+		if *tlsCert == "" || *tlsKey == "" {
+			zlog.Fatalf("[Error] 开启 H3/WT 必须提供 TLS 证书")
+		}
+		wtServer = &webtransport.Server{
+			H3: &http3.Server{
+				Addr:    *listenAddr,
+				Handler: mux,
+			},
+			CheckOrigin: func(r *http.Request) bool { return true },
+		}
+		go func() {
+			zlog.Infof("[H3/WT Server] 🚀 启动 HTTP/3 & WebTransport (UDP), 监听: %s, 路径: %s", *listenAddr, *path)
+			if err := wtServer.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
+				zlog.Fatalf("H3/WT 启动失败: %v", err)
+			}
+		}()
+	}
+
 	mux.HandleFunc(*path, func(w http.ResponseWriter, r *http.Request) {
-		tunnelHandler(w, r, *allowLocal)
+		tunnelHandler(w, r, *allowLocal, wtServer)
 	})
 
 	if *tlsCert != "" && *tlsKey != "" {
-		// 🌟 如果开启了 H3，在后台 Goroutine 启动 HTTP/3 监听
-		if *enableH3 {
-			go func() {
-				h3Server := &http3.Server{
-					Addr:    *listenAddr,
-					Handler: mux,
-				}
-				zlog.Infof("[H3 Server] 🚀 启动 HTTP/3 隧道 (UDP/QUIC), 监听: %s, 路径: %s", *listenAddr, *path)
-				if err := h3Server.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
-					zlog.Fatalf("HTTP/3 启动失败: %v", err)
-				}
-			}()
-		}
-
 		server := &http.Server{
 			Addr:    *listenAddr,
 			Handler: mux,
 		}
-		zlog.Infof("[H2 Server] 🟢 启动标准 HTTP/2 隧道 (TLS/TCP), 监听: %s, 路径: %s", *listenAddr, *path)
+		zlog.Infof("[H2 Server] 🟢 启动标准 HTTP/2 隧道 (TCP), 监听: %s, 路径: %s", *listenAddr, *path)
 		if err := server.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
 			zlog.Fatalf("启动失败: %v", err)
 		}
 	} else {
-		if *enableH3 {
-			zlog.Fatalf("[Error] 开启 HTTP/3 必须提供 TLS 证书 (-cert 和 -key)")
-		}
 		h2s := &http2.Server{}
 		server := &http.Server{
 			Addr:    *listenAddr,
 			Handler: h2c.NewHandler(mux, h2s),
 		}
-		zlog.Infof("[H2C Server] 🟡 启动明文 HTTP/2 隧道 (无加密), 监听: %s, 路径: %s", *listenAddr, *path)
-		zlog.Warnf("[H2C Server] ⚠️ 警告：明文传输通常仅用于配合 Nginx 等前置反代使用")
+		zlog.Infof("[H2C Server] 🟡 启动明文 HTTP/2 隧道 (TCP), 监听: %s, 路径: %s", *listenAddr, *path)
 		if err := server.ListenAndServe(); err != nil {
 			zlog.Fatalf("启动失败: %v", err)
 		}
 	}
 }
 
-// tunnelHandler 处理核心的隧道转发逻辑
-func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtServer *webtransport.Server) {
 	target := r.Header.Get("X-Target")
 	if target == "" {
 		http.Error(w, "Missing X-Target header", http.StatusBadRequest)
@@ -220,7 +210,38 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 		return
 	}
 
-	// 🌟 动态识别当前请求的底层协议 (HTTP/2.0 或 HTTP/3.0)
+	// 🌟 WebTransport 处理分支
+	if wtServer != nil && r.Method == http.MethodConnect {
+		session, err := wtServer.Upgrade(w, r)
+		if err != nil {
+			zlog.Errorf("[Error] WT Upgrade 失败: %v", err)
+			return
+		}
+		zlog.Infof("[Connect] WebTransport 会话已建立 -> 路由目标: %s", target)
+
+		for {
+			stream, err := session.AcceptStream(r.Context())
+			if err != nil {
+				break
+			}
+			zlog.Debugf("[Stream] 接收到新的 WT 子流转发请求")
+
+			// 🌟 核心修正：这里直接将取到的指针流传递进去
+			go handleWTServerStream(stream, target)
+		}
+
+		zlog.Infof("[Disconnect] WebTransport 会话已释放 -> 目标: %s", target)
+		return
+	}
+
+	// =====================================
+	// 常规 H2 / H3 / gRPC 处理分支
+	// =====================================
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	protoName := r.Proto
 	isGRPC := r.Header.Get("Content-Type") == "application/grpc"
 	
@@ -243,7 +264,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		zlog.Error("[Error] 客户端/中间件不支持 HTTP 流式传输")
 		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 		return
 	}
@@ -260,7 +280,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 	}
 
 	errChan := make(chan error, 2)
-
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
@@ -294,55 +313,149 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 	zlog.Infof("[Disconnect] %s 隧道已释放 -> 目标: %s", protoName, target)
 }
 
+// 🌟 核心修正：接收的参数显式声明为指针 `*webtransport.Stream`
+func handleWTServerStream(stream *webtransport.Stream, target string) {
+	targetConn, err := net.Dial("tcp", target)
+	if err != nil {
+		zlog.Errorf("[Error] WT 子流拨号目标 %s 失败: %v", target, err)
+		(*stream).CancelWrite(1)
+		return
+	}
+	defer targetConn.Close()
+
+	defer func() {
+		(*stream).CancelRead(0)
+		(*stream).CancelWrite(0)
+		(*stream).Close()
+	}()
+
+	errChan := make(chan error, 2)
+	go func() {
+		// 因为 stream 是指针，天然实现了 io.Writer
+		_, err := io.Copy(targetConn, stream)
+		errChan <- err
+	}()
+	go func() {
+		// 因为 stream 是指针，天然实现了 io.Reader
+		_, err := io.Copy(stream, targetConn)
+		errChan <- err
+	}()
+
+	<-errChan
+}
+
 // ==========================================
 // 客户端逻辑 (Client)
 // ==========================================
+
+type WTSessionManager struct {
+	dialer  *webtransport.Dialer
+	reqUrl  string
+	headers http.Header
+	session *webtransport.Session
+	mu      sync.Mutex
+}
+
+func (m *WTSessionManager) GetSession(ctx context.Context) (*webtransport.Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.session != nil {
+		return m.session, nil
+	}
+
+	zlog.Infof("[Client] ⚡ 正在建立 WebTransport 底层主会话...")
+	_, session, err := m.dialer.Dial(ctx, m.reqUrl, m.headers)
+	if err != nil {
+		return nil, err
+	}
+	m.session = session
+	zlog.Infof("[Client] ✅ WebTransport 主会话建立成功")
+	return session, nil
+}
+
+func (m *WTSessionManager) ClearSession() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.session = nil
+}
+
 func runClient(args []string) {
 	clientCmd := flag.NewFlagSet("client", flag.ExitOnError)
-	listenAddr := clientCmd.String("listen", "127.0.0.1:2222", "本地监听的 TCP 地址 (如 127.0.0.1:2222)")
-	serverUrl := clientCmd.String("server", "http://127.0.0.1:8443", "远端 H2/H2C 服务端 URL (需携带 http:// 或 https://)")
-	path := clientCmd.String("path", "/tunnel", "请求路径，需与服务端一致")
-	targetAddr := clientCmd.String("target", "127.0.0.1:22", "要求远端服务器代理访问的最终目标 TCP 地址")
-	insecure := clientCmd.Bool("insecure", true, "是否跳过 TLS 证书校验 (适用于自签证书)")
-	customHost := clientCmd.String("host", "", "自定义伪装的 SNI / Host 域名 (用于突破 CDN 或前置反代)")
-	useGRPC := clientCmd.Bool("grpc", false, "开启 gRPC 协议伪装 (适用于严格审查的 CDN 或 nginx grpc_pass)")
-	logLevel := clientCmd.String("loglevel", "info", "日志等级: debug, info, warn, error")
-	useH3 := clientCmd.Bool("h3", false, "使用 HTTP/3 (QUIC/UDP) 协议连接服务端")
+	listenAddr := clientCmd.String("listen", "127.0.0.1:2222", "本地监听地址")
+	serverUrl := clientCmd.String("server", "https://127.0.0.1:8443", "服务端 URL")
+	path := clientCmd.String("path", "/tunnel", "代理路径")
+	targetAddr := clientCmd.String("target", "127.0.0.1:22", "远端最终目标 TCP 地址")
+	insecure := clientCmd.Bool("insecure", true, "跳过 TLS 证书校验")
+	customHost := clientCmd.String("host", "", "自定义伪装 Host")
+	useGRPC := clientCmd.Bool("grpc", false, "使用 gRPC 协议伪装")
+	useH3 := clientCmd.Bool("h3", false, "使用 HTTP/3 协议连接")
+	useWT := clientCmd.Bool("wt", false, "使用 WebTransport 协议连接")
+	logLevel := clientCmd.String("loglevel", "info", "日志等级")
 
 	clientCmd.Parse(args)
 	initLogger(*logLevel)
 	defer zlog.Sync()
 
+	if *useH3 && *useWT {
+		zlog.Fatalf("[Client Error] -h3 和 -wt 标志互斥，不能同时使用")
+	}
+
 	reqUrl := strings.TrimRight(*serverUrl, "/") + *path
 	isHTTPS := strings.HasPrefix(reqUrl, "https://")
 
 	var httpClient *http.Client
+	var wtManager *WTSessionManager
 
-	// 🌟 核心：根据 -h3 标志动态选择底层 Transport
-	if *useH3 {
+	if *useWT {
 		if !isHTTPS {
-			zlog.Fatalf("[Client Error] HTTP/3 必须使用 https:// 协议的 Server URL")
+			zlog.Fatalf("[Client Error] WebTransport 必须使用 HTTPS URL")
 		}
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: *insecure,
+		tlsConfig := &tls.Config{InsecureSkipVerify: *insecure}
+		if *customHost != "" {
+			tlsConfig.ServerName = *customHost
 		}
+		
+		headers := make(http.Header)
+		headers.Set("X-Target", *targetAddr)
+		headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		if *customHost != "" {
+			headers.Set("Host", *customHost)
+		}
+
+		wtManager = &WTSessionManager{
+			dialer: &webtransport.Dialer{
+				TLSClientConfig: tlsConfig,
+				QUICConfig: &quic.Config{
+					HandshakeIdleTimeout: 10 * time.Second,
+					MaxIdleTimeout:       30 * time.Second,
+					KeepAlivePeriod:      8 * time.Second,
+				},
+			},
+			reqUrl:  reqUrl,
+			headers: headers,
+		}
+	} else if *useH3 {
+		if !isHTTPS {
+			zlog.Fatalf("[Client Error] HTTP/3 必须使用 HTTPS URL")
+		}
+		tlsConfig := &tls.Config{InsecureSkipVerify: *insecure}
 		if *customHost != "" {
 			tlsConfig.ServerName = *customHost
 		}
 		rt := &http3.Transport{
 			TLSClientConfig: tlsConfig,
 			QUICConfig: &quic.Config{
-				MaxIdleTimeout:  30 * time.Second,
-				KeepAlivePeriod: 15 * time.Second, // 维持 UDP NAT 映射
+				HandshakeIdleTimeout: 10 * time.Second,
+				MaxIdleTimeout:       30 * time.Second,
+				KeepAlivePeriod:      8 * time.Second,
 			},
 		}
 		httpClient = &http.Client{Transport: rt}
 	} else {
 		transport := &http2.Transport{}
 		if isHTTPS {
-			tlsConfig := &tls.Config{
-				InsecureSkipVerify: *insecure,
-			}
+			tlsConfig := &tls.Config{InsecureSkipVerify: *insecure}
 			if *customHost != "" {
 				tlsConfig.ServerName = *customHost
 			}
@@ -358,38 +471,83 @@ func runClient(args []string) {
 
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
-		zlog.Fatalf("[Client Error] 无法监听本地端口 %s: %v", *listenAddr, err)
+		zlog.Fatalf("无法监听本地端口: %v", err)
 	}
 	defer listener.Close()
 
-	if *useH3 {
-		zlog.Infof("[Client] 🚀 客户端已启动 (HTTP/3 模式), 监听本地: %s", *listenAddr)
+	if *useWT {
+		zlog.Infof("[Client] 🚀 启动模式: WebTransport, 监听本地: %s", *listenAddr)
+	} else if *useH3 {
+		zlog.Infof("[Client] 🚀 启动模式: HTTP/3, 监听本地: %s", *listenAddr)
 	} else {
-		zlog.Infof("[Client] 🚀 客户端已启动 (HTTP/2 模式), 监听本地: %s", *listenAddr)
+		zlog.Infof("[Client] 🚀 启动模式: HTTP/2 (或 gRPC), 监听本地: %s", *listenAddr)
 	}
-	zlog.Infof("[Client] 🔗 隧道目标: %s", reqUrl)
-	zlog.Infof("[Client] 🎯 最终目标: %s", *targetAddr)
-	if *customHost != "" {
-		zlog.Infof("[Client] 🎭 伪装 Host/SNI: %s", *customHost)
-	}
-	if *useGRPC {
-		zlog.Infof("[Client] 🧬 已启用 gRPC 模式伪装")
-	}
+	zlog.Infof("[Client] 🔗 隧道目标: %s -> %s", reqUrl, *targetAddr)
 
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
-			zlog.Errorf("[Client Error] 接收连接失败: %v", err)
 			continue
 		}
-		go handleClientConn(localConn, httpClient, reqUrl, *targetAddr, *customHost, *useGRPC)
+		go handleClientConn(localConn, httpClient, wtManager, reqUrl, *targetAddr, *customHost, *useGRPC, *useWT)
 	}
 }
 
-func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string, target string, customHost string, useGRPC bool) {
+func handleClientConn(localConn net.Conn, httpClient *http.Client, wtManager *WTSessionManager, reqUrl string, target string, customHost string, useGRPC bool, useWT bool) {
 	defer localConn.Close()
 	zlog.Debugf("[Client] 🟢 接收到本地连接，正在打通隧道...")
 
+	// =====================================
+	// WebTransport 传输
+	// =====================================
+	if useWT {
+		session, err := wtManager.GetSession(context.Background())
+		if err != nil {
+			zlog.Errorf("[Client Error] 获取 WebTransport 会话失败: %v", err)
+			return
+		}
+
+		stream, err := session.OpenStreamSync(context.Background())
+		if err != nil {
+			zlog.Warnf("[Client] ⚠️ 检测到 WebTransport 僵尸会话，正在清理重试...")
+			wtManager.ClearSession()
+			session, err = wtManager.GetSession(context.Background())
+			if err != nil {
+				zlog.Errorf("[Client Error] 重试建立会话失败: %v", err)
+				return
+			}
+			stream, err = session.OpenStreamSync(context.Background())
+			if err != nil {
+				zlog.Errorf("[Client Error] 重试开启 WT 流失败: %v", err)
+				return
+			}
+		}
+
+		zlog.Debugf("[Client] ✅ WT 虚拟数据流通道已建立")
+
+		errChan := make(chan error, 2)
+		go func() {
+			// 🌟 核心修正：stream 已经是 *webtransport.Stream 指针了，直接传即可！
+			_, err := io.Copy(stream, localConn)
+			(*stream).CancelRead(0)
+			errChan <- err
+		}()
+		go func() {
+			// 🌟 核心修正：同理，直接传 stream
+			_, err := io.Copy(localConn, stream)
+			(*stream).CancelWrite(0)
+			errChan <- err
+		}()
+
+		<-errChan
+		(*stream).Close()
+		zlog.Debugf("[Client] 🔴 隧道流连接已断开 (底层 Session 仍保持连接)")
+		return
+	}
+
+	// =====================================
+	// 常规 H2 / H3 / gRPC 握手及传输
+	// =====================================
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -409,7 +567,7 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 		req.Header.Set("TE", "trailers")
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("X-Target", target)
 
 	var writer io.Writer = pw
@@ -434,7 +592,7 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 		return
 	}
 
-	zlog.Infof("[Client] ✅ 隧道已建立，开始传输数据")
+	zlog.Debugf("[Client] ✅ HTTP 隧道已建立")
 
 	var reader io.Reader = resp.Body
 	if useGRPC {
