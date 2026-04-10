@@ -11,7 +11,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
@@ -128,8 +131,8 @@ func main() {
 func printUsage() {
 	fmt.Println("使用方法: h2tunnel <子命令> [参数]")
 	fmt.Println("\n子命令:")
-	fmt.Println("  server    启动 HTTP/2 隧道服务端")
-	fmt.Println("  client    启动 HTTP/2 隧道客户端")
+	fmt.Println("  server    启动隧道服务端")
+	fmt.Println("  client    启动隧道客户端")
 	fmt.Println("  version   查看当前版本号")
 	fmt.Println("\n示例:")
 	fmt.Println("  h2tunnel server -h")
@@ -147,6 +150,7 @@ func runServer(args []string) {
 	path := serverCmd.String("path", "/tunnel", "代理路径，需与客户端一致")
 	allowLocal := serverCmd.Bool("local-only", true, "安全选项：是否只允许转发到服务端的 127.0.0.1 (强烈建议开启)")
 	logLevel := serverCmd.String("loglevel", "info", "日志等级: debug, info, warn, error")
+	enableH3 := serverCmd.Bool("h3", false, "是否在相同端口同时开启 HTTP/3 (UDP/QUIC) 监听 (必须配置证书)")
 
 	serverCmd.Parse(args)
 	initLogger(*logLevel)
@@ -158,15 +162,32 @@ func runServer(args []string) {
 	})
 
 	if *tlsCert != "" && *tlsKey != "" {
+		// 🌟 如果开启了 H3，在后台 Goroutine 启动 HTTP/3 监听
+		if *enableH3 {
+			go func() {
+				h3Server := &http3.Server{
+					Addr:    *listenAddr,
+					Handler: mux,
+				}
+				zlog.Infof("[H3 Server] 🚀 启动 HTTP/3 隧道 (UDP/QUIC), 监听: %s, 路径: %s", *listenAddr, *path)
+				if err := h3Server.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
+					zlog.Fatalf("HTTP/3 启动失败: %v", err)
+				}
+			}()
+		}
+
 		server := &http.Server{
 			Addr:    *listenAddr,
 			Handler: mux,
 		}
-		zlog.Infof("[H2 Server] 🟢 启动标准 HTTP/2 隧道 (TLS 加密), 监听: %s, 路径: %s", *listenAddr, *path)
+		zlog.Infof("[H2 Server] 🟢 启动标准 HTTP/2 隧道 (TLS/TCP), 监听: %s, 路径: %s", *listenAddr, *path)
 		if err := server.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
 			zlog.Fatalf("启动失败: %v", err)
 		}
 	} else {
+		if *enableH3 {
+			zlog.Fatalf("[Error] 开启 HTTP/3 必须提供 TLS 证书 (-cert 和 -key)")
+		}
 		h2s := &http2.Server{}
 		server := &http.Server{
 			Addr:    *listenAddr,
@@ -193,18 +214,18 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 		return
 	}
 
-	// 安全限制
 	if allowLocal && !strings.HasPrefix(target, "127.0.0.1:") && !strings.HasPrefix(target, "localhost:") {
 		zlog.Warnf("[Reject] 拒绝连接到非本地目标: %s", target)
 		http.Error(w, "Target forbidden", http.StatusForbidden)
 		return
 	}
 
-	// 🌟 核心：检测是否为 gRPC 流量
+	// 🌟 动态识别当前请求的底层协议 (HTTP/2.0 或 HTTP/3.0)
+	protoName := r.Proto
 	isGRPC := r.Header.Get("Content-Type") == "application/grpc"
-	protoName := "HTTP/2"
+	
 	if isGRPC {
-		protoName = "gRPC"
+		protoName = "gRPC over " + r.Proto
 		w.Header().Set("Content-Type", "application/grpc")
 		w.Header().Add("Trailer", "Grpc-Status")
 		w.Header().Add("Trailer", "Grpc-Message")
@@ -233,7 +254,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 	var writer io.Writer = w
 	var reader io.Reader = r.Body
 
-	// 🌟 如果是 gRPC 协议，套上封包解包器
 	if isGRPC {
 		writer = &grpcWriter{w: w}
 		reader = &grpcReader{r: r.Body}
@@ -241,7 +261,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 
 	errChan := make(chan error, 2)
 
-	// 下行：TCP -> Response
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
@@ -260,7 +279,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 		}
 	}()
 
-	// 上行：Request -> TCP
 	go func() {
 		_, err := io.Copy(targetConn, reader)
 		errChan <- err
@@ -268,7 +286,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool) {
 
 	<-errChan
 
-	// gRPC 规范：流结束时必须追加 Trailer
 	if isGRPC {
 		w.Header().Set("Grpc-Status", "0")
 		w.Header().Set("Grpc-Message", "OK")
@@ -290,6 +307,7 @@ func runClient(args []string) {
 	customHost := clientCmd.String("host", "", "自定义伪装的 SNI / Host 域名 (用于突破 CDN 或前置反代)")
 	useGRPC := clientCmd.Bool("grpc", false, "开启 gRPC 协议伪装 (适用于严格审查的 CDN 或 nginx grpc_pass)")
 	logLevel := clientCmd.String("loglevel", "info", "日志等级: debug, info, warn, error")
+	useH3 := clientCmd.Bool("h3", false, "使用 HTTP/3 (QUIC/UDP) 协议连接服务端")
 
 	clientCmd.Parse(args)
 	initLogger(*logLevel)
@@ -298,23 +316,45 @@ func runClient(args []string) {
 	reqUrl := strings.TrimRight(*serverUrl, "/") + *path
 	isHTTPS := strings.HasPrefix(reqUrl, "https://")
 
-	transport := &http2.Transport{}
-	if isHTTPS {
+	var httpClient *http.Client
+
+	// 🌟 核心：根据 -h3 标志动态选择底层 Transport
+	if *useH3 {
+		if !isHTTPS {
+			zlog.Fatalf("[Client Error] HTTP/3 必须使用 https:// 协议的 Server URL")
+		}
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: *insecure,
 		}
 		if *customHost != "" {
 			tlsConfig.ServerName = *customHost
 		}
-		transport.TLSClientConfig = tlsConfig
-	} else {
-		transport.AllowHTTP = true
-		transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			return net.Dial(network, addr)
+		rt := &http3.Transport{
+			TLSClientConfig: tlsConfig,
+			QUICConfig: &quic.Config{
+				MaxIdleTimeout:  30 * time.Second,
+				KeepAlivePeriod: 15 * time.Second, // 维持 UDP NAT 映射
+			},
 		}
+		httpClient = &http.Client{Transport: rt}
+	} else {
+		transport := &http2.Transport{}
+		if isHTTPS {
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: *insecure,
+			}
+			if *customHost != "" {
+				tlsConfig.ServerName = *customHost
+			}
+			transport.TLSClientConfig = tlsConfig
+		} else {
+			transport.AllowHTTP = true
+			transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return net.Dial(network, addr)
+			}
+		}
+		httpClient = &http.Client{Transport: transport}
 	}
-
-	httpClient := &http.Client{Transport: transport}
 
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -322,7 +362,11 @@ func runClient(args []string) {
 	}
 	defer listener.Close()
 
-	zlog.Infof("[Client] 🚀 客户端已启动，监听本地: %s", *listenAddr)
+	if *useH3 {
+		zlog.Infof("[Client] 🚀 客户端已启动 (HTTP/3 模式), 监听本地: %s", *listenAddr)
+	} else {
+		zlog.Infof("[Client] 🚀 客户端已启动 (HTTP/2 模式), 监听本地: %s", *listenAddr)
+	}
 	zlog.Infof("[Client] 🔗 隧道目标: %s", reqUrl)
 	zlog.Infof("[Client] 🎯 最终目标: %s", *targetAddr)
 	if *customHost != "" {
@@ -344,7 +388,6 @@ func runClient(args []string) {
 
 func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string, target string, customHost string, useGRPC bool) {
 	defer localConn.Close()
-	// 使用 Debug 级别，防止大流量下终端刷屏
 	zlog.Debugf("[Client] 🟢 接收到本地连接，正在打通隧道...")
 
 	pr, pw := io.Pipe()
@@ -361,7 +404,6 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 		req.Host = customHost
 	}
 
-	// 🌟 核心：为 gRPC 设置专属 Header
 	if useGRPC {
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
@@ -371,12 +413,10 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 	req.Header.Set("X-Target", target)
 
 	var writer io.Writer = pw
-	// 🌟 如果是 gRPC 协议，套上封包器
 	if useGRPC {
 		writer = &grpcWriter{w: pw}
 	}
 
-	// 上行：Local TCP -> Request
 	go func() {
 		io.Copy(writer, localConn)
 		pw.Close()
@@ -397,12 +437,10 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, reqUrl string
 	zlog.Infof("[Client] ✅ 隧道已建立，开始传输数据")
 
 	var reader io.Reader = resp.Body
-	// 🌟 如果是 gRPC 协议，套上解包器
 	if useGRPC {
 		reader = &grpcReader{r: resp.Body}
 	}
 
-	// 下行：Response -> Local TCP
 	io.Copy(localConn, reader)
 	zlog.Debugf("[Client] 🔴 隧道连接已断开")
 }
