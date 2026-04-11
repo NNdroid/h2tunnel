@@ -156,16 +156,36 @@ func runServer(args []string) {
 		if *tlsCert == "" || *tlsKey == "" {
 			zlog.Fatalf("[Error] 开启 H3/WT 必须提供 TLS 证书")
 		}
+
+		// 🌟 核心接管：加载证书并强制注入 ALPN
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			zlog.Fatalf("[Error] 加载证书失败: %v", err)
+		}
+
+		serverTLS := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h3", "h3-29"}, 
+		}
+
 		wtServer = &webtransport.Server{
 			H3: &http3.Server{
-				Addr:    *listenAddr,
-				Handler: mux,
+				Addr:            *listenAddr,
+				Handler:         mux,
+				TLSConfig:       serverTLS,
+				EnableDatagrams: true, // 🌟 补齐拼图：开启 HTTP/3 层的 Datagram 宣告！
+				QUICConfig: &quic.Config{
+					EnableDatagrams:                  true,
+					EnableStreamResetPartialDelivery: true,
+				},
 			},
 			CheckOrigin: func(r *http.Request) bool { return true },
 		}
+
 		go func() {
 			zlog.Infof("[H3/WT Server] 🚀 启动 HTTP/3 & WebTransport (UDP), 监听: %s, 路径: %s", *listenAddr, *path)
-			if err := wtServer.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
+			// 直接使用 H3.ListenAndServe，它会自动使用我们注入的 TLSConfig
+			if err := wtServer.H3.ListenAndServe(); err != nil {
 				zlog.Fatalf("H3/WT 启动失败: %v", err)
 			}
 		}()
@@ -226,7 +246,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtSe
 			}
 			zlog.Debugf("[Stream] 接收到新的 WT 子流转发请求")
 
-			// 🌟 核心修正：这里直接将取到的指针流传递进去
 			go handleWTServerStream(stream, target)
 		}
 
@@ -313,7 +332,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtSe
 	zlog.Infof("[Disconnect] %s 隧道已释放 -> 目标: %s", protoName, target)
 }
 
-// 🌟 核心修正：接收的参数显式声明为指针 `*webtransport.Stream`
 func handleWTServerStream(stream *webtransport.Stream, target string) {
 	targetConn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -331,12 +349,10 @@ func handleWTServerStream(stream *webtransport.Stream, target string) {
 
 	errChan := make(chan error, 2)
 	go func() {
-		// 因为 stream 是指针，天然实现了 io.Writer
 		_, err := io.Copy(targetConn, stream)
 		errChan <- err
 	}()
 	go func() {
-		// 因为 stream 是指针，天然实现了 io.Reader
 		_, err := io.Copy(stream, targetConn)
 		errChan <- err
 	}()
@@ -411,7 +427,10 @@ func runClient(args []string) {
 		if !isHTTPS {
 			zlog.Fatalf("[Client Error] WebTransport 必须使用 HTTPS URL")
 		}
-		tlsConfig := &tls.Config{InsecureSkipVerify: *insecure}
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: *insecure,
+			NextProtos:         []string{"h3", "h3-29"}, 
+		}
 		if *customHost != "" {
 			tlsConfig.ServerName = *customHost
 		}
@@ -427,9 +446,11 @@ func runClient(args []string) {
 			dialer: &webtransport.Dialer{
 				TLSClientConfig: tlsConfig,
 				QUICConfig: &quic.Config{
-					HandshakeIdleTimeout: 10 * time.Second,
-					MaxIdleTimeout:       30 * time.Second,
-					KeepAlivePeriod:      8 * time.Second,
+					EnableDatagrams:                  true,
+					EnableStreamResetPartialDelivery: true,
+					HandshakeIdleTimeout:             10 * time.Second,
+					MaxIdleTimeout:                   30 * time.Second,
+					KeepAlivePeriod:                  8 * time.Second,
 				},
 			},
 			reqUrl:  reqUrl,
@@ -439,16 +460,21 @@ func runClient(args []string) {
 		if !isHTTPS {
 			zlog.Fatalf("[Client Error] HTTP/3 必须使用 HTTPS URL")
 		}
-		tlsConfig := &tls.Config{InsecureSkipVerify: *insecure}
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: *insecure,
+			NextProtos:         []string{"h3", "h3-29"},
+		}
 		if *customHost != "" {
 			tlsConfig.ServerName = *customHost
 		}
 		rt := &http3.Transport{
 			TLSClientConfig: tlsConfig,
 			QUICConfig: &quic.Config{
-				HandshakeIdleTimeout: 10 * time.Second,
-				MaxIdleTimeout:       30 * time.Second,
-				KeepAlivePeriod:      8 * time.Second,
+				EnableDatagrams:                  true,
+				EnableStreamResetPartialDelivery: true,
+				HandshakeIdleTimeout:             10 * time.Second,
+				MaxIdleTimeout:                   30 * time.Second,
+				KeepAlivePeriod:                  8 * time.Second,
 			},
 		}
 		httpClient = &http.Client{Transport: rt}
@@ -527,13 +553,11 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, wtManager *WT
 
 		errChan := make(chan error, 2)
 		go func() {
-			// 🌟 核心修正：stream 已经是 *webtransport.Stream 指针了，直接传即可！
 			_, err := io.Copy(stream, localConn)
 			(*stream).CancelRead(0)
 			errChan <- err
 		}()
 		go func() {
-			// 🌟 核心修正：同理，直接传 stream
 			_, err := io.Copy(localConn, stream)
 			(*stream).CancelWrite(0)
 			errChan <- err
