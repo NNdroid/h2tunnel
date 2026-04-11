@@ -157,7 +157,6 @@ func runServer(args []string) {
 			zlog.Fatalf("[Error] 开启 H3/WT 必须提供 TLS 证书")
 		}
 
-		// 🌟 核心接管：加载证书并强制注入 ALPN
 		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 		if err != nil {
 			zlog.Fatalf("[Error] 加载证书失败: %v", err)
@@ -165,7 +164,7 @@ func runServer(args []string) {
 
 		serverTLS := &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h3", "h3-29"}, 
+			NextProtos:   []string{http3.NextProtoH3},
 		}
 
 		wtServer = &webtransport.Server{
@@ -173,19 +172,20 @@ func runServer(args []string) {
 				Addr:            *listenAddr,
 				Handler:         mux,
 				TLSConfig:       serverTLS,
-				EnableDatagrams: true, // 🌟 补齐拼图：开启 HTTP/3 层的 Datagram 宣告！
+				EnableDatagrams: true,
 				QUICConfig: &quic.Config{
 					EnableDatagrams:                  true,
 					EnableStreamResetPartialDelivery: true,
+					KeepAlivePeriod:                  10 * time.Second,
 				},
 			},
 			CheckOrigin: func(r *http.Request) bool { return true },
 		}
+		webtransport.ConfigureHTTP3Server(wtServer.H3)//importance
 
 		go func() {
 			zlog.Infof("[H3/WT Server] 🚀 启动 HTTP/3 & WebTransport (UDP), 监听: %s, 路径: %s", *listenAddr, *path)
-			// 直接使用 H3.ListenAndServe，它会自动使用我们注入的 TLSConfig
-			if err := wtServer.H3.ListenAndServe(); err != nil {
+			if err := wtServer.ListenAndServe(); err != nil {
 				zlog.Fatalf("H3/WT 启动失败: %v", err)
 			}
 		}()
@@ -219,6 +219,7 @@ func runServer(args []string) {
 
 func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtServer *webtransport.Server) {
 	target := r.Header.Get("X-Target")
+	zlog.Warnf("[Info] 连接目标: %s", target)
 	if target == "" {
 		http.Error(w, "Missing X-Target header", http.StatusBadRequest)
 		return
@@ -230,7 +231,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtSe
 		return
 	}
 
-	// 🌟 WebTransport 处理分支
 	if wtServer != nil && r.Method == http.MethodConnect {
 		session, err := wtServer.Upgrade(w, r)
 		if err != nil {
@@ -253,9 +253,6 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtSe
 		return
 	}
 
-	// =====================================
-	// 常规 H2 / H3 / gRPC 处理分支
-	// =====================================
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -263,7 +260,7 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtSe
 
 	protoName := r.Proto
 	isGRPC := r.Header.Get("Content-Type") == "application/grpc"
-	
+
 	if isGRPC {
 		protoName = "gRPC over " + r.Proto
 		w.Header().Set("Content-Type", "application/grpc")
@@ -332,38 +329,48 @@ func tunnelHandler(w http.ResponseWriter, r *http.Request, allowLocal bool, wtSe
 	zlog.Infof("[Disconnect] %s 隧道已释放 -> 目标: %s", protoName, target)
 }
 
+// 修复：恢复 *webtransport.Stream 指针类型，保留优雅半关闭
 func handleWTServerStream(stream *webtransport.Stream, target string) {
 	targetConn, err := net.Dial("tcp", target)
 	if err != nil {
 		zlog.Errorf("[Error] WT 子流拨号目标 %s 失败: %v", target, err)
-		(*stream).CancelWrite(1)
+		stream.CancelWrite(1) // 直接使用 stream 调用，无需解引用
 		return
 	}
 	defer targetConn.Close()
 
-	defer func() {
-		(*stream).CancelRead(0)
-		(*stream).CancelWrite(0)
-		(*stream).Close()
-	}()
-
 	errChan := make(chan error, 2)
+
+	// 远端 (Target) -> 本地 (Stream)
 	go func() {
 		_, err := io.Copy(targetConn, stream)
+		if cw, ok := targetConn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		} else {
+			targetConn.Close()
+		}
 		errChan <- err
 	}()
+
+	// 本地 (Stream) -> 远端 (Target)
 	go func() {
 		_, err := io.Copy(stream, targetConn)
+		// 优雅关闭 WT Stream 的发送端（发送 FIN）
+		stream.Close()
 		errChan <- err
 	}()
 
 	<-errChan
+
+	// 兜底安全清理
+	stream.CancelRead(0)
 }
 
 // ==========================================
 // 客户端逻辑 (Client)
 // ==========================================
 
+// 修复：恢复 *webtransport.Session 指针类型
 type WTSessionManager struct {
 	dialer  *webtransport.Dialer
 	reqUrl  string
@@ -429,15 +436,17 @@ func runClient(args []string) {
 		}
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: *insecure,
-			NextProtos:         []string{"h3", "h3-29"}, 
+			NextProtos:         []string{http3.NextProtoH3},
 		}
 		if *customHost != "" {
 			tlsConfig.ServerName = *customHost
 		}
-		
+
 		headers := make(http.Header)
 		headers.Set("X-Target", *targetAddr)
-		headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+
+		
 		if *customHost != "" {
 			headers.Set("Host", *customHost)
 		}
@@ -462,7 +471,7 @@ func runClient(args []string) {
 		}
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: *insecure,
-			NextProtos:         []string{"h3", "h3-29"},
+			NextProtos:         []string{"h3"},
 		}
 		if *customHost != "" {
 			tlsConfig.ServerName = *customHost
@@ -523,9 +532,6 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, wtManager *WT
 	defer localConn.Close()
 	zlog.Debugf("[Client] 🟢 接收到本地连接，正在打通隧道...")
 
-	// =====================================
-	// WebTransport 传输
-	// =====================================
 	if useWT {
 		session, err := wtManager.GetSession(context.Background())
 		if err != nil {
@@ -552,19 +558,27 @@ func handleClientConn(localConn net.Conn, httpClient *http.Client, wtManager *WT
 		zlog.Debugf("[Client] ✅ WT 虚拟数据流通道已建立")
 
 		errChan := make(chan error, 2)
+
 		go func() {
 			_, err := io.Copy(stream, localConn)
-			(*stream).CancelRead(0)
+			// 发送完成，平滑关闭 QUIC 写流
+			stream.Close()
 			errChan <- err
 		}()
+
 		go func() {
 			_, err := io.Copy(localConn, stream)
-			(*stream).CancelWrite(0)
+			if cw, ok := localConn.(interface{ CloseWrite() error }); ok {
+				cw.CloseWrite()
+			} else {
+				localConn.Close()
+			}
 			errChan <- err
 		}()
 
 		<-errChan
-		(*stream).Close()
+
+		stream.CancelRead(0)
 		zlog.Debugf("[Client] 🔴 隧道流连接已断开 (底层 Session 仍保持连接)")
 		return
 	}
