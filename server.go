@@ -48,7 +48,7 @@ func runServer(args []string) {
 
 		zlog.Debugf("[Server] 收到全局请求: %s %s (Host: %s)", r.Method, fullPath, r.Host)
 
-		if r.Method == http.MethodConnect {
+		if r.Method == http.MethodConnect && cfg.EnableH3 {
 			matchedPath := fullPath
 			if strings.HasPrefix(matchedPath, "/.well-known/masque/tcp/") {
 				zlog.Debugf("[Server] 命中 MASQUE-TCP 路由: %s", matchedPath)
