@@ -90,6 +90,9 @@ func runServer(args []string) {
 					EnableDatagrams:                  true,
 					EnableStreamResetPartialDelivery: true,
 					KeepAlivePeriod:                  10 * time.Second,
+					MaxIdleTimeout:                   30 * time.Second,    // 限制超时时间
+					MaxIncomingStreams:               10000,               // 高压下必须调大并发流数量
+					MaxIncomingUniStreams:            10000,               // 调大单向流限制
 				},
 			},
 		}
@@ -305,35 +308,15 @@ func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg ServerConfig) {
 		return
 	}
 	defer tConn.Close()
+	
+	// 这里可以设置一个相对宽松的 ReadDeadline，防止 UDP 僵尸连接，
+	// 也可以在 proxyStream 里统一定义。
+	tConn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	zlog.Infof("[%s] 🔗 MASQUE-UDP 连接就绪 -> %s", sessionID, target)
 
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	flusher.Flush()
 
-	errChan := make(chan error, 2)
-	// 读取目标 UDP 数据封装 Capsule 发给客户端
-	go func() {
-		buf := make([]byte, 65536)
-		for {
-			tConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			n, _, err := tConn.ReadFromUDP(buf)
-			if err != nil { errChan <- err; return }
-			zlog.Debugf("[%s] <- 收到目标 UDP 返回: %d bytes", sessionID, n)
-			if err := writeUDPCapsule(w, buf[:n]); err != nil { errChan <- err; return }
-			flusher.Flush()
-		}
-	}()
-	// 从客户端读取 Capsule 解封发给目标 UDP
-	go func() {
-		for {
-			p, err := readUDPCapsule(r.Body)
-			if err != nil { errChan <- err; return }
-			zlog.Debugf("[%s] -> 转发 UDP 负载至目标: %d bytes", sessionID, len(p))
-			if _, err := tConn.Write(p); err != nil { errChan <- err; return }
-		}
-	}()
-
-	err = <-errChan
-	zlog.Infof("[%s] 🏁 MASQUE-UDP 隧道关闭: %v", sessionID, err)
+	proxyStream(sessionID, "masque-udp", tConn, r.Body, w, flusher)
 }

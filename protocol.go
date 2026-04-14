@@ -104,93 +104,72 @@ func readVarInt(r io.Reader) (uint64, error) {
 	return val, nil
 }
 
-// --- MASQUE UDP Capsule ---
+// --- MASQUE UDP Capsule (零分配版本) ---
 func writeUDPCapsule(w io.Writer, p []byte) error {
 	if err := writeVarInt(w, 0x00); err != nil { return err }
 	if err := writeVarInt(w, uint64(1+len(p))); err != nil { return err }
 	if err := writeVarInt(w, 0x00); err != nil { return err }
-	_, err := w.Write(p)
-	if err != nil {
-		zlog.Debugf("[Capsule] 写入底层流失败: %v", err)
-	}
+	_, err := w.Write(p) // 直接写入 payload，不拼接新切片
 	return err
 }
 
-func readUDPCapsule(r io.Reader) ([]byte, error) {
+func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
 	for {
 		capsuleType, err := readVarInt(r)
-		if err != nil { return nil, err } // 正常的流结束 EOF
-		
+		if err != nil { return 0, err }
 		capsuleLen, err := readVarInt(r)
-		if err != nil {
-			zlog.Warnf("[Capsule] 读取 Capsule 长度字段失败: %v", err)
-			return nil, err
-		}
-
-		lr := &io.LimitedReader{R: r, N: int64(capsuleLen)}
+		if err != nil { return 0, err }
 		
-		// 0x00: DATAGRAM (RFC 9298)
+		lr := &io.LimitedReader{R: r, N: int64(capsuleLen)}
 		if capsuleType == 0x00 {
 			contextID, err := readVarInt(lr)
-			if err != nil { return nil, err }
-			
+			if err != nil { return 0, err }
 			if contextID == 0 {
-				buf := make([]byte, lr.N)
-				if _, err := io.ReadFull(lr, buf); err != nil {
-					zlog.Errorf("[Capsule] Payload 读取不完整 (预期 %d bytes): %v", lr.N, err)
-					return nil, err
-				}
-				return buf, nil
-			} else {
-				zlog.Debugf("[Capsule] ⚠️ 收到非预期的 Context ID (0x%x)，已跳过该报文", contextID)
+				if lr.N > int64(len(payloadBuf)) { return 0, fmt.Errorf("UDP capsule too large for buffer") }
+				n, err := io.ReadFull(lr, payloadBuf[:lr.N]) // 直接读入复用池，不产生 GC
+				return n, err
 			}
-		} else {
-			zlog.Debugf("[Capsule] ⚠️ 收到未知 Capsule Type (0x%x, 长度: %d)，按照扩展标准跳过", capsuleType, capsuleLen)
 		}
-
-		// 如果不是我们关心的 Capsule 或者 Context ID 不匹配，安全排空读取缓冲区，丢弃内容
-		if lr.N > 0 {
-			io.Copy(io.Discard, lr)
-		}
+		if lr.N > 0 { io.Copy(io.Discard, lr) }
 	}
 }
 
-// --- Stream UDP Packets ---
+// --- Stream UDP Packets (零分配版本) ---
 func writeUDPPacket(w io.Writer, p []byte) error {
-	if len(p) > 65535 {
-		zlog.Errorf("[StreamUDP] ❌ 拒绝封装超大 UDP 报文 (大小: %d bytes，上限: 65535)", len(p))
-		return fmt.Errorf("UDP payload > 65535")
-	}
-	buf := make([]byte, 2+len(p))
-	binary.BigEndian.PutUint16(buf[:2], uint16(len(p)))
-	copy(buf[2:], p)
-	_, err := w.Write(buf)
+	if len(p) > 65535 { return fmt.Errorf("UDP payload > 65535") }
+	var hdr [2]byte
+	binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+	
+	if _, err := w.Write(hdr[:]); err != nil { return err }
+	_, err := w.Write(p) // 分两次写入，让底层的 buffer 去处理，避免大内存拷贝
 	return err
 }
 
-func readUDPPacket(r io.Reader) ([]byte, error) {
+func readUDPPacket(r io.Reader, payloadBuf []byte) (int, error) {
 	var hdr [2]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil { return nil, err } // 正常的 EOF
+	if _, err := io.ReadFull(r, hdr[:]); err != nil { return 0, err }
 	
 	length := binary.BigEndian.Uint16(hdr[:])
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		zlog.Warnf("[StreamUDP] ⚠️ 包体读取异常 (声明长度 %d): %v", length, err)
-		return nil, err
-	}
-	return buf, nil
+	if int(length) > len(payloadBuf) { return 0, fmt.Errorf("UDP packet too large for buffer") }
+	
+	if _, err := io.ReadFull(r, payloadBuf[:length]); err != nil { return 0, err } // 直接读入复用池
+	return int(length), nil
 }
 
 // --- gRPC Wrappers ---
 type grpcWriter struct{ w io.Writer }
 func (g *grpcWriter) Write(p []byte) (n int, err error) {
 	if len(p) == 0 { return 0, nil }
-	buf := make([]byte, 5+len(p))
-	// Header: 1 byte (0=uncompressed) + 4 bytes length
-	binary.BigEndian.PutUint32(buf[1:5], uint32(len(p)))
-	copy(buf[5:], p)
-	if _, err := g.w.Write(buf); err != nil {
-		zlog.Debugf("[gRPC-Writer] 发送帧失败: %v", err)
+	
+	// 只分配 5 个字节的极小头部，Go 编译器会将其优化在栈上，不触发 GC
+	var header [5]byte 
+	binary.BigEndian.PutUint32(header[1:5], uint32(len(p)))
+	
+	// 连续写两次，只要底层的 w (如 http2.Stream) 带有缓冲，性能损耗极小
+	if _, err := g.w.Write(header[:]); err != nil {
+		return 0, err
+	}
+	if _, err := g.w.Write(p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
