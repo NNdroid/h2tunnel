@@ -39,6 +39,7 @@ LDFLAGS="-s -w -X 'main.Version=$VERSION'"
 echo "🚀 开始跨平台编译..."
 echo "----------------------------------------"
 
+
 # 遍历平台列表进行编译
 for PLATFORM in "${PLATFORMS[@]}"; do
     # 拆分 GOOS 和 GOARCH

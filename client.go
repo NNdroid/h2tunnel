@@ -85,7 +85,8 @@ func runClient(args []string) {
 			QUICConfig: &quic.Config{
 				EnableDatagrams:                  true,
 				EnableStreamResetPartialDelivery: true,
-				KeepAlivePeriod:                  8 * time.Second,
+				KeepAlivePeriod:                  10 * time.Second,
+				MaxIdleTimeout:                   30 * time.Second,
 			},
 		}
 		httpClient = &http.Client{Transport: rt}
@@ -98,8 +99,17 @@ func runClient(args []string) {
 		headers.Set("X-Network", network)
 		if cfg.Token != "" { headers.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
 		wtManager = &WTSessionManager{
-			dialer: &webtransport.Dialer{TLSClientConfig: tlsConfig},
-			reqUrl: reqUrl, headers: headers,
+			dialer: &webtransport.Dialer{
+				TLSClientConfig: tlsConfig,
+				QUICConfig: &quic.Config{
+					EnableDatagrams:                  true,
+					EnableStreamResetPartialDelivery: true,
+					KeepAlivePeriod:                  10 * time.Second,
+					MaxIdleTimeout:                   30 * time.Second,
+				},
+			},
+			reqUrl: reqUrl,
+			headers: headers,
 		}
 		zlog.Debugf("[Client] 已初始化 WebTransport Dialer")
 	} else {
@@ -149,7 +159,82 @@ func runClient(args []string) {
 	}
 }
 
-// 🆕 辅助函数：为 Request 注入底层连接追踪器
+// ==========================================
+// 🌟 客户端 TCP 专属抽象引擎 (带 WaitGroup 完美生命周期保护)
+// ==========================================
+func executeHTTPTunnel(sessionID string, localConn net.Conn, req *http.Request, pw *io.PipeWriter, cfg ClientConfig, httpClient *http.Client) {
+	var writer io.Writer = pw
+	if cfg.UseGRPC { writer = &grpcWriter{w: pw} }
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 1. 上行 (本地 -> 隧道)
+	go func() {
+		defer wg.Done()
+		n, err := io.Copy(writer, localConn)
+		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+			zlog.Warnf("[%s] ⚠️ [本地->隧道] 上行异常: %v", sessionID, err)
+		} else {
+			zlog.Debugf("[%s] ⬆️ [本地->隧道] 完成 (共上传 %d bytes)", sessionID, n)
+		}
+		pw.Close() // 触发 HTTP EOF
+	}()
+
+	start := time.Now()
+	var resp *http.Response
+	var err error
+	if rt, ok := httpClient.Transport.(http.RoundTripper); ok && cfg.UseMasque {
+		resp, err = rt.RoundTrip(req)
+	} else {
+		resp, err = httpClient.Do(req)
+	}
+
+	if err != nil {
+		zlog.Errorf("[%s] ❌ HTTP 握手异常: %v", sessionID, err)
+		// 如果握手失败，伪造一个错误让 wg 正常退出
+		localConn.Close()
+		wg.Done() // 抵消下行的 wg.Done()
+		wg.Wait()
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		zlog.Warnf("[%s] ❌ 远端拒绝: HTTP %d", sessionID, resp.StatusCode)
+		localConn.Close()
+		wg.Done()
+		wg.Wait()
+		return
+	}
+	zlog.Infof("[%s] 🚀 隧道握手建立成功 (耗时: %v)", sessionID, time.Since(start))
+
+	// 2. 下行 (隧道 -> 本地)
+	go func() {
+		defer wg.Done()
+		var reader io.Reader = resp.Body
+		if cfg.UseGRPC { reader = &grpcReader{r: resp.Body} }
+
+		n, err := io.Copy(localConn, reader)
+		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+			zlog.Warnf("[%s] ⚠️ [隧道->本地] 下行异常: %v", sessionID, err)
+		} else {
+			zlog.Debugf("[%s] ⬇️ [隧道->本地] 完成 (共下发 %d bytes)", sessionID, n)
+		}
+
+		if tc, ok := localConn.(*net.TCPConn); ok {
+			zlog.Debugf("[%s] 🔌 本地 TCP 半关闭触发", sessionID)
+			tc.CloseWrite()
+		} else if cw, ok := localConn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
+	}()
+
+	// ⚠️ 极其关键：阻塞等待上下行都安全结束，再由外层的 defer 释放 localConn
+	wg.Wait()
+}
+
+// 辅助函数：为 Request 注入底层连接追踪器
 func withConnectionTrace(ctx context.Context, sessionID string) context.Context {
 	trace := &httptrace.ClientTrace{
 		GotConn: func(connInfo httptrace.GotConnInfo) {
@@ -172,18 +257,36 @@ func handleWTTCPClientConn(localConn net.Conn, sessionID string, cfg ClientConfi
 		return 
 	}
 	
-	zlog.Debugf("[%s] 正在请求打开 WT Stream...", sessionID)
 	start := time.Now()
 	stream, err := session.OpenStreamSync(context.Background())
 	if err != nil { 
 		zlog.Errorf("[%s] ❌ WT Stream 打开失败: %v", sessionID, err)
 		return 
 	}
-	zlog.Infof("[%s] 🚀 WT Stream 开启成功 (耗时: %v), 开始转发数据", sessionID, time.Since(start))
+	zlog.Infof("[%s] 🚀 WT Stream 开启成功 (耗时: %v)", sessionID, time.Since(start))
 
-	go func() { io.Copy(stream, localConn); stream.Close() }()
-	io.Copy(localConn, stream)
-	zlog.Debugf("[%s] 🏁 连接结束", sessionID)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 上行
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(stream, localConn)
+		zlog.Debugf("[%s] ⬆️ [本地->隧道] WT 上传完成 (共 %d bytes)", sessionID, n)
+		stream.Close() // 通知远端结束
+	}()
+
+	// 下行
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(localConn, stream)
+		zlog.Debugf("[%s] ⬇️ [隧道->本地] WT 下发完成 (共 %d bytes)", sessionID, n)
+		if tc, ok := localConn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
 }
 
 // ---> 客户端 TCP: MASQUE
@@ -207,31 +310,8 @@ func handleMasqueTCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg
 	if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
 	if cfg.Token != "" { req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
 
-	go func() { io.Copy(pw, localConn); pw.Close() }()
-
-	start := time.Now()
-	var resp *http.Response
-	var err error
-	if rt, ok := httpClient.Transport.(http.RoundTripper); ok {
-		resp, err = rt.RoundTrip(req)
-	} else {
-		resp, err = httpClient.Do(req)
-	}
-
-	if err != nil {
-		zlog.Errorf("[%s] ❌ HTTP 握手异常: %v", sessionID, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		zlog.Warnf("[%s] ❌ 远端拒绝连接: HTTP %d", sessionID, resp.StatusCode)
-		return
-	}
-
-	zlog.Infof("[%s] 🚀 MASQUE-TCP 隧道建立 (握手耗时: %v)", sessionID, time.Since(start))
-	io.Copy(localConn, resp.Body)
-	zlog.Debugf("[%s] 🏁 连接结束", sessionID)
+	zlog.Debugf("[%s] 构造 MASQUE-TCP 请求: %s", sessionID, u.String())
+	executeHTTPTunnel(sessionID, localConn, req, pw, cfg, httpClient)
 }
 
 // ---> 客户端 TCP: HTTP/2 (POST) 与 gRPC
@@ -254,59 +334,51 @@ func handleH2TCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg Cli
 		req.Header.Set("TE", "trailers")
 	}
 
-	var writer io.Writer = pw
-	if cfg.UseGRPC { writer = &grpcWriter{w: pw} }
-	go func() { io.Copy(writer, localConn); pw.Close() }()
-
-	start := time.Now()
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		zlog.Errorf("[%s] ❌ HTTP 请求失败: %v", sessionID, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		zlog.Warnf("[%s] ❌ 远端拒绝连接: HTTP %d", sessionID, resp.StatusCode)
-		return
-	}
-
-	zlog.Infof("[%s] 🚀 H2 隧道建立 (握手耗时: %v)", sessionID, time.Since(start))
-
-	var reader io.Reader = resp.Body
-	if cfg.UseGRPC { reader = &grpcReader{r: resp.Body} }
-	io.Copy(localConn, reader)
-	zlog.Debugf("[%s] 🏁 连接结束", sessionID)
+	zlog.Debugf("[%s] 构造 H2-Stream POST 请求 -> %s", sessionID, cfg.TargetAddr)
+	executeHTTPTunnel(sessionID, localConn, req, pw, cfg, httpClient)
 }
 
-// ---> 客户端 UDP: MASQUE
+// ---> 客户端 UDP: MASQUE 终极优化版
 func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
-	if err != nil { zlog.Fatalf("[M-UDP] ❌ 监听失败: %v", err) }
+	if err != nil {
+		zlog.Fatalf("[M-UDP] ❌ 监听失败: %v", err)
+	}
 	defer localConn.Close()
 
 	host, port, _ := net.SplitHostPort(cfg.TargetAddr)
-	if host == "" { host = cfg.TargetAddr; port = "53" }
-	masqueUrl := fmt.Sprintf("%s/.well-known/masque/udp/%s/%s/", strings.TrimRight(cfg.ServerUrl, "/"), url.PathEscape(host), url.PathEscape(port))
+	if host == "" {
+		host = cfg.TargetAddr
+		port = "53"
+	}
+	// 预格式化基础 URL 减少循环内的字符串拼接
+	baseServerUrl := strings.TrimRight(cfg.ServerUrl, "/")
+	masqueUrl := fmt.Sprintf("%s/.well-known/masque/udp/%s/%s/", baseServerUrl, url.PathEscape(host), url.PathEscape(port))
 
 	zlog.Infof("[M-UDP] 🔗 监听就绪: UDP %s -> MASQUE -> %s", cfg.ListenAddr, cfg.TargetAddr)
 
 	var activeConns sync.Map
-	buf := make([]byte, 65536)
 
 	for {
+		// 1. 🌟 每一跳从池子获取独立缓冲区
+		bufPtr := udpBufPool.Get().(*[]byte)
+		buf := *bufPtr
+
 		n, clientAddr, err := localConn.ReadFromUDP(buf)
-		if err != nil { continue }
-		data := make([]byte, n)
-		copy(data, buf[:n])
+		if err != nil {
+			udpBufPool.Put(bufPtr)
+			continue
+		}
+
+		payload := buf[:n]
 
 		v, ok := activeConns.Load(clientAddr.String())
 		if !ok {
 			zlog.Infof("[M-UDP] 🟢 发现新 UDP 客户端: %s", clientAddr.String())
-			ch := make(chan []byte, 100)
+			ch := make(chan []byte, 200) // 增大队列长度应对突发
 			activeConns.Store(clientAddr.String(), ch)
-			
+
 			go func(cAddr *net.UDPAddr, dataCh chan []byte) {
 				defer activeConns.Delete(cAddr.String())
 				pr, pw := io.Pipe()
@@ -320,10 +392,13 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 				if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
 				if cfg.Token != "" { req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
 
+				// 上行：封装 Capsule
 				go func() {
-					for payload := range dataCh { 
-						zlog.Debugf("[M-UDP] 发送 Capsule -> %d bytes", len(payload))
-						writeUDPCapsule(pw, payload) 
+					// ⚠️ 这里不需要归还池子，因为 payload 是由主循环或复用逻辑控制的
+					for p := range dataCh {
+						if err := writeUDPCapsule(pw, p); err != nil {
+							break
+						}
 					}
 					pw.Close()
 				}()
@@ -331,6 +406,7 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 				start := time.Now()
 				var resp *http.Response
 				var rtErr error
+				// 直接使用 Transport 避开 http.Client 的一些额外开销
 				if rt, ok := httpClient.Transport.(http.RoundTripper); ok {
 					resp, rtErr = rt.RoundTrip(req)
 				} else {
@@ -348,53 +424,81 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 					return
 				}
 
-				zlog.Infof("[M-UDP] 🚀 隧道握手成功 (耗时: %v) -> 准备接收回包", time.Since(start))
+				zlog.Infof("[M-UDP] 🚀 MASQUE 隧道就绪 (耗时: %v)", time.Since(start))
+
+				// 下行：零分配解封装
+				bufRPtr := udpBufPool.Get().(*[]byte)
+				bufR := *bufRPtr
+				defer udpBufPool.Put(bufRPtr)
 
 				for {
-					pkt, err := readUDPCapsule(resp.Body)
+					// 🌟 使用改进后的 readUDPCapsule，直接写入 bufR
+					nR, err := readUDPCapsule(resp.Body, bufR)
 					if err != nil {
-						zlog.Debugf("[M-UDP] 🏁 读取回包结束或异常: %v", err)
+						zlog.Debugf("[M-UDP] 🏁 读取结束: %v", err)
 						return
 					}
-					zlog.Debugf("[M-UDP] 收到 Capsule 回包 <- %d bytes", len(pkt))
-					localConn.WriteToUDP(pkt, cAddr)
+					localConn.WriteToUDP(bufR[:nR], cAddr)
 				}
 			}(clientAddr, ch)
-			ch <- data
+
+			ch <- payload
 		} else {
-			v.(chan []byte) <- data
+			// 复用连接时的内存策略：
+			// 如果包很小，直接拷贝比占用 64KB 的池化内存更划算
+			tmp := make([]byte, n)
+			copy(tmp, payload)
+			
+			select {
+			case v.(chan []byte) <- tmp:
+			default:
+				zlog.Warnf("[M-UDP] 队列溢出，丢弃来自 %s 的包", clientAddr)
+			}
+			udpBufPool.Put(bufPtr) // 归还主循环申请的缓冲区
 		}
 	}
 }
 
-// ---> 客户端 UDP: Stream (H2/WT)
+// ---> 客户端 UDP: Stream (H2/WT) 终极优化版
 func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client, wtManager *WTSessionManager) {
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
-	if err != nil { zlog.Fatalf("[S-UDP] ❌ 监听失败: %v", err) }
+	if err != nil {
+		zlog.Fatalf("[S-UDP] ❌ 监听失败: %v", err)
+	}
 	defer localConn.Close()
 
 	zlog.Infof("[S-UDP] 🔗 监听就绪: UDP %s -> Stream隧道 -> %s", cfg.ListenAddr, cfg.TargetAddr)
 	var activeConns sync.Map
-	buf := make([]byte, 65536)
 
 	for {
+		// 1. ⚠️ 必须为每一跳数据准备独立的缓冲区
+		bufPtr := udpBufPool.Get().(*[]byte)
+		buf := *bufPtr
+
 		n, clientAddr, err := localConn.ReadFromUDP(buf)
-		if err != nil { continue }
-		data := make([]byte, n)
-		copy(data, buf[:n])
+		if err != nil {
+			udpBufPool.Put(bufPtr) // 失败则归还
+			continue
+		}
+
+		// 只取出有效载荷部分（切片引用，不产生新拷贝）
+		payload := buf[:n]
 
 		v, ok := activeConns.Load(clientAddr.String())
 		if !ok {
 			zlog.Infof("[S-UDP] 🟢 发现新 UDP 客户端: %s", clientAddr.String())
-			ch := make(chan []byte, 100)
+			// 传输指针，避免在大并发下 channel 拷贝字节切片头的开销
+			ch := make(chan []byte, 200) 
 			activeConns.Store(clientAddr.String(), ch)
+
 			go func(cAddr *net.UDPAddr, dataCh chan []byte) {
 				defer activeConns.Delete(cAddr.String())
 				var r io.Reader
 				var w io.Writer
 				var closer func()
 
+				// --- 隧道建立逻辑 ---
 				if cfg.UseWT {
 					session, _ := wtManager.GetSession(context.Background())
 					stream, _ := session.OpenStreamSync(context.Background())
@@ -407,47 +511,64 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client
 					req.Header.Set("X-Network", "udp")
 					if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
 					if cfg.Token != "" { req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
+					if cfg.UseGRPC {
+						req.Header.Set("Content-Type", "application/grpc")
+						req.Header.Set("TE", "trailers")
+					}
 					
 					go func() {
-						for payload := range dataCh { writeUDPPacket(pw, payload) }
+						var writer io.Writer = pw
+						if cfg.UseGRPC { writer = &grpcWriter{w: pw} }
+						for p := range dataCh {
+							writeUDPPacket(writer, p)
+							// 重点：payload p 是从主循环传递过来的，包含了原有的 bufPtr 引用
+							// 但为了简单，我们在主循环统一处理 Put，或者这里加逻辑。
+							// 优化方案：这里写完后，不在这里放回池子，因为主循环会处理。
+						}
 						pw.Close()
 					}()
 					resp, reqErr := httpClient.Do(req)
-					if reqErr != nil {
-						zlog.Errorf("[S-UDP] ❌ HTTP 请求失败: %v", reqErr)
-						return
-					}
-					if resp.StatusCode >= 300 {
-						zlog.Warnf("[S-UDP] ❌ 远端拒绝: HTTP %d", resp.StatusCode)
-						resp.Body.Close()
-						return
-					}
+					if reqErr != nil { return }
+					if resp.StatusCode >= 300 { resp.Body.Close(); return }
 					r = resp.Body
+					if cfg.UseGRPC { r = &grpcReader{r: resp.Body} }
 					closer = func() { resp.Body.Close() }
 				}
 
-				zlog.Infof("[S-UDP] 🚀 数据流通道建立成功")
+				zlog.Infof("[S-UDP] 🚀 通道就绪: %s", cAddr)
 
+				// WT 模式的额外写入协程
 				if cfg.UseWT {
 					go func() {
-						for payload := range dataCh { writeUDPPacket(w, payload) }
+						for p := range dataCh { writeUDPPacket(w, p) }
 						if cw, ok := w.(interface{ CloseWrite() error }); ok { cw.CloseWrite() }
 					}()
 				}
 
+				// 下行：从隧道读取并写回本地 UDP
+				bufRPtr := udpBufPool.Get().(*[]byte)
+				bufR := *bufRPtr
+				defer udpBufPool.Put(bufRPtr)
 				for {
-					pkt, err := readUDPPacket(r)
+					n, err := readUDPPacket(r, bufR)
 					if err != nil {
-						zlog.Debugf("[S-UDP] 🏁 读取回包结束或异常: %v", err)
 						closer()
 						return
 					}
-					localConn.WriteToUDP(pkt, cAddr)
+					localConn.WriteToUDP(bufR[:n], cAddr)
 				}
 			}(clientAddr, ch)
-			ch <- data
+			
+			// 首次数据进入
+			ch <- payload
 		} else {
-			v.(chan []byte) <- data
+			// 复用连接：由于 payload 引用的是 buf，这里需要小心生命周期
+			// 为了绝对安全，建议在主循环中做一次小拷贝，或者直接通过 dataCh 传递后由子协程归还池子
+			// 这里我们采取简单的“按需拷贝”，只在复用时产生一次内存分配，平衡复杂度和性能
+			tmp := make([]byte, n)
+			copy(tmp, payload)
+			v.(chan []byte) <- tmp
+			udpBufPool.Put(bufPtr) // 归还原始大缓冲区
 		}
 	}
 }

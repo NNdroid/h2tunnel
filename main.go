@@ -16,6 +16,23 @@ import (
 var Version = "dev"
 var zlog *zap.SugaredLogger = zap.NewNop().Sugar()
 
+var (
+	// 用于 TCP io.CopyBuffer 的 32KB 缓冲池
+	tcpBufPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 32*1024)
+			return &buf
+		},
+	}
+	// 用于 UDP 读取的 64KB 缓冲池
+	udpBufPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 65536)
+			return &buf
+		},
+	}
+)
+
 type ServerConfig struct {
 	ListenAddr    string
 	TLSCert       string
@@ -47,6 +64,7 @@ type ClientConfig struct {
 func initLogger(levelStr string) {
 	var level zapcore.Level
 	switch strings.ToLower(levelStr) {
+	case "fatal": level = zapcore.FatalLevel
 	case "debug": level = zapcore.DebugLevel
 	case "info":  level = zapcore.InfoLevel
 	case "warn":  level = zapcore.WarnLevel
@@ -70,26 +88,38 @@ func initLogger(levelStr string) {
 func proxyStream(sessionID string, network string, targetConn net.Conn, tunnelReader io.Reader, tunnelWriter io.Writer, flusher http.Flusher) {
 	zlog.Debugf("[%s] 🔄 代理引擎启动 | Network: %s | 目标地址: %s", sessionID, network, targetConn.RemoteAddr())
 
-	if network == "udp" {
+	// 处理两种 UDP 模式
+	if network == "udp" || network == "masque-udp" {
 		errChan := make(chan error, 2)
 		
 		// 1. 目标 -> 隧道 (Downstream)
 		go func() {
-			buf := make([]byte, 65536)
 			var txBytes int64
+			// 从池子里借一块 64KB 内存
+			bufPtr := udpBufPool.Get().(*[]byte)
+			buf := *bufPtr
+			defer udpBufPool.Put(bufPtr) // 用完还回去
 			for {
 				n, err := targetConn.Read(buf)
 				if n > 0 {
 					txBytes += int64(n)
-					if errW := writeUDPPacket(tunnelWriter, buf[:n]); errW != nil {
-						zlog.Errorf("[%s] ❌ [UDP 目标->隧道] 写入失败: %v", sessionID, errW)
+					var errW error
+					// 根据协议类型选择不同的封包方式
+					if network == "masque-udp" {
+						errW = writeUDPCapsule(tunnelWriter, buf[:n])
+					} else {
+						errW = writeUDPPacket(tunnelWriter, buf[:n])
+					}
+					
+					if errW != nil {
+						zlog.Errorf("[%s] ❌ [%s 目标->隧道] 写入失败: %v", sessionID, network, errW)
 						errChan <- errW
 						return
 					}
 					if flusher != nil { flusher.Flush() }
 				}
 				if err != nil {
-					zlog.Debugf("[%s] 🏁 [UDP 目标->隧道] 读取结束: %v (共下发 %d bytes)", sessionID, err, txBytes)
+					zlog.Debugf("[%s] 🏁 [%s 目标->隧道] 读取结束: %v (共下发 %d bytes)", sessionID, network, err, txBytes)
 					errChan <- err
 					return
 				}
@@ -99,16 +129,28 @@ func proxyStream(sessionID string, network string, targetConn net.Conn, tunnelRe
 		// 2. 隧道 -> 目标 (Upstream)
 		go func() {
 			var rxBytes int64
+			// 从池子里借一块 64KB 内存
+			bufPtr := udpBufPool.Get().(*[]byte)
+			buf := *bufPtr
+			defer udpBufPool.Put(bufPtr) // 用完还回去
 			for {
-				pkt, err := readUDPPacket(tunnelReader)
+				var n int
+				var err error
+				// 根据协议类型选择不同的解包方式
+				if network == "masque-udp" {
+					n, err = readUDPCapsule(tunnelReader, buf)
+				} else {
+					n, err = readUDPPacket(tunnelReader, buf)
+				}
+
 				if err != nil {
-					zlog.Debugf("[%s] 🏁 [UDP 隧道->目标] 读取结束: %v (共上传 %d bytes)", sessionID, err, rxBytes)
+					zlog.Debugf("[%s] 🏁 [%s 隧道->目标] 读取结束: %v (共上传 %d bytes)", sessionID, network, err, rxBytes)
 					errChan <- err
 					return
 				}
-				rxBytes += int64(len(pkt))
-				if _, errW := targetConn.Write(pkt); errW != nil {
-					zlog.Errorf("[%s] ❌ [UDP 隧道->目标] 写入目标失败: %v", sessionID, errW)
+				rxBytes += int64(n)
+				if _, errW := targetConn.Write(buf[:n]); errW != nil {
+					zlog.Errorf("[%s] ❌ [%s 隧道->目标] 写入目标失败: %v", sessionID, network, errW)
 					errChan <- errW
 					return
 				}
@@ -116,7 +158,7 @@ func proxyStream(sessionID string, network string, targetConn net.Conn, tunnelRe
 		}()
 		
 		err := <-errChan
-		zlog.Infof("[%s] ⏹️ UDP 代理生命周期结束: %v", sessionID, err)
+		zlog.Infof("[%s] ⏹️ %s 代理生命周期结束: %v", sessionID, strings.ToUpper(network), err)
 
 	} else {
 		// TCP 模式：引入 WaitGroup 保证双向生命周期完整
@@ -126,7 +168,9 @@ func proxyStream(sessionID string, network string, targetConn net.Conn, tunnelRe
 		// 1. 目标 -> 隧道 (Downstream / 下行)
 		go func() {
 			defer wg.Done()
-			buf := make([]byte, 32*1024)
+			bufPtr := tcpBufPool.Get().(*[]byte)
+			buf := *bufPtr
+			defer tcpBufPool.Put(bufPtr)
 			var nTotal int64
 			
 			// ⚠️ 弃用 io.Copy，手写循环以保证每次读取后立刻 Flush!
