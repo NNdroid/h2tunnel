@@ -8,7 +8,125 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"strconv"
+	"time"
+	"github.com/quic-go/quic-go"
 )
+
+func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
+	// 如果开启了“仅限本地”模式，则进行前缀校验
+	if cfg.LocalOnly {
+		return strings.HasPrefix(target, "127.0.0.1:") || 
+		       strings.HasPrefix(target, "localhost:") || 
+		       strings.HasPrefix(target, "[::1]:")
+	}
+	
+	// 如果没有开启 LocalOnly，则默认放行所有目标
+	return true 
+}
+
+func GetDefaultQUICConfig() *quic.Config {
+	return &quic.Config{
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true,
+		// 允许的无序字节数。高吞吐下必须调大，否则会被拥塞控制卡死
+		MaxStreamReceiveWindow:     8 * 1024 * 1024, // 8 MB (默认通常是 512KB)
+		MaxConnectionReceiveWindow: 20 * 1024 * 1024, // 20 MB
+		// 允许客户端并发开启的最大双向流数量，避免多路复用时因流耗尽导致阻塞
+		MaxIncomingStreams: 1000,
+		// 如果是纯代理环境，可以考虑关闭 KeepAlive 或调长周期，减少控制帧开销
+		KeepAlivePeriod:                  9 * time.Second,
+		MaxIdleTimeout:                   30 * time.Second,    // 限制超时时间
+		MaxIncomingUniStreams:            10000,               // 调大单向流限制
+	}
+}
+
+// IsValidIPPort 校驗字串是否為合法的 IP:Port 格式
+func IsValidIPPort(addr string) bool {
+	// 1. 嘗試將字串拆分為 Host 和 Port
+	// net.SplitHostPort 可以完美處理 IPv6 帶括號的情況，例如 "[::1]:8080"
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+
+	// 2. 驗證 IP 是否合法
+	// net.ParseIP 會過濾掉非法的 IP (例如 256.256.256.256 或一般的網域名稱)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+
+	// 3. 驗證 Port 是否合法
+	// 必須是數字，且範圍在 1 ~ 65535 之間
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return false
+	}
+	if port < 1 || port > 65535 {
+		return false
+	}
+
+	return true
+}
+
+func GetXNetwork(r *http.Request) string {
+	network := r.Header.Get("X-Network")
+	if network != "udp" { network = "tcp" }
+	return network
+}
+
+func GetXTarget(r *http.Request) string {
+	target := r.Header.Get("X-Target")
+	return target
+}
+
+func GetXDst(r *http.Request) (string, string) {
+	network := GetXNetwork(r)
+	target := GetXTarget(r)
+	
+	if target == "" { // 当目标为空时，使用默认值
+		switch network {
+		case "udp":
+			target = "127.0.0.1:53"// DNS
+		default:
+			target = "127.0.0.1:22"// SSH
+		}
+	}
+
+	return network, target
+}
+
+func SetXNetwork(h http.Header, network string) {
+	h.Set("X-Network", network)
+}
+
+func SetXTarget(h http.Header, target string) {
+	h.Set("X-Target", target)
+}
+
+func SetXDst(h http.Header, cfg ClientConfig) (string, string) {
+	network := "tcp"
+	target := ""
+	if cfg.UseUDP { network = "udp" }
+	isValidTarget := IsValidIPPort(cfg.TargetAddr)
+	if isValidTarget { target = cfg.TargetAddr }
+	if target == "" || !isValidTarget { // 当目标为空时，使用默认值
+		switch network {
+		case "udp":
+			target = "127.0.0.1:53"// DNS
+		default:
+			target = "127.0.0.1:22"// SSH
+		}
+	}
+	SetXNetwork(h, network)
+	SetXTarget(h, target)
+	return network, target
+}
+
+func SetXAuth(h http.Header, cfg ClientConfig) {
+	if cfg.Token != "" { h.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
+}
 
 // checkAuth 统一鉴权
 func checkAuth(r *http.Request, expectedToken string) bool {
@@ -104,7 +222,7 @@ func readVarInt(r io.Reader) (uint64, error) {
 	return val, nil
 }
 
-// --- MASQUE UDP Capsule (零分配版本) ---
+// --- MASQUE UDP Capsule ---
 func writeUDPCapsule(w io.Writer, p []byte) error {
 	if err := writeVarInt(w, 0x00); err != nil { return err }
 	if err := writeVarInt(w, uint64(1+len(p))); err != nil { return err }
@@ -134,7 +252,7 @@ func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
 	}
 }
 
-// --- Stream UDP Packets (零分配版本) ---
+// --- Stream UDP Packets ---
 func writeUDPPacket(w io.Writer, p []byte) error {
 	if len(p) > 65535 { return fmt.Errorf("UDP payload > 65535") }
 	var hdr [2]byte
