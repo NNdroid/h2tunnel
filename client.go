@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 	"golang.org/x/net/http2"
@@ -70,8 +69,6 @@ func runClient(args []string) {
 
 	reqUrl := strings.TrimRight(cfg.ServerUrl, "/") + cfg.Path
 	isHTTPS := strings.HasPrefix(reqUrl, "https://")
-	network := "tcp"
-	if cfg.UseUDP { network = "udp" }
 
 	var httpClient *http.Client
 	var wtManager *WTSessionManager
@@ -82,12 +79,7 @@ func runClient(args []string) {
 		if cfg.ServerName != "" { tlsConfig.ServerName = cfg.ServerName }
 		rt := &http3.Transport{
 			TLSClientConfig: tlsConfig,
-			QUICConfig: &quic.Config{
-				EnableDatagrams:                  true,
-				EnableStreamResetPartialDelivery: true,
-				KeepAlivePeriod:                  10 * time.Second,
-				MaxIdleTimeout:                   30 * time.Second,
-			},
+			QUICConfig: GetDefaultQUICConfig(),
 		}
 		httpClient = &http.Client{Transport: rt}
 		zlog.Debugf("[Client] 已初始化 HTTP/3 Transport")
@@ -95,18 +87,13 @@ func runClient(args []string) {
 		tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure, NextProtos: []string{http3.NextProtoH3}}
 		if cfg.ServerName != "" { tlsConfig.ServerName = cfg.ServerName }
 		headers := make(http.Header)
-		headers.Set("X-Target", cfg.TargetAddr)
-		headers.Set("X-Network", network)
-		if cfg.Token != "" { headers.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
+		headers.Set("Protocol", "webtransport")
+		SetXDst(headers, cfg)
+		SetXAuth(headers, cfg)
 		wtManager = &WTSessionManager{
 			dialer: &webtransport.Dialer{
 				TLSClientConfig: tlsConfig,
-				QUICConfig: &quic.Config{
-					EnableDatagrams:                  true,
-					EnableStreamResetPartialDelivery: true,
-					KeepAlivePeriod:                  10 * time.Second,
-					MaxIdleTimeout:                   30 * time.Second,
-				},
+				QUICConfig: GetDefaultQUICConfig(),
 			},
 			reqUrl: reqUrl,
 			headers: headers,
@@ -308,7 +295,8 @@ func handleMasqueTCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg
 	req.Proto = "HTTP/3"
 	req.Header.Set("Protocol", "connect-tcp")
 	if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
-	if cfg.Token != "" { req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
+	SetXDst(req.Header, cfg)
+	SetXAuth(req.Header, cfg)
 
 	zlog.Debugf("[%s] 构造 MASQUE-TCP 请求: %s", sessionID, u.String())
 	executeHTTPTunnel(sessionID, localConn, req, pw, cfg, httpClient)
@@ -324,10 +312,9 @@ func handleH2TCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg Cli
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", reqUrl, pr)
-	req.Header.Set("X-Target", cfg.TargetAddr)
-	req.Header.Set("X-Network", "tcp")
 	if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
-	if cfg.Token != "" { req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
+	SetXDst(req.Header, cfg)
+	SetXAuth(req.Header, cfg)
 	
 	if cfg.UseGRPC {
 		req.Header.Set("Content-Type", "application/grpc")
@@ -338,7 +325,7 @@ func handleH2TCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg Cli
 	executeHTTPTunnel(sessionID, localConn, req, pw, cfg, httpClient)
 }
 
-// ---> 客户端 UDP: MASQUE 终极优化版
+// ---> 客户端 UDP: MASQUE
 func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
@@ -390,7 +377,8 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 				req.Header.Set("Protocol", "connect-udp")
 				req.Header.Set("Capsule-Protocol", "?1")
 				if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
-				if cfg.Token != "" { req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
+				SetXDst(req.Header, cfg)
+				SetXAuth(req.Header, cfg)
 
 				// 上行：封装 Capsule
 				go func() {
@@ -459,7 +447,7 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 	}
 }
 
-// ---> 客户端 UDP: Stream (H2/WT) 终极优化版
+// ---> 客户端 UDP: Stream (H2/WT)
 func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client, wtManager *WTSessionManager) {
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
@@ -500,17 +488,26 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client
 
 				// --- 隧道建立逻辑 ---
 				if cfg.UseWT {
-					session, _ := wtManager.GetSession(context.Background())
-					stream, _ := session.OpenStreamSync(context.Background())
+					session, err := wtManager.GetSession(context.Background())
+					if err != nil || session == nil {
+						zlog.Errorf("[S-UDP] ❌ 无法获取 WT Session: %v", err)
+						return // 必须 return 结束当前协程
+					}
+					
+					stream, err := session.OpenStreamSync(context.Background())
+					if err != nil || stream == nil {
+						zlog.Errorf("[S-UDP] ❌ 无法打开 WT Stream: %v", err)
+						return // 必须 return
+					}
+					
 					r, w = stream, stream
 					closer = func() { stream.Close() }
 				} else {
 					pr, pw := io.Pipe()
 					req, _ := http.NewRequest("POST", reqUrl, pr)
-					req.Header.Set("X-Target", cfg.TargetAddr)
-					req.Header.Set("X-Network", "udp")
 					if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
-					if cfg.Token != "" { req.Header.Set("Proxy-Authorization", "Bearer "+cfg.Token) }
+					SetXDst(req.Header, cfg)
+					SetXAuth(req.Header, cfg)
 					if cfg.UseGRPC {
 						req.Header.Set("Content-Type", "application/grpc")
 						req.Header.Set("TE", "trailers")
