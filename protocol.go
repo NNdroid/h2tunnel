@@ -7,9 +7,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"strconv"
+	"strings"
 	"time"
+
 	"github.com/quic-go/quic-go"
 )
 
