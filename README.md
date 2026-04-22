@@ -20,13 +20,13 @@ We provide a comprehensive one-click script that handles dependencies, binary up
 ### Option 1: Fully Automatic Installation (Recommended)
 Generates a random 16-character Token and a random 32-character Path for maximum security:
 ```bash
-bash -c "$(curl -L [https://raw.githubusercontent.com/NNdroid/h2tunnel/refs/heads/main/install.sh](https://raw.githubusercontent.com/NNdroid/h2tunnel/refs/heads/main/install.sh))" @ install
+bash -c "$(curl -L https://raw.githubusercontent.com/NNdroid/h2tunnel/refs/heads/main/install.sh)" @ install
 ```
 
 ### Option 2: Custom Parameters
 Manually specify your secret Token and proxy Path:
 ```bash
-bash -c "$(curl -L [https://raw.githubusercontent.com/NNdroid/h2tunnel/refs/heads/main/install.sh](https://raw.githubusercontent.com/NNdroid/h2tunnel/refs/heads/main/install.sh))" @ install --token your_secret_token --path /your/secure/path
+bash -c "$(curl -L https://raw.githubusercontent.com/NNdroid/h2tunnel/refs/heads/main/install.sh)" @ install --token your_secret_token --path /your/secure/path
 ```
 
 ## 🛡️ Reverse Proxy Configuration (Nginx & h2c)
