@@ -10,13 +10,23 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
 )
 
 // 预生成的随机字节数组，用于极速填充 Padding，避免运行时计算和内存分配
-var paddingGarbage [4*1024*1024]byte
+var paddingGarbage [4096]byte
+var paddingWritePool = sync.Pool{
+	New: func() interface{} {
+		// 单次最大 chunk 为 1MB (1048576)
+		// Header(6) + Padding(最大不到 512)
+		// 分配 1048576 + 1024 = 1049600 字节，绝对安全且避免越界
+		buf := make([]byte, 1049600)
+		return &buf
+	},
+}
 
 func init() {
 	rand.Read(paddingGarbage[:])
@@ -28,6 +38,45 @@ func fastRand(max int) int {
 	var b [1]byte
 	rand.Read(b[:])
 	return int(b[0]) % max
+}
+
+// calculatePadding 智能动态填充算法
+// 核心思想：反比例填充 + 块边界对齐
+func calculatePadding(dataLen int) int {
+	var targetPad int
+
+	// 阶梯式反比例基础填充
+	switch {
+	case dataLen < 128:
+		// 极小包（握手包、心跳包）：重度混淆，随机填充 128 ~ 384 字节
+		targetPad = 128 + fastRand(256)
+	case dataLen < 512:
+		// 小包（控制指令）：中度混淆，随机填充 64 ~ 192 字节
+		targetPad = 64 + fastRand(128)
+	case dataLen < 8192:
+		// 中等包：轻度混淆，随机填充 16 ~ 64 字节
+		targetPad = 16 + fastRand(48)
+	default:
+		// 大型数据流（高速下载）
+		targetPad = 0
+	}
+
+	// 块对齐增强 (Block Alignment)
+	// 强制让 (真实数据 + Padding) 的总长度对齐到 64 字节边界，
+	// 这会让流量看起来非常像 AES/ChaCha20 这种标准块加密算法的输出特征。
+	totalLen := dataLen + targetPad
+	remainder := totalLen % 64
+	if remainder != 0 {
+		targetPad += (64 - remainder)
+	}
+
+	// 绝对安全边界拦截
+	// 确保 Padding 永远不会超过我们预分配的 paddingGarbage 垃圾池大小
+	if targetPad >= len(paddingGarbage) {
+		targetPad = len(paddingGarbage) - 1
+	}
+
+	return targetPad
 }
 
 func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
@@ -379,32 +428,39 @@ type PaddingWriter struct {
 func (pw *PaddingWriter) Write(p []byte) (nTotal int, err error) {
 	for len(p) > 0 {
 		chunk := p
-		// 既然数据长度有 4 字节，理论上可以支持非常大的单帧（最大 4GB）
-		// 为了防止极端情况下的内存拥塞，这里设一个较大的软限制（例如 1MB），
-		// 实际上由于你的 tcpBufPool 是 32KB，平时根本不会触发此截断。
+		// 控制单帧最大限制为 1MB
 		if len(chunk) > 1048576 {
 			chunk = chunk[:1048576]
 		}
 
-		// 随机生成 0~128 字节的 Padding
-		padLen := fastRand(128) 
-		
-		// [0:4] 为数据长度, [4:6] 为 Padding 长度
-		var header [6]byte
-		binary.BigEndian.PutUint32(header[0:4], uint32(len(chunk)))
-		binary.BigEndian.PutUint16(header[4:6], uint16(padLen))
+		// 智能计算 Padding 长度
+		padLen := calculatePadding(len(chunk)) 
+		totalLen := 6 + len(chunk) + padLen
 
-		// 连续写入：Header -> Data -> Padding
-		if _, err := pw.w.Write(header[:]); err != nil {
-			return nTotal, err
-		}
-		if _, err := pw.w.Write(chunk); err != nil {
-			return nTotal, err
-		}
+		// 🌟 核心优化：从全局池子里“借”一块内存，坚决不用 make
+		bufPtr := paddingWritePool.Get().(*[]byte)
+		buf := *bufPtr
+
+		// 写入 6 字节 Header
+		binary.BigEndian.PutUint32(buf[0:4], uint32(len(chunk)))
+		binary.BigEndian.PutUint16(buf[4:6], uint16(padLen))
+	
+		// 写入真实数据
+		copy(buf[6:], chunk)
+		
+		// 写入垃圾 Padding
 		if padLen > 0 {
-			if _, err := pw.w.Write(paddingGarbage[:padLen]); err != nil {
-				return nTotal, err
-			}
+			copy(buf[6+len(chunk):], paddingGarbage[:padLen])
+		}
+
+		// 🌟 提交给底层发送（切片截取到实际组装的 totalLen）
+		_, errW := pw.w.Write(buf[:totalLen])
+		
+		// 🌟 用完立刻“还”回池子，供其他并发连接复用
+		paddingWritePool.Put(bufPtr)
+
+		if errW != nil {
+			return nTotal, errW
 		}
 
 		nTotal += len(chunk)
