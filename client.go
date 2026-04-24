@@ -152,6 +152,10 @@ func runClient(args []string) {
 func executeHTTPTunnel(sessionID string, localConn net.Conn, req *http.Request, pw *io.PipeWriter, cfg ClientConfig, httpClient *http.Client) {
 	var writer io.Writer = pw
 	if cfg.UseGRPC { writer = &grpcWriter{w: pw} }
+	// ✅ 追加 Padding 拦截层
+	if !cfg.UseUDP {
+		writer = &PaddingWriter{w: writer}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -201,6 +205,10 @@ func executeHTTPTunnel(sessionID string, localConn net.Conn, req *http.Request, 
 		defer wg.Done()
 		var reader io.Reader = resp.Body
 		if cfg.UseGRPC { reader = &grpcReader{r: resp.Body} }
+		// ✅ 追加 Padding 拦截层
+		if !cfg.UseUDP {
+			reader = &PaddingReader{r: reader}
+		}
 
 		n, err := io.Copy(localConn, reader)
 		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
@@ -252,13 +260,20 @@ func handleWTTCPClientConn(localConn net.Conn, sessionID string, cfg ClientConfi
 	}
 	zlog.Infof("[%s] 🚀 WT Stream 开启成功 (耗时: %v)", sessionID, time.Since(start))
 
+	// 🌟 补齐 Padding 层包装
+	var reader io.Reader = stream
+	var writer io.Writer = stream
+	// （注意替换为你配置里真实的开关字段，假设为 EnablePadding）
+	reader = &PaddingReader{r: stream}
+	writer = &PaddingWriter{w: stream}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	// 上行
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(stream, localConn)
+		n, _ := io.Copy(writer, localConn)
 		zlog.Debugf("[%s] ⬆️ [本地->隧道] WT 上传完成 (共 %d bytes)", sessionID, n)
 		stream.Close() // 通知远端结束
 	}()
@@ -266,7 +281,7 @@ func handleWTTCPClientConn(localConn net.Conn, sessionID string, cfg ClientConfi
 	// 下行
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(localConn, stream)
+		n, _ := io.Copy(localConn, reader)
 		zlog.Debugf("[%s] ⬇️ [隧道->本地] WT 下发完成 (共 %d bytes)", sessionID, n)
 		if tc, ok := localConn.(*net.TCPConn); ok {
 			tc.CloseWrite()

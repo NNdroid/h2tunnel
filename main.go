@@ -144,6 +144,9 @@ func proxyStream(sessionID string, network string, targetConn net.Conn, tunnelRe
 		zlog.Infof("[%s] ⏹️ %s 代理生命周期结束: %v", sessionID, strings.ToUpper(network), err)
 
 	} else {
+		// 启用padding
+		tunnelReader := &PaddingReader{r: tunnelReader}
+		tunnelWriter := &PaddingWriter{w: tunnelWriter}
 		// TCP 模式：引入 WaitGroup 保证双向生命周期完整
 		var wg sync.WaitGroup
 		wg.Add(2)

@@ -188,7 +188,7 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 			}
 			defer tConn.Close()
 			zlog.Infof("[%s] 🔗 WT 目标连接成功 (耗时: %v), 开始代理", sID, time.Since(start))
-			
+	
 			proxyStream(sID, netType, tConn, s, s, nil)
 			s.CancelRead(0)
 		}(stream, target, network, streamID) // 传入 stream 指针
@@ -230,6 +230,7 @@ func handleMasqueTCPServer(w http.ResponseWriter, r *http.Request, sessionID str
 	} else {
 		zlog.Warnf("[%s] ⚠️ 警告: ResponseWriter 不支持 Flusher，代理可能发生缓冲延迟！", sessionID)
 	}
+	
 	proxyStream(sessionID, "tcp", targetConn, r.Body, w, flusher)
 }
 
@@ -279,7 +280,6 @@ func handleH2StreamServer(w http.ResponseWriter, r *http.Request, sessionID stri
 		tunnelWriter = &grpcWriter{w: w}
 	}
 	
-	// 无论如何都要进入代理逻辑，不能跳过！
 	proxyStream(sessionID, network, targetConn, tunnelReader, tunnelWriter, flusher)
 }
 

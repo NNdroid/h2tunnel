@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -13,6 +14,21 @@ import (
 
 	"github.com/quic-go/quic-go"
 )
+
+// 预生成的随机字节数组，用于极速填充 Padding，避免运行时计算和内存分配
+var paddingGarbage [4*1024*1024]byte
+
+func init() {
+	rand.Read(paddingGarbage[:])
+}
+
+// 快速获取随机数的轻量级方法（非强加密安全，但满足流量混淆性能要求）
+// 可自定义 max 的范围
+func fastRand(max int) int {
+	var b [1]byte
+	rand.Read(b[:])
+	return int(b[0]) % max
+}
 
 func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
 	// 如果开启了“仅限本地”模式，则进行前缀校验
@@ -225,10 +241,22 @@ func readVarInt(r io.Reader) (uint64, error) {
 
 // --- MASQUE UDP Capsule ---
 func writeUDPCapsule(w io.Writer, p []byte) error {
+	// 随机概率插入 Padding Capsule (混淆长度和流量特征)
+	if fastRand(10) > 6 { // 30% 的概率插入
+		padLen := fastRand(64)
+		// 0x1F23 是自定义的未知类型，接收端的 io.Discard 会自动吃掉它
+		if err := writeVarInt(w, 0x1F23); err != nil { return err } 
+		if err := writeVarInt(w, uint64(padLen)); err != nil { return err }
+		if padLen > 0 {
+			if _, err := w.Write(paddingGarbage[:padLen]); err != nil { return err }
+		}
+	}
+
+	// 正常写入 Datagram (Type 0x00)
 	if err := writeVarInt(w, 0x00); err != nil { return err }
 	if err := writeVarInt(w, uint64(1+len(p))); err != nil { return err }
 	if err := writeVarInt(w, 0x00); err != nil { return err }
-	_, err := w.Write(p) // 直接写入 payload，不拼接新切片
+	_, err := w.Write(p) 
 	return err
 }
 
@@ -256,22 +284,44 @@ func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
 // --- Stream UDP Packets ---
 func writeUDPPacket(w io.Writer, p []byte) error {
 	if len(p) > 65535 { return fmt.Errorf("UDP payload > 65535") }
-	var hdr [2]byte
-	binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
 	
-	if _, err := w.Write(hdr[:]); err != nil { return err }
-	_, err := w.Write(p) // 分两次写入，让底层的 buffer 去处理，避免大内存拷贝
+	padLen := fastRand(64)
+	totalLen := 4 + len(p) + padLen
+
+	bufPtr := udpBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer udpBufPool.Put(bufPtr)
+
+	// 组装 Header
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(p)))
+	binary.BigEndian.PutUint16(buf[2:4], uint16(padLen))
+	
+	// 拼接 Payload 和 Padding
+	copy(buf[4:], p)
+	if padLen > 0 {
+		copy(buf[4+len(p):], paddingGarbage[:padLen])
+	}
+	
+	_, err := w.Write(buf[:totalLen])
 	return err
 }
 
 func readUDPPacket(r io.Reader, payloadBuf []byte) (int, error) {
-	var hdr [2]byte
+	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil { return 0, err }
 	
-	length := binary.BigEndian.Uint16(hdr[:])
-	if int(length) > len(payloadBuf) { return 0, fmt.Errorf("UDP packet too large for buffer") }
+	length := binary.BigEndian.Uint16(hdr[0:2])
+	padLen := binary.BigEndian.Uint16(hdr[2:4])
 	
-	if _, err := io.ReadFull(r, payloadBuf[:length]); err != nil { return 0, err } // 直接读入复用池
+	if int(length) > len(payloadBuf) { return 0, fmt.Errorf("UDP packet too large for buffer: %d", length) }
+	
+	if _, err := io.ReadFull(r, payloadBuf[:length]); err != nil { return 0, err } 
+	
+	if padLen > 0 {
+		if _, err := io.CopyN(io.Discard, r, int64(padLen)); err != nil {
+			return 0, err
+		}
+	}
 	return int(length), nil
 }
 
@@ -317,4 +367,104 @@ func (g *grpcReader) Read(p []byte) (n int, err error) {
 	}
 	g.left -= uint32(n)
 	return n, err
+}
+
+// --- Stream Padding Wrappers ---
+
+// PaddingWriter 对标准 io.Writer 进行混淆包装
+type PaddingWriter struct {
+	w io.Writer
+}
+
+func (pw *PaddingWriter) Write(p []byte) (nTotal int, err error) {
+	for len(p) > 0 {
+		chunk := p
+		// 既然数据长度有 4 字节，理论上可以支持非常大的单帧（最大 4GB）
+		// 为了防止极端情况下的内存拥塞，这里设一个较大的软限制（例如 1MB），
+		// 实际上由于你的 tcpBufPool 是 32KB，平时根本不会触发此截断。
+		if len(chunk) > 1048576 {
+			chunk = chunk[:1048576]
+		}
+
+		// 随机生成 0~128 字节的 Padding
+		padLen := fastRand(128) 
+		
+		// [0:4] 为数据长度, [4:6] 为 Padding 长度
+		var header [6]byte
+		binary.BigEndian.PutUint32(header[0:4], uint32(len(chunk)))
+		binary.BigEndian.PutUint16(header[4:6], uint16(padLen))
+
+		// 连续写入：Header -> Data -> Padding
+		if _, err := pw.w.Write(header[:]); err != nil {
+			return nTotal, err
+		}
+		if _, err := pw.w.Write(chunk); err != nil {
+			return nTotal, err
+		}
+		if padLen > 0 {
+			if _, err := pw.w.Write(paddingGarbage[:padLen]); err != nil {
+				return nTotal, err
+			}
+		}
+
+		nTotal += len(chunk)
+		p = p[len(chunk):]
+	}
+	return nTotal, nil
+}
+
+//傳遞關閉信號到底層 Writer
+func (pw *PaddingWriter) Close() error {
+	if closer, ok := pw.w.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+// PaddingReader 对应的解包器
+type PaddingReader struct {
+	r        io.Reader
+	leftData uint32
+	leftPad  uint16
+}
+
+func (pr *PaddingReader) Read(p []byte) (n int, err error) {
+	for pr.leftData == 0 {
+		// 消耗掉上一帧残留的 Padding (如果有的话)
+		if pr.leftPad > 0 {
+			_, err := io.CopyN(io.Discard, pr.r, int64(pr.leftPad))
+			if err != nil {
+				return 0, err
+			}
+			pr.leftPad = 0
+		}
+
+		// 读取新帧的 6 字节 Header
+		var header [6]byte
+		if _, err := io.ReadFull(pr.r, header[:]); err != nil {
+			return 0, err
+		}
+		pr.leftData = binary.BigEndian.Uint32(header[0:4]) // 解析 4 字节数据长度
+		pr.leftPad = binary.BigEndian.Uint16(header[4:6])
+	}
+
+	// 读取真实载荷
+	toRead := pr.leftData
+	if uint32(len(p)) < toRead {
+		toRead = uint32(len(p)) // 防御性判断：不能超过用户传入的 slice 容量
+	}
+	n, err = pr.r.Read(p[:toRead])
+	if err != nil && err != io.EOF {
+		zlog.Debugf("[PaddingReader] 读取真实数据异常: %v", err)
+	}
+	pr.leftData -= uint32(n)
+	return n, err
+}
+
+//傳遞關閉信號到底層 Reader
+func (pr *PaddingReader) Close() error {
+	if closer, ok := pr.r.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
