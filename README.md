@@ -54,7 +54,7 @@ server {
         proxy_buffering off;
         
         # Forward to local h2c port
-        proxy_pass [http://127.0.0.1:12345](http://127.0.0.1:12345);
+        proxy_pass http://127.0.0.1:12345;
         
 		# 1.1 or 2
         proxy_http_version 1.1;
