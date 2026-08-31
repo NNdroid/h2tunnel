@@ -1,58 +1,204 @@
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
+	"net/url"
 	"os"
 	"strings"
-	"sync"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
-var Version = "dev"
+var Version = "1.1.0"
 var zlog *zap.SugaredLogger = zap.NewNop().Sugar()
 
+type Config struct {
+	Mode      string `json:"mode"`       // "server" or "client"
+	Listen    string `json:"listen"`     // Server listen address (e.g. ":8443") or client listen address (e.g. "127.0.0.1:2222")
+	Server    string `json:"server"`     // Client upstream server URL (e.g. "https://example.com:8443")
+	Target    string `json:"target"`     // Target address to forward to (e.g. "127.0.0.1:22")
+	Path      string `json:"path"`       // HTTP proxy path (e.g. "/tunnel")
+	Token     string `json:"token"`      // Authorization token
+	Transport string `json:"transport"`  // "all", "h2", "h2c", "h3", "wt", "webtransport", "masque", "grpc"
+	Network   string `json:"network"`    // "all" (or "tcp,udp"), "tcp", "udp"
+	TLS       bool   `json:"tls"`        // Enable TLS (auto self-signed if cert/key not provided)
+	Cert      string `json:"cert"`       // TLS certificate path
+	Key       string `json:"key"`        // TLS private key path
+	H3        bool   `json:"h3"`         // Enable HTTP/3 (QUIC)
+	WT        bool   `json:"wt"`         // Enable WebTransport (client)
+	Masque    bool   `json:"masque"`     // Enable MASQUE CONNECT (client)
+	GRPC      bool   `json:"grpc"`       // Enable gRPC mode
+	Insecure  bool   `json:"insecure"`   // Skip TLS certificate verification (client)
+	Host      string `json:"host"`       // Custom Host header (client)
+	SNI       string `json:"sni"`        // Custom SNI (client)
+	ALPN      string `json:"alpn"`       // Custom ALPN (client)
+	LocalOnly bool   `json:"local_only"` // Allow forwarding to localhost only (server)
+	LogLevel  string `json:"log_level"`  // debug, info, warn, error
+}
+
+func (c *Config) UnmarshalJSON(data []byte) error {
+	type Alias Config
+	aux := struct {
+		*Alias
+		RawToken     interface{} `json:"token"`
+		RawAuthToken interface{} `json:"auth_token"`
+		RawPSK       interface{} `json:"psk"`
+		RawProtocol  string      `json:"protocol"`
+	}{
+		Alias: (*Alias)(c),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	collectToken := func(v interface{}) {
+		if v == nil || c.Token != "" {
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			c.Token = strings.TrimSpace(val)
+		case []interface{}:
+			var tokens []string
+			for _, item := range val {
+				if s, ok := item.(string); ok {
+					trimmed := strings.TrimSpace(s)
+					if trimmed != "" {
+						tokens = append(tokens, trimmed)
+					}
+				}
+			}
+			c.Token = strings.Join(tokens, ",")
+		}
+	}
+
+	collectToken(aux.RawToken)
+	collectToken(aux.RawAuthToken)
+	collectToken(aux.RawPSK)
+
+	if aux.RawProtocol != "" && c.Transport == "" {
+		c.Transport = aux.RawProtocol
+	}
+
+	switch strings.ToLower(c.Transport) {
+	case "h3", "http3", "http/3":
+		c.H3 = true
+	case "wt", "webtransport":
+		c.WT = true
+	case "masque":
+		c.Masque = true
+	case "grpc":
+		c.GRPC = true
+	}
+
+	return nil
+}
+
+func applyEnvOverrides(cfg *Config) {
+	getEnv := func(keys ...string) string {
+		for _, k := range keys {
+			if v := os.Getenv(k); v != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
+	}
+
+	if v := getEnv("H2TUNNEL_MODE", "MODE"); v != "" {
+		cfg.Mode = v
+	}
+	if v := getEnv("H2TUNNEL_LISTEN", "LISTEN", "PORT"); v != "" {
+		if !strings.Contains(v, ":") && len(v) < 6 {
+			cfg.Listen = ":" + v
+		} else {
+			cfg.Listen = v
+		}
+	}
+	if v := getEnv("H2TUNNEL_SERVER", "SERVER"); v != "" {
+		cfg.Server = v
+	}
+	if v := getEnv("H2TUNNEL_TARGET", "TARGET"); v != "" {
+		cfg.Target = v
+	}
+	if v := getEnv("H2TUNNEL_PATH", "TUNNEL_PATH", "PROXY_PATH"); v != "" {
+		cfg.Path = v
+	}
+	if v := getEnv("H2TUNNEL_TOKEN", "H2TUNNEL_PSK", "TOKEN", "PSK"); v != "" {
+		cfg.Token = v
+	}
+	if v := getEnv("H2TUNNEL_TRANSPORT", "TRANSPORT"); v != "" {
+		cfg.Transport = v
+	}
+	if v := getEnv("H2TUNNEL_NETWORK", "NETWORK"); v != "" {
+		cfg.Network = v
+	}
+	if v := getEnv("H2TUNNEL_TLS", "TLS"); v != "" {
+		cfg.TLS = (v == "1" || strings.ToLower(v) == "true")
+	}
+	if v := getEnv("H2TUNNEL_LOG_LEVEL", "LOG_LEVEL", "LOGLEVEL"); v != "" {
+		cfg.LogLevel = v
+	}
+}
+
 type ServerConfig struct {
-	ListenAddr    string
-	TLSCert       string
-	TLSKey        string
-	Path          string
-	LocalOnly     bool
-	LogLevel      string
-	EnableH3      bool
-	ExpectedToken string
+	ListenAddr    string `json:"listen"`
+	TLSCert       string `json:"cert"`
+	TLSKey        string `json:"key"`
+	EnableTLS     bool   `json:"tls"`
+	Path          string `json:"path"`
+	LocalOnly     bool   `json:"local_only"`
+	LogLevel      string `json:"log_level"`
+	EnableH3      bool   `json:"h3"`
+	Transport     string `json:"transport"`
+	Network       string `json:"network"` // "all", "tcp", "udp"
+	ExpectedToken string `json:"token"`
 }
 
 type ClientConfig struct {
-	ListenAddr string
-	ServerUrl  string
-	Path       string
-	TargetAddr string
-	Insecure   bool
-	CustomHost string
-	ServerName string
-	UseH3      bool
-	UseWT      bool
-	UseMasque  bool
-	UseUDP     bool
-	UseGRPC    bool
-	LogLevel   string
-	Token      string
+	ListenAddr string `json:"listen"`
+	ServerUrl  string `json:"server"`
+	Path       string `json:"path"`
+	TargetAddr string `json:"target"`
+	Insecure   bool   `json:"insecure"`
+	CustomHost string `json:"host"`
+	ServerName string `json:"sni"`
+	Alpn       string `json:"alpn"`
+	UseH3      bool   `json:"h3"`
+	UseWT      bool   `json:"wt"`
+	UseMasque  bool   `json:"masque"`
+	UseGRPC    bool   `json:"grpc"`
+	Network    string `json:"network"` // "all" / "both", "tcp", "udp"
+	LogLevel   string `json:"log_level"`
+	Token      string `json:"token"`
+}
+
+func (c *ClientConfig) IsUDP() bool {
+	netMode := strings.ToLower(strings.TrimSpace(c.Network))
+	return netMode == "udp" || netMode == "all" || netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp"
+}
+
+func (c *ClientConfig) IsTCP() bool {
+	netMode := strings.ToLower(strings.TrimSpace(c.Network))
+	return netMode == "tcp" || netMode == "all" || netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" || netMode == ""
 }
 
 func initLogger(levelStr string) {
 	var level zapcore.Level
 	switch strings.ToLower(levelStr) {
-	case "fatal": level = zapcore.FatalLevel
-	case "debug": level = zapcore.DebugLevel
-	case "info":  level = zapcore.InfoLevel
-	case "warn":  level = zapcore.WarnLevel
-	case "error": level = zapcore.ErrorLevel
-	default:      level = zapcore.InfoLevel
+	case "debug":
+		level = zapcore.DebugLevel
+	case "info":
+		level = zapcore.InfoLevel
+	case "warn":
+		level = zapcore.WarnLevel
+	case "error":
+		level = zapcore.ErrorLevel
+	default:
+		level = zapcore.InfoLevel
 	}
 
 	encoderConfig := zap.NewProductionEncoderConfig()
@@ -67,175 +213,280 @@ func initLogger(levelStr string) {
 	zlog = zap.New(core).Sugar()
 }
 
-// proxyStream 稳健的双向代理引擎
-func proxyStream(sessionID string, network string, targetConn net.Conn, tunnelReader io.Reader, tunnelWriter io.Writer, flusher http.Flusher) {
-	zlog.Debugf("[%s] 🔄 代理引擎启动 | Network: %s | 目标地址: %s", sessionID, network, targetConn.RemoteAddr())
-
-	// 处理两种 UDP 模式
-	if network == "udp" || network == "masque-udp" {
-		errChan := make(chan error, 2)
-		
-		// 1. 目标 -> 隧道 (Downstream)
-		go func() {
-			var txBytes int64
-			// 从池子里借一块 64KB 内存
-			bufPtr := udpBufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer udpBufPool.Put(bufPtr) // 用完还回去
-			for {
-				n, err := targetConn.Read(buf)
-				if n > 0 {
-					txBytes += int64(n)
-					var errW error
-					// 根据协议类型选择不同的封包方式
-					if network == "masque-udp" {
-						errW = writeUDPCapsule(tunnelWriter, buf[:n])
-					} else {
-						errW = writeUDPPacket(tunnelWriter, buf[:n])
-					}
-					
-					if errW != nil {
-						zlog.Errorf("[%s] ❌ [%s 目标->隧道] 写入失败: %v", sessionID, network, errW)
-						errChan <- errW
-						return
-					}
-					if flusher != nil { flusher.Flush() }
-				}
-				if err != nil {
-					zlog.Debugf("[%s] 🏁 [%s 目标->隧道] 读取结束: %v (共下发 %d bytes)", sessionID, network, err, txBytes)
-					errChan <- err
-					return
-				}
-			}
-		}()
-		
-		// 2. 隧道 -> 目标 (Upstream)
-		go func() {
-			var rxBytes int64
-			// 从池子里借一块 64KB 内存
-			bufPtr := udpBufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer udpBufPool.Put(bufPtr) // 用完还回去
-			for {
-				var n int
-				var err error
-				// 根据协议类型选择不同的解包方式
-				if network == "masque-udp" {
-					n, err = readUDPCapsule(tunnelReader, buf)
-				} else {
-					n, err = readUDPPacket(tunnelReader, buf)
-				}
-
-				if err != nil {
-					zlog.Debugf("[%s] 🏁 [%s 隧道->目标] 读取结束: %v (共上传 %d bytes)", sessionID, network, err, rxBytes)
-					errChan <- err
-					return
-				}
-				rxBytes += int64(n)
-				if _, errW := targetConn.Write(buf[:n]); errW != nil {
-					zlog.Errorf("[%s] ❌ [%s 隧道->目标] 写入目标失败: %v", sessionID, network, errW)
-					errChan <- errW
-					return
-				}
-			}
-		}()
-		
-		err := <-errChan
-		zlog.Infof("[%s] ⏹️ %s 代理生命周期结束: %v", sessionID, strings.ToUpper(network), err)
-
-	} else {
-		// 启用padding
-		tunnelReader := &PaddingReader{r: tunnelReader}
-		tunnelWriter := &PaddingWriter{w: tunnelWriter}
-		// TCP 模式：引入 WaitGroup 保证双向生命周期完整
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// 1. 目标 -> 隧道 (Downstream / 下行)
-		go func() {
-			defer wg.Done()
-			bufPtr := tcpBufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer tcpBufPool.Put(bufPtr)
-			var nTotal int64
-			
-			// ⚠️ 弃用 io.Copy，手写循环以保证每次读取后立刻 Flush!
-			for {
-				n, err := targetConn.Read(buf)
-				if n > 0 {
-					nTotal += int64(n)
-					_, errW := tunnelWriter.Write(buf[:n])
-					if flusher != nil { flusher.Flush() } // 关键修复：立刻把数据推给客户端！
-					if errW != nil {
-						zlog.Warnf("[%s] ❌ [TCP 目标->隧道] 写入 HTTP 流失败: %v", sessionID, errW)
-						break
-					}
-				}
-				if err != nil {
-					if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-						zlog.Warnf("[%s] ⚠️ [TCP 目标->隧道] 异常断开: %v (共下发 %d bytes)", sessionID, err, nTotal)
-					} else {
-						zlog.Debugf("[%s] ⬇️ [TCP 目标->隧道] 传输完成 (共下发 %d bytes)", sessionID, nTotal)
-					}
-					break
-				}
-			}
-			
-			// 下行结束（目标断开或网络错误），强行切断目标连接，防止上行死锁
-			targetConn.Close()
-		}()
-
-		// 2. 隧道 -> 目标 (Upstream / 上行)
-		go func() {
-			defer wg.Done()
-			n, err := io.Copy(targetConn, tunnelReader)
-			
-			if err != nil && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-				zlog.Warnf("[%s] ⚠️ [TCP 隧道->目标] 异常断开: %v (共上传 %d bytes)", sessionID, err, n)
-				targetConn.Close() // 异常断开，全关
-			} else {
-				zlog.Debugf("[%s] ⬆️ [TCP 隧道->目标] 传输完成 (共上传 %d bytes)", sessionID, n)
-				
-				// 客户端主动发完数据（如 DNS 41 bytes 请求），触发半关闭
-				if tc, ok := targetConn.(*net.TCPConn); ok {
-					zlog.Debugf("[%s] 🔌 触发 TCP CloseWrite", sessionID)
-					tc.CloseWrite()
-				} else if cw, ok := targetConn.(interface{ CloseWrite() error }); ok {
-					zlog.Debugf("[%s] 🔌 触发通用 CloseWrite", sessionID)
-					cw.CloseWrite()
-				}
-			}
-		}()
-
-		// ⚠️ 必须等上下行协程全部退出，当前代理生命周期才算真正结束！
-		wg.Wait()
-		zlog.Infof("[%s] ⏹️ TCP 代理生命周期正常结束", sessionID)
+func loadConfigFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	applyEnvOverrides(&cfg)
+	return &cfg, nil
 }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-c" || os.Args[1] == "--config" || strings.HasPrefix(os.Args[1], "-c=") || strings.HasPrefix(os.Args[1], "--config=")) {
+		confPath := "config.json"
+		if strings.Contains(os.Args[1], "=") {
+			confPath = strings.SplitN(os.Args[1], "=", 2)[1]
+		} else if len(os.Args) > 2 {
+			confPath = os.Args[2]
+		}
+		runFromConfig(confPath)
+		return
+	}
+
 	if len(os.Args) < 2 {
+		if _, err := os.Stat("config.json"); err == nil {
+			runFromConfig("config.json")
+			return
+		}
 		printUsage()
 		os.Exit(1)
 	}
+
 	switch os.Args[1] {
-	case "server": runServer(os.Args[2:])
-	case "client": runClient(os.Args[2:])
+	case "server":
+		runServer(os.Args[2:])
+	case "client":
+		runClient(os.Args[2:])
+	case "gen-uri":
+		runGenURI(os.Args[2:])
+	case "gen-systemd":
+		runGenSystemd(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("h2tunnel version %s\n", Version)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
-		fmt.Printf("未知子命令: %s\n", os.Args[1])
+		fmt.Printf("Unknown subcommand: %s\n", os.Args[1])
 		printUsage()
 		os.Exit(1)
 	}
 }
 
+func runGenURI(args []string) {
+	fs := flag.NewFlagSet("gen-uri", flag.ExitOnError)
+	cfgPath := fs.String("c", "", "Path to configuration file")
+	host := fs.String("host", "", "Server public IP or domain")
+	port := fs.String("port", "", "Server listen port")
+	path := fs.String("path", "", "Proxy path")
+	transport := fs.String("transport", "", "Transport (h2, h3, wt, masque, grpc)")
+	target := fs.String("target", "", "Forward target")
+	token := fs.String("token", "", "Token")
+	sni := fs.String("sni", "", "SNI disguise")
+	remark := fs.String("name", "", "Node remark name")
+	insecure := fs.Bool("insecure", true, "Skip TLS verify")
+	pin := fs.String("pin", "", "Share PIN (6 digits). Empty = auto-generate a random PIN")
+	_ = fs.Parse(args)
+
+	// 配置优先于内置默认，但命令行 flag 可覆盖配置中的任意字段
+	if *cfgPath != "" {
+		if fileCfg, err := loadConfigFile(*cfgPath); err == nil {
+			// 优先从 client 配置的 server URL 反解出公网 host/port
+			if *host == "" && fileCfg.Server != "" {
+				if u, err := url.Parse(fileCfg.Server); err == nil && u.Host != "" {
+					*host = u.Hostname()
+					if u.Port() != "" {
+						*port = u.Port()
+					}
+				}
+			}
+			if *port == "" && fileCfg.Listen != "" {
+				if _, p, err := net.SplitHostPort(fileCfg.Listen); err == nil {
+					*port = p
+				}
+			}
+			if *path == "" && fileCfg.Path != "" {
+				*path = fileCfg.Path
+			}
+			if *target == "" && fileCfg.Target != "" {
+				*target = fileCfg.Target
+			}
+			if *token == "" && fileCfg.Token != "" {
+				*token = fileCfg.Token
+			}
+			if *sni == "" && fileCfg.SNI != "" {
+				*sni = fileCfg.SNI
+			}
+			// transport 兼容 "transport":"h3" 字符串与 {"h3":true} 布尔两种写法
+			if *transport == "" {
+				switch {
+				case fileCfg.H3:
+					*transport = "h3"
+				case fileCfg.WT:
+					*transport = "wt"
+				case fileCfg.Masque:
+					*transport = "masque"
+				case fileCfg.GRPC:
+					*transport = "grpc"
+				case fileCfg.Transport != "":
+					*transport = fileCfg.Transport
+				}
+			}
+		}
+	}
+
+	// 内置默认兜底
+	if *host == "" {
+		*host = "your-server-ip"
+	}
+	if *port == "" {
+		*port = "8443"
+	}
+	if *path == "" {
+		*path = "/tunnel"
+	}
+	if *transport == "" {
+		*transport = "h2"
+	}
+	if *target == "" {
+		*target = "127.0.0.1:22"
+	}
+	if *remark == "" {
+		*remark = "H2Tunnel Node"
+	}
+
+	uri := GenerateH2TunnelURI(*transport, *host, *port, *path, *target, *token, *sni, *remark, *pin, *insecure)
+	fmt.Printf("=== 📱 h2tunnel Sharing URI ===\n\n%s\n", uri)
+	PrintTerminalQR(uri)
+}
+
+// loadConfigFromArgs parses only -c/--config and returns the merged Config.
+// The per-parameter command-line flags have been removed; the configuration
+// file is now the single source of truth. When no file is given, built-in
+// defaults are applied by the build*Config helpers, and the old `-insecure`
+// default (true) is preserved so a bare client run still works.
+func loadConfigFromArgs(args []string) *Config {
+	fs := flag.NewFlagSet("config", flag.ExitOnError)
+	c := fs.String("c", "", "Path to configuration file")
+	conf := fs.String("config", "", "Path to configuration file")
+	_ = fs.Parse(args)
+
+	cp := *c
+	if cp == "" {
+		cp = *conf
+	}
+	cfg := &Config{}
+	if cp != "" {
+		fileCfg, err := loadConfigFile(cp)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config file %s: %v\n", cp, err)
+			os.Exit(1)
+		}
+		cfg = fileCfg
+	} else {
+		// bare run: preserve the old `-insecure` flag default
+		cfg.Insecure = true
+		fmt.Fprintln(os.Stderr, "⚠️ 警告: 未指定配置文件，客户端默认跳过 TLS 证书校验 (Insecure=true)，在不可信网络中易被中间人攻击。生产环境请通过配置文件显式设置并校验证书指纹。")
+	}
+	applyEnvOverrides(cfg)
+	return cfg
+}
+
+func buildServerConfig(cfg *Config) ServerConfig {
+	listen := cfg.Listen
+	if listen == "" {
+		listen = ":8443"
+	}
+	path := cfg.Path
+	if path == "" {
+		path = "/tunnel"
+	}
+	logLevel := cfg.LogLevel
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
+	if netMode == "" || netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" {
+		netMode = "all"
+	}
+
+	return ServerConfig{
+		ListenAddr:    listen,
+		TLSCert:       cfg.Cert,
+		TLSKey:        cfg.Key,
+		EnableTLS:     cfg.TLS,
+		Path:          path,
+		LocalOnly:     cfg.LocalOnly,
+		LogLevel:      logLevel,
+		EnableH3:      cfg.H3,
+		Transport:     cfg.Transport,
+		Network:       netMode,
+		ExpectedToken: cfg.Token,
+	}
+}
+
+func buildClientConfig(cfg *Config) ClientConfig {
+	listen := cfg.Listen
+	if listen == "" {
+		listen = "127.0.0.1:2222"
+	}
+	server := cfg.Server
+	if server == "" {
+		server = "https://127.0.0.1:8443"
+	}
+	path := cfg.Path
+	if path == "" {
+		path = "/tunnel"
+	}
+	target := cfg.Target
+	if target == "" {
+		target = "127.0.0.1:22"
+	}
+	logLevel := cfg.LogLevel
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
+	if netMode == "" {
+		netMode = "tcp"
+	} else if netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" {
+		netMode = "all"
+	}
+
+	return ClientConfig{
+		ListenAddr: listen,
+		ServerUrl:  server,
+		Path:       path,
+		TargetAddr: target,
+		Insecure:   cfg.Insecure,
+		CustomHost: cfg.Host,
+		ServerName: cfg.SNI,
+		Alpn:       cfg.ALPN,
+		UseH3:      cfg.H3,
+		UseWT:      cfg.WT,
+		UseMasque:  cfg.Masque,
+		UseGRPC:    cfg.GRPC,
+		Network:    netMode,
+		LogLevel:   logLevel,
+		Token:      cfg.Token,
+	}
+}
+
+func runFromConfig(path string) {
+	cfg, err := loadConfigFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read config file %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	applyEnvOverrides(cfg)
+	if strings.ToLower(cfg.Mode) == "client" {
+		startClientDirect(buildClientConfig(cfg))
+	} else {
+		startServerDirect(buildServerConfig(cfg))
+	}
+}
+
 func printUsage() {
-	fmt.Println("使用方法: h2tunnel <子命令> [参数]")
-	fmt.Println("\n子命令:")
-	fmt.Println("  server    启动隧道服务端")
-	fmt.Println("  client    启动隧道客户端")
-	fmt.Println("  version   查看当前版本号")
+	fmt.Println("Usage: h2tunnel <command> [options] or h2tunnel -c config.json")
+	fmt.Println("\nCommands:")
+	fmt.Println("  server       Start h2tunnel multiplexing proxy server")
+	fmt.Println("  client       Start h2tunnel proxy client")
+	fmt.Println("  gen-uri      Generate Stun client sharing URI link & QR Code")
+	fmt.Println("  gen-systemd  Generate Linux systemd service unit")
+	fmt.Println("  version      Show version information")
+	fmt.Println("  help         Show help message")
 }

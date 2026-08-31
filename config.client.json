@@ -1,0 +1,31 @@
+{
+  "_description": "h2tunnel Multi-Protocol Multiplexing Client Configuration",
+  "_fields": {
+    "mode": "Operational mode: 'client'",
+    "listen": "Local TCP port for incoming client connections (e.g. 127.0.0.1:2222)",
+    "server": "Remote h2tunnel server URL (e.g. https://example.com:8443)",
+    "target": "Target backend service address to request from the server (e.g. 127.0.0.1:22)",
+    "path": "HTTP proxy endpoint URL path matching server (e.g. /tunnel)",
+    "transport": "Client transport protocol: 'h2' (HTTP/2 Stream POST), 'h2c' (cleartext H2), 'grpc' (gRPC streaming), 'wt' (WebTransport over H3/QUIC), 'masque' (RFC 9298 MASQUE CONNECT), 'h3' (HTTP/3)",
+    "network": "Local client listener mode: 'tcp' (listen on TCP port only), 'udp' (listen on UDP port only), 'both' (listen on both TCP and UDP ports simultaneously)",
+    "token": "Proxy-Authorization Token matching server (aliases: auth_token, psk)",
+    "sni": "TLS Server Name Indication (SNI) disguise domain",
+    "host": "HTTP Host header disguise domain",
+    "alpn": "Custom ALPN string (e.g. h2, h3)",
+    "insecure": "Skip TLS certificate chain verification (recommended when using self-signed certs)",
+    "log_level": "Logging verbosity: debug, info, warn, error"
+  },
+  "mode": "client",
+  "listen": "127.0.0.1:2222",
+  "server": "https://example.com:8443",
+  "target": "127.0.0.1:22",
+  "path": "/tunnel",
+  "transport": "h2",
+  "network": "both",
+  "token": "my_secret_token",
+  "sni": "www.bing.com",
+  "host": "www.bing.com",
+  "alpn": "h2",
+  "insecure": true,
+  "log_level": "info"
+}

@@ -22,14 +22,16 @@ func setupBenchmarkEnv() (serverURL, targetAddr, testToken string) {
 	serverURL = "https://" + serverAddr
 	testToken = "bench-token"
 
-	// 启动服务端 (设为 fatal 级别，防止日志 I/O 严重拖慢压测成绩)
-	go runServer([]string{
-		"-listen", serverAddr,
-		"-cert", certFile,
-		"-key", keyFile,
-		"-h3",
-		"-token", testToken,
-		"-loglevel", "fatal",
+	// 启动服务端 (config-only: 直接构造 ServerConfig)
+	go startServerDirect(ServerConfig{
+		ListenAddr:    serverAddr,
+		TLSCert:       certFile,
+		TLSKey:        keyFile,
+		EnableTLS:     true,
+		Path:          "/tunnel",
+		EnableH3:      true,
+		ExpectedToken: testToken,
+		LogLevel:      "fatal", // 压测时关掉服务端日志
 	})
 
 	time.Sleep(2 * time.Second)
@@ -53,7 +55,7 @@ func BenchmarkH2TunnelAllProtocols(b *testing.B) {
 		{"H3_TCP", "30003", false, []string{"-h3"}},
 		{"WT_TCP", "30004", false, []string{"-wt"}},
 		{"MASQUE_TCP", "30005", false, []string{"-masque"}},
-		
+
 		// ---- UDP 代理组 ----
 		{"H2_UDP_Stream", "30006", true, []string{"-udp"}},
 		{"gRPC_UDP_Stream", "30007", true, []string{"-udp", "-grpc"}},
@@ -62,18 +64,38 @@ func BenchmarkH2TunnelAllProtocols(b *testing.B) {
 		{"MASQUE_UDP", "30010", true, []string{"-udp", "-masque"}},
 	}
 
-	// 提前启动所有的客户端进行预热
+	// 提前启动所有的客户端进行预热 (协议开关映射到 ClientConfig 字段)
 	for _, tc := range cases {
 		clientListen := "127.0.0.1:" + tc.clientPort
-		baseArgs := []string{
-			"-listen", clientListen,
-			"-server", serverURL,
-			"-target", targetAddr,
-			"-insecure",
-			"-token", testToken,
-			"-loglevel", "fatal", // 压测时关掉客户端日志
+		cc := ClientConfig{
+			ListenAddr: clientListen,
+			ServerUrl:  serverURL,
+			Path:       "/tunnel",
+			TargetAddr: targetAddr,
+			Insecure:   true,
+			Token:      testToken,
+			LogLevel:   "fatal", // 压测时关掉客户端日志
 		}
-		go runClient(append(baseArgs, tc.args...))
+		for i := 0; i < len(tc.args); i++ {
+			switch tc.args[i] {
+			case "-grpc":
+				cc.UseGRPC = true
+			case "-h3":
+				cc.UseH3 = true
+			case "-wt":
+				cc.UseWT = true
+			case "-masque":
+				cc.UseMasque = true
+			case "-udp":
+				cc.Network = "udp"
+			case "-alpn":
+				if i+1 < len(tc.args) {
+					cc.Alpn = tc.args[i+1]
+					i++
+				}
+			}
+		}
+		go startClientDirect(cc)
 	}
 	time.Sleep(2 * time.Second) // 等待所有客户端端口绑定完毕
 
@@ -96,7 +118,7 @@ func BenchmarkH2TunnelAllProtocols(b *testing.B) {
 				b.Fatalf("无法连接到客户端: %v", err)
 			}
 			defer conn.Close()
-			
+
 			// 为 UDP 和 TCP 设置读写超时，防止异常时死锁
 			conn.SetDeadline(time.Now().Add(30 * time.Second))
 

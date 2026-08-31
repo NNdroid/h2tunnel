@@ -55,10 +55,14 @@ func startEchoServer(addr string) {
 	// TCP Echo
 	go func() {
 		l, err := net.Listen("tcp", addr)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		for {
 			conn, err := l.Accept()
-			if err != nil { continue }
+			if err != nil {
+				continue
+			}
 			go func(c net.Conn) { defer c.Close(); io.Copy(c, c) }(conn)
 		}
 	}()
@@ -67,10 +71,12 @@ func startEchoServer(addr string) {
 	go func() {
 		uAddr, _ := net.ResolveUDPAddr("udp", addr)
 		conn, err := net.ListenUDP("udp", uAddr)
-		if err != nil { return }
-		
+		if err != nil {
+			return
+		}
+
 		// 🚨 这里的 65536 是关键！必须大于压测的 payloadSize (16384)
-		buf := make([]byte, 65536) 
+		buf := make([]byte, 65536)
 		for {
 			n, cAddr, err := conn.ReadFromUDP(buf)
 			if err == nil {
@@ -98,14 +104,16 @@ func TestH2TunnelAllModes(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "secret-e2e-token"
 
-	// 2. 启动隧道服务端
-	go runServer([]string{
-		"-listen", serverAddr,
-		"-cert", certFile,
-		"-key", keyFile,
-		"-h3", // 开启 H3 以支持 WT 和 MASQUE
-		"-token", testToken,
-		"-loglevel", "error", // 减少测试时的日志刷屏，想看详细过程可以改为 debug
+	// 2. 启动隧道服务端 (config-only: 直接构造 ServerConfig，避免依赖已移除的 CLI flag)
+	go startServerDirect(ServerConfig{
+		ListenAddr:    serverAddr,
+		TLSCert:       certFile,
+		TLSKey:        keyFile,
+		EnableTLS:     true,
+		Path:          "/tunnel",
+		EnableH3:      true, // 开启 H3 以支持 WT 和 MASQUE
+		ExpectedToken: testToken,
+		LogLevel:      "error", // 减少测试时的日志刷屏，想看详细过程可以改为 debug
 	})
 
 	// 给服务端一点时间启动
@@ -127,7 +135,8 @@ func TestH2TunnelAllModes(t *testing.T) {
 		{"H3_TCP", "20003", false, []string{"-h3"}},
 		{"WT_TCP", "20004", false, []string{"-wt"}},
 		{"MASQUE_TCP", "20005", false, []string{"-masque"}},
-		
+		{"MASQUE_H2_TCP", "20011", false, []string{"-masque", "-alpn", "h2"}},
+
 		// ---- UDP 系列 ----
 		{"H2_UDP_Stream", "20006", true, []string{"-udp"}},
 		{"gRPC_UDP_Stream", "20007", true, []string{"-udp", "-grpc"}},
@@ -140,20 +149,37 @@ func TestH2TunnelAllModes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clientListen := "127.0.0.1:" + tc.clientPort
-			
-			// 组装客户端启动参数
-			baseArgs := []string{
-				"-listen", clientListen,
-				"-server", serverURL,
-				"-target", targetAddr,
-				"-insecure",
-				"-token", testToken,
-				"-loglevel", "error",
-			}
-			clientArgs := append(baseArgs, tc.args...)
 
-			// 启动对应的客户端
-			go runClient(clientArgs)
+			// 启动对应的客户端 (config-only: 协议开关从 tc.args 映射到 ClientConfig 字段)
+			cc := ClientConfig{
+				ListenAddr: clientListen,
+				ServerUrl:  serverURL,
+				Path:       "/tunnel",
+				TargetAddr: targetAddr,
+				Insecure:   true,
+				Token:      testToken,
+				LogLevel:   "error",
+			}
+			for i := 0; i < len(tc.args); i++ {
+				switch tc.args[i] {
+				case "-grpc":
+					cc.UseGRPC = true
+				case "-h3":
+					cc.UseH3 = true
+				case "-wt":
+					cc.UseWT = true
+				case "-masque":
+					cc.UseMasque = true
+				case "-udp":
+					cc.Network = "udp"
+				case "-alpn":
+					if i+1 < len(tc.args) {
+						cc.Alpn = tc.args[i+1]
+						i++
+					}
+				}
+			}
+			go startClientDirect(cc)
 			time.Sleep(1 * time.Second) // 等待客户端监听就绪
 
 			// 发起真实数据测试
@@ -192,8 +218,260 @@ func TestH2TunnelAllModes(t *testing.T) {
 			if string(buf[:n]) != string(testMsg) {
 				t.Fatalf("数据损坏! 预期: %s, 实际收到: %s", testMsg, buf[:n])
 			}
-			
+
 			t.Logf("✅ 完美通过!")
 		})
 	}
+}
+
+// =========================================
+// 4. 模拟真实非 Echo 服务交互测试 (如 SSH 协议握手)
+// 验证 Padding 在真实服务端被正确解封装与封装，绝无数据污染
+// =========================================
+func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
+	certFile := "test_cert_realistic.pem"
+	keyFile := "test_key_realistic.pem"
+	generateTestCerts(certFile, keyFile)
+	defer os.Remove(certFile)
+	defer os.Remove(keyFile)
+
+	targetAddr := "127.0.0.1:21000"
+	serverAddr := "127.0.0.1:21443"
+	serverURL := "https://" + serverAddr
+	testToken := "realistic-token"
+
+	// 启动非 Echo 模拟服务 (服务端先发送 Banner，再交互)
+	ln, err := net.Listen("tcp", targetAddr)
+	if err != nil {
+		t.Fatalf("无法监听测试服务端口: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+				// 1. 服务端先主动向客户端发送 SSH-Banner
+				_, _ = conn.Write([]byte("SSH-2.0-OpenSSH_9.0\r\n"))
+
+				// 2. 服务端读取客户端发来的 Client-Banner
+				buf := make([]byte, 100)
+				n, err := conn.Read(buf)
+				if err != nil || string(buf[:n]) != "SSH-2.0-CustomClient\r\n" {
+					return
+				}
+
+				// 3. 服务端回复确认包
+				_, _ = conn.Write([]byte("SERVER_HANDSHAKE_OK\r\n"))
+			}(c)
+		}
+	}()
+
+	// 启动 H2Tunnel 服务端
+	go startServerDirect(ServerConfig{
+		ListenAddr:    serverAddr,
+		TLSCert:       certFile,
+		TLSKey:        keyFile,
+		EnableTLS:     true,
+		Path:          "/tunnel",
+		ExpectedToken: testToken,
+		LogLevel:      "error",
+	})
+	time.Sleep(1 * time.Second)
+
+	clientListen := "127.0.0.1:21001"
+	go startClientDirect(ClientConfig{
+		ListenAddr: clientListen,
+		ServerUrl:  serverURL,
+		Path:       "/tunnel",
+		TargetAddr: targetAddr,
+		Insecure:   true,
+		Token:      testToken,
+		LogLevel:   "error",
+	})
+	time.Sleep(1 * time.Second)
+
+	conn, err := net.Dial("tcp", clientListen)
+	if err != nil {
+		t.Fatalf("连接客户端失败: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 1. 客户端应该先读取到服务端主动下发的 Banner
+	serverBanner := make([]byte, 21)
+	_, err = io.ReadFull(conn, serverBanner)
+	if err != nil {
+		t.Fatalf("读取服务端 Banner 失败: %v", err)
+	}
+	if string(serverBanner) != "SSH-2.0-OpenSSH_9.0\r\n" {
+		t.Fatalf("服务端 Banner 损坏! 收到: %q", string(serverBanner))
+	}
+
+	// 2. 客户端发送 Client-Banner
+	_, err = conn.Write([]byte("SSH-2.0-CustomClient\r\n"))
+	if err != nil {
+		t.Fatalf("发送客户端 Banner 失败: %v", err)
+	}
+
+	// 3. 客户端读取服务端二次回复
+	reply := make([]byte, 21)
+	_, err = io.ReadFull(conn, reply)
+	if err != nil {
+		t.Fatalf("读取确认回复失败: %v", err)
+	}
+	if string(reply) != "SERVER_HANDSHAKE_OK\r\n" {
+		t.Fatalf("确认回复损坏! 收到: %q", string(reply))
+	}
+
+	t.Log("✅ 真实非 Echo 协议全双工握手测试完美通过！")
+}
+
+// =========================================
+// 5. 严格协议分流与网络类型门禁测试 (Strict Demux)
+// =========================================
+func TestH2Tunnel_StrictDemux(t *testing.T) {
+	certFile := "test_cert_demux.pem"
+	keyFile := "test_key_demux.pem"
+	generateTestCerts(certFile, keyFile)
+	defer os.Remove(certFile)
+	defer os.Remove(keyFile)
+
+	targetAddr := "127.0.0.1:22000"
+	startEchoServer(targetAddr)
+
+	serverAddr := "127.0.0.1:22443"
+	serverURL := "https://" + serverAddr
+	testToken := "demux-token"
+
+	// 启动严格模式服务端：仅允许 gRPC 且仅允许 TCP
+	go startServerDirect(ServerConfig{
+		ListenAddr:    serverAddr,
+		TLSCert:       certFile,
+		TLSKey:        keyFile,
+		EnableTLS:     true,
+		Path:          "/tunnel",
+		Transport:     "grpc", // 严格限定必须为 gRPC
+		Network:       "tcp",  // 严格限定只允许 TCP，拒绝 UDP
+		ExpectedToken: testToken,
+		LogLevel:      "error",
+	})
+	time.Sleep(1 * time.Second)
+
+	// 测试用例 1: 客户端未开启 gRPC 发起 H2 POST 请求 -> 应被服务端严格分流拦截 (403)
+	t.Run("Reject_Non_gRPC_When_Server_Requires_gRPC", func(t *testing.T) {
+		clientListen := "127.0.0.1:22001"
+		go startClientDirect(ClientConfig{
+			ListenAddr: clientListen,
+			ServerUrl:  serverURL,
+			Path:       "/tunnel",
+			TargetAddr: targetAddr,
+			Insecure:   true,
+			UseGRPC:    false, // 故意不使用 gRPC
+			Token:      testToken,
+			LogLevel:   "error",
+		})
+		time.Sleep(500 * time.Millisecond)
+
+		conn, err := net.Dial("tcp", clientListen)
+		if err != nil {
+			t.Fatalf("连接本地客户端失败: %v", err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+		_, err = conn.Write([]byte("ping"))
+		if err != nil {
+			t.Fatalf("写入失败: %v", err)
+		}
+
+		buf := make([]byte, 100)
+		_, err = conn.Read(buf)
+		// 远端返回 403 导致隧道握手失败，本地连接被立即关闭 (EOF)
+		if err == nil {
+			t.Fatalf("预期连接应被服务端严格拦截并关闭，但成功读取到了数据: %s", string(buf))
+		}
+		t.Log("✅ 非 gRPC 请求被严格模式成功拦截！")
+	})
+
+	// 测试用例 2: 客户端开启 gRPC 发起请求 -> 应顺利通过
+	t.Run("Accept_gRPC_When_Server_Requires_gRPC", func(t *testing.T) {
+		clientListen := "127.0.0.1:22002"
+		go startClientDirect(ClientConfig{
+			ListenAddr: clientListen,
+			ServerUrl:  serverURL,
+			Path:       "/tunnel",
+			TargetAddr: targetAddr,
+			Insecure:   true,
+			UseGRPC:    true, // 正确使用 gRPC
+			Token:      testToken,
+			LogLevel:   "error",
+		})
+		time.Sleep(500 * time.Millisecond)
+
+		conn, err := net.Dial("tcp", clientListen)
+		if err != nil {
+			t.Fatalf("连接本地客户端失败: %v", err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+		testMsg := []byte("Hello Strict gRPC")
+		_, err = conn.Write(testMsg)
+		if err != nil {
+			t.Fatalf("写入失败: %v", err)
+		}
+
+		buf := make([]byte, 100)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("读取回显失败: %v", err)
+		}
+		if string(buf[:n]) != string(testMsg) {
+			t.Fatalf("数据不匹配: %s != %s", buf[:n], testMsg)
+		}
+		t.Log("✅ 合规的 gRPC 请求成功通行！")
+	})
+
+	// 测试用例 3: 客户端尝试发送 UDP 数据 -> 应被服务端限制 Network="tcp" 拦截
+	t.Run("Reject_UDP_When_Server_Requires_TCP_Only", func(t *testing.T) {
+		clientListen := "127.0.0.1:22003"
+		go startClientDirect(ClientConfig{
+			ListenAddr: clientListen,
+			ServerUrl:  serverURL,
+			Path:       "/tunnel",
+			TargetAddr: targetAddr,
+			Insecure:   true,
+			UseGRPC:    true,
+			Network:    "udp", // 请求 UDP
+			Token:      testToken,
+			LogLevel:   "error",
+		})
+		time.Sleep(500 * time.Millisecond)
+
+		conn, err := net.Dial("udp", clientListen)
+		if err != nil {
+			t.Fatalf("连接本地客户端失败: %v", err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+		_, err = conn.Write([]byte("udp ping"))
+		if err != nil {
+			t.Fatalf("UDP 写入失败: %v", err)
+		}
+
+		buf := make([]byte, 100)
+		_, err = conn.Read(buf)
+		if err == nil {
+			t.Fatalf("预期 UDP 请求应被服务端拒绝无回显，但收到了数据")
+		}
+		t.Log("✅ 违规的 UDP 请求被服务端成功拦截！")
+	})
 }

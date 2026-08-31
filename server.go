@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -16,26 +15,99 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
-func runServer(args []string) {
-	serverCmd := flag.NewFlagSet("server", flag.ExitOnError)
-	cfg := ServerConfig{}
-	serverCmd.StringVar(&cfg.ListenAddr, "listen", ":8443", "服务端监听地址")
-	serverCmd.StringVar(&cfg.TLSCert, "cert", "", "TLS 证书文件路径")
-	serverCmd.StringVar(&cfg.TLSKey, "key", "", "TLS 私钥文件路径")
-	serverCmd.StringVar(&cfg.Path, "path", "/tunnel", "代理路径")
-	serverCmd.BoolVar(&cfg.LocalOnly, "local-only", false, "是否只允许转发到本地")
-	serverCmd.StringVar(&cfg.LogLevel, "loglevel", "info", "日志等级")
-	serverCmd.BoolVar(&cfg.EnableH3, "h3", false, "开启 HTTP/3 监听")
-	serverCmd.StringVar(&cfg.ExpectedToken, "token", "", "预期的 Proxy-Authorization Token")
-	serverCmd.Parse(args)
+func isNetworkAllowed(reqNet, configuredNet string) bool {
+	configuredNet = strings.ToLower(strings.TrimSpace(configuredNet))
+	if configuredNet == "" || configuredNet == "all" || configuredNet == "both" || configuredNet == "tcp+udp" || configuredNet == "tcp,udp" {
+		return true
+	}
+	reqNet = strings.ToLower(strings.TrimSpace(reqNet))
+	return reqNet == configuredNet
+}
 
+func checkStrictTransport(r *http.Request, configuredTransport string, isWT, isMasqueTCP, isMasqueUDP bool) error {
+	trans := strings.ToLower(strings.TrimSpace(configuredTransport))
+	if trans == "" || trans == "all" || trans == "auto" {
+		return nil // 全协议网关模式，全部允许
+	}
+
+	isGRPC := r.Method == http.MethodPost && (r.Header.Get("Content-Type") == "application/grpc" || strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc"))
+	isH2Stream := r.Method == http.MethodPost && !isGRPC
+
+	switch trans {
+	case "grpc":
+		if !isGRPC {
+			return fmt.Errorf("transport policy violation: only gRPC allowed, got Method=%s Content-Type=%s", r.Method, r.Header.Get("Content-Type"))
+		}
+	case "h2", "h2c":
+		if !isH2Stream {
+			return fmt.Errorf("transport policy violation: only H2-Stream POST allowed, got Method=%s Protocol=%s", r.Method, r.Header.Get("Protocol"))
+		}
+	case "wt", "webtransport":
+		if !isWT {
+			return fmt.Errorf("transport policy violation: only WebTransport allowed, got Method=%s Protocol=%s", r.Method, r.Header.Get("Protocol"))
+		}
+	case "masque":
+		if !isMasqueTCP && !isMasqueUDP {
+			return fmt.Errorf("transport policy violation: only MASQUE allowed, got Method=%s Protocol=%s", r.Method, r.Header.Get("Protocol"))
+		}
+	case "h3", "http3", "http/3":
+		if r.ProtoMajor != 3 && !strings.HasPrefix(r.Proto, "HTTP/3") {
+			return fmt.Errorf("transport policy violation: only HTTP/3 allowed, got %s", r.Proto)
+		}
+	}
+	return nil
+}
+
+func runServer(args []string) {
+	startServerDirect(buildServerConfig(loadConfigFromArgs(args)))
+}
+
+func startServerDirect(cfg ServerConfig) {
 	initLogger(cfg.LogLevel)
 	defer zlog.Sync()
-	zlog.Infof("[Server] 🚀 h2tunnel %s 正在启动...", Version)
-	zlog.Infof("[Server] ⚙️ 配置 -> 监听: %s, 路径: %s, H3: %v, LocalOnly: %v", cfg.ListenAddr, cfg.Path, cfg.EnableH3, cfg.LocalOnly)
+
+	// Apply transport mode if specified
+	switch strings.ToLower(cfg.Transport) {
+	case "h3", "http3", "http/3", "quic":
+		cfg.EnableH3 = true
+		cfg.EnableTLS = true
+	case "wt", "webtransport":
+		cfg.EnableH3 = true
+		cfg.EnableTLS = true
+	case "masque":
+		cfg.EnableH3 = true
+		cfg.EnableTLS = true
+	case "grpc":
+		cfg.EnableH3 = false
+	case "h2", "tls":
+		cfg.EnableTLS = true
+		cfg.EnableH3 = false
+	case "h2c", "cleartext", "plain":
+		cfg.EnableTLS = false
+		cfg.EnableH3 = false
+	case "all", "auto":
+		cfg.EnableH3 = true
+	}
+
+	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
+	if netMode == "" {
+		netMode = "all"
+	}
+	cfg.Network = netMode
+
+	zlog.Infof("[Server] 🚀 h2tunnel %s starting...", Version)
+	zlog.Infof("[Server] ⚙️ Config -> Listen: %s, Path: %s, Transport: %s, Network: %s, TLS: %v, H3: %v, LocalOnly: %v",
+		cfg.ListenAddr, cfg.Path, cfg.Transport, cfg.Network, cfg.EnableTLS, cfg.EnableH3, cfg.LocalOnly)
+	zlog.Infof("[Server] 🚦 Strict Demux Policy -> Transport: [%s], Network: [%s] (TCP Allowed: %v, UDP Allowed: %v)",
+		cfg.Transport, cfg.Network, isNetworkAllowed("tcp", cfg.Network), isNetworkAllowed("udp", cfg.Network))
 
 	mux := http.NewServeMux()
 	var wtServer *webtransport.Server
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK\n"))
+	})
 
 	mux.HandleFunc(cfg.Path, func(w http.ResponseWriter, r *http.Request) {
 		routeTunnelRequest(w, r, cfg, wtServer)
@@ -43,39 +115,59 @@ func runServer(args []string) {
 
 	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fullPath := r.RequestURI
-		if fullPath == "" || !strings.HasPrefix(fullPath, "/") { fullPath = r.URL.Path }
+		if fullPath == "" || !strings.HasPrefix(fullPath, "/") {
+			fullPath = r.URL.Path
+		}
 
-		zlog.Debugf("[Server] 收到全局请求: %s %s (Host: %s)", r.Method, fullPath, r.Host)
+		zlog.Debugf("[Server] Global request: %s %s (Host: %s)", r.Method, fullPath, r.Host)
 
-		if r.Method == http.MethodConnect && cfg.EnableH3 {
+		if r.Method == http.MethodConnect && (cfg.EnableH3 || strings.HasPrefix(fullPath, "/.well-known/masque/")) {
 			matchedPath := fullPath
 			if strings.HasPrefix(matchedPath, "/.well-known/masque/tcp/") {
-				zlog.Debugf("[Server] 命中 MASQUE-TCP 路由: %s", matchedPath)
+				zlog.Debugf("[Server] Matched MASQUE-TCP route: %s", matchedPath)
 				r.URL.Path = matchedPath
 				routeTunnelRequest(w, r, cfg, wtServer)
 				return
 			}
 			if strings.HasPrefix(matchedPath, "/.well-known/masque/udp/") {
-				zlog.Debugf("[Server] 命中 MASQUE-UDP 路由: %s", matchedPath)
+				zlog.Debugf("[Server] Matched MASQUE-UDP route: %s", matchedPath)
 				r.URL.Path = matchedPath
 				handleMasqueUDP(w, r, cfg)
 				return
 			}
 			if matchedPath == cfg.Path {
-				zlog.Debugf("[Server] 命中自定义 CONNECT 路由: %s", matchedPath)
+				zlog.Debugf("[Server] Matched custom CONNECT route: %s", matchedPath)
 				routeTunnelRequest(w, r, cfg, wtServer)
 				return
 			}
-			zlog.Warnf("[Server] 拒绝未知的 CONNECT 请求 | 路径: '%s'", matchedPath)
+			zlog.Warnf("[Server] 拒绝未知的 CONNECT 请求 | Path: '%s'", matchedPath)
 			http.Error(w, "Unknown CONNECT Target", http.StatusNotFound)
 			return
 		}
 		mux.ServeHTTP(w, r)
 	})
 
-	if cfg.EnableH3 {
-		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
-		if err != nil { zlog.Fatalf("[Server] 无法加载证书: %v", err) }
+	var cert tls.Certificate
+	hasTLS := false
+
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		c, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			zlog.Fatalf("[Server] Failed to load certificate: %v", err)
+		}
+		cert = c
+		hasTLS = true
+	} else if cfg.EnableTLS || cfg.EnableH3 {
+		c, _, err := GenerateSelfSignedCert("")
+		if err != nil {
+			zlog.Fatalf("[Server] Failed to generate self-signed certificate: %v", err)
+		}
+		cert = c
+		hasTLS = true
+		zlog.Infof("[Server] 🔐 Auto-generated self-signed TLS certificate")
+	}
+
+	if cfg.EnableH3 && hasTLS {
 		wtServer = &webtransport.Server{
 			H3: &http3.Server{
 				Addr:    cfg.ListenAddr,
@@ -85,39 +177,51 @@ func runServer(args []string) {
 					NextProtos:   []string{http3.NextProtoH3},
 				},
 				EnableDatagrams: true,
-				QUICConfig: GetDefaultQUICConfig(),
+				QUICConfig:      GetDefaultQUICConfig(),
 			},
 		}
 		webtransport.ConfigureHTTP3Server(wtServer.H3)
 		go func() {
 			zlog.Infof("[H3 Server] 🚀 Listening (QUIC): %s", cfg.ListenAddr)
 			if err := wtServer.ListenAndServe(); err != nil {
-				zlog.Errorf("[H3 Server] 退出: %v", err)
+				zlog.Errorf("[H3 Server] Exited: %v", err)
 			}
 		}()
 	}
 
-	if cfg.TLSCert != "" {
-		server := &http.Server{Addr: cfg.ListenAddr, Handler: rootHandler}
+	if hasTLS {
+		server := &http.Server{
+			Addr:              cfg.ListenAddr,
+			Handler:           rootHandler,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       1 * time.Hour,
+			TLSConfig: &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				NextProtos:   []string{"h2", "http/1.1"},
+			},
+		}
 		zlog.Infof("[H2 Server] 🟢 Listening (TLS): %s", cfg.ListenAddr)
 		server.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
 	} else {
-		server := &http.Server{Addr: cfg.ListenAddr, Handler: h2c.NewHandler(rootHandler, &http2.Server{})}
+		server := &http.Server{
+			Addr:              cfg.ListenAddr,
+			Handler:           h2c.NewHandler(rootHandler, &http2.Server{IdleTimeout: 1 * time.Hour}),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       1 * time.Hour,
+		}
 		zlog.Infof("[H2C Server] 🟡 Listening (H2C): %s", cfg.ListenAddr)
 		server.ListenAndServe()
 	}
 }
 
 func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg ServerConfig, wtServer *webtransport.Server) {
-	// 生成唯一的 Trace ID
 	sessionID := fmt.Sprintf("SVR-%s-%d", r.RemoteAddr, time.Now().UnixNano()%10000)
 	clientPhysicalAddr := r.RemoteAddr
-	zlog.Debugf("[%s] === 新请求进入路由层 ===", sessionID)
-	zlog.Debugf("[%s] 协议: %s, Method: %s, Path: %s, 客户端物理通道IP:端口: %s", sessionID, r.Proto, r.Method, r.URL.Path, clientPhysicalAddr)
+	zlog.Debugf("[%s] === New incoming tunnel request ===", sessionID)
+	zlog.Debugf("[%s] Proto: %s, Method: %s, Path: %s, Client Physical Addr: %s", sessionID, r.Proto, r.Method, r.URL.Path, clientPhysicalAddr)
 
-	// 判断是否允许访问
 	if !checkAuth(r, cfg.ExpectedToken) {
-		zlog.Warnf("[%s] ❌ 认证失败: 拒绝访问 (IP: %s)", sessionID, r.RemoteAddr)
+		zlog.Warnf("[%s] ❌ Authentication failed: Access denied (IP: %s)", sessionID, r.RemoteAddr)
 		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
 		return
 	}
@@ -125,138 +229,145 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg ServerConfig
 	isMasqueTCP := r.Method == http.MethodConnect && r.Header.Get("Protocol") == "connect-tcp"
 	isWT := wtServer != nil && r.Method == http.MethodConnect && r.Header.Get("Protocol") == "webtransport"
 
+	reqNetwork, _ := GetXDst(r)
+	if isMasqueTCP {
+		reqNetwork = "tcp"
+	}
+
+	// 1. 严格网络类型分流校验 (TCP / UDP 限制)
+	if !isNetworkAllowed(reqNetwork, cfg.Network) {
+		zlog.Warnf("[%s] 🚫 严格分流拦截: 服务端限制 Network='%s'，拒绝 %s 请求 (IP: %s)", sessionID, cfg.Network, strings.ToUpper(reqNetwork), r.RemoteAddr)
+		http.Error(w, fmt.Sprintf("%s traffic forbidden by server policy", strings.ToUpper(reqNetwork)), http.StatusForbidden)
+		return
+	}
+
+	// 2. 严格传输协议分流校验 (Transport 限制)
+	if err := checkStrictTransport(r, cfg.Transport, isWT, isMasqueTCP, false); err != nil {
+		zlog.Warnf("[%s] 🚫 严格分流拦截: %v (IP: %s)", sessionID, err, r.RemoteAddr)
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
 	if isWT {
-		zlog.Debugf("[%s] -> 分发至 WebTransport 处理器", sessionID)
+		zlog.Debugf("[%s] -> Dispatching to WebTransport handler", sessionID)
 		handleWebTransportServer(w, r, sessionID, cfg, wtServer)
 		return
 	}
 	if isMasqueTCP {
-		zlog.Debugf("[%s] -> 分发至 MASQUE-TCP 处理器", sessionID)
+		zlog.Debugf("[%s] -> Dispatching to MASQUE-TCP handler", sessionID)
 		handleMasqueTCPServer(w, r, sessionID, cfg)
 		return
 	}
 	if r.Method == http.MethodPost {
-		zlog.Debugf("[%s] -> 分发至 H2-Stream (POST) 处理器", sessionID)
+		zlog.Debugf("[%s] -> Dispatching to H2-Stream (POST) handler", sessionID)
 		handleH2StreamServer(w, r, sessionID, cfg)
 		return
 	}
 
-	zlog.Warnf("[%s] ❌ 不支持的请求方法或协议组合", sessionID)
+	zlog.Warnf("[%s] ❌ Unsupported request method or protocol combination", sessionID)
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
-// 从头部获取目标
 func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg ServerConfig, wtServer *webtransport.Server) {
-	// 先提取目标地址并做安全校验（在 Upgrade 之前）
 	network, target := GetXDst(r)
-	
-	// 注意逻辑反转：如果 target 为空，或者“不允许访问”，则返回 403
-	// （假设 checkTargetIsAvailable 返回 true 代表允许，false 代表拒绝）
 	if target == "" || !checkTargetIsAvailable(target, cfg) {
-		zlog.Warnf("[%s] 🚫 被拒绝的目标地址: %s", sessionID, target)
+		zlog.Warnf("[%s] 🚫 Access denied for target address: %s", sessionID, target)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
-	// 校验通过后，再执行 WebTransport 升级
 	session, err := wtServer.Upgrade(w, r)
 	if err != nil {
-		zlog.Errorf("[%s] ❌ WebTransport 升级失败: %v", sessionID, err)
+		zlog.Errorf("[%s] ❌ WebTransport upgrade failed: %v", sessionID, err)
 		return
 	}
-	zlog.Infof("[%s] ✅ WT Session 建立成功 | 预期目标: %s (%s)", sessionID, target, network)
+	zlog.Infof("[%s] ✅ WT Session established | Target: %s (%s)", sessionID, target, network)
 
 	for {
 		stream, err := session.AcceptStream(r.Context())
 		if err != nil {
-			zlog.Debugf("[%s] WT Session 结束接管 Stream: %v", sessionID, err)
+			zlog.Debugf("[%s] WT Session ended: %v", sessionID, err)
 			break
 		}
-		
-		// 保留之前修复的伪 StreamID 逻辑
-		streamID := fmt.Sprintf("%s-ST%d", sessionID, time.Now().UnixNano()%10000)
-		zlog.Debugf("[%s] 接受新 WT Stream, 准备拨号: %s", streamID, target)
 
-		// ⚠️这里必须是 *webtransport.Stream，因为 Read/Write 方法是指针接收者
+		streamID := fmt.Sprintf("%s-ST%d", sessionID, time.Now().UnixNano()%10000)
+		zlog.Debugf("[%s] Accepted new WT Stream, dialing: %s", streamID, target)
+
 		go func(s *webtransport.Stream, t string, netType string, sID string) {
 			start := time.Now()
-			tConn, errDial := net.Dial(netType, t)
+			tConn, errDial := net.DialTimeout(netType, t, 10*time.Second)
 			if errDial != nil {
-				zlog.Errorf("[%s] ❌ 连接目标失败: %v (耗时: %v)", sID, errDial, time.Since(start))
+				zlog.Errorf("[%s] ❌ Failed to connect target: %v (duration: %v)", sID, errDial, time.Since(start))
 				s.CancelWrite(1)
 				return
 			}
 			defer tConn.Close()
-			zlog.Infof("[%s] 🔗 WT 目标连接成功 (耗时: %v), 开始代理", sID, time.Since(start))
-	
-			proxyStream(sID, netType, tConn, s, s, nil)
+			zlog.Infof("[%s] 🔗 WT target connected successfully (duration: %v)", sID, time.Since(start))
+
+			var sReader io.Reader = s
+			var sWriter io.Writer = s
+			if netType != "udp" {
+				sReader = &PaddingReader{r: s}
+				sWriter = &PaddingWriter{w: s}
+			}
+
+			proxyStream(sID, netType, tConn, sReader, sWriter, nil)
 			s.CancelRead(0)
-		}(stream, target, network, streamID) // 传入 stream 指针
+		}(stream, target, network, streamID)
 	}
 }
 
-// 从URL获取目标
 func handleMasqueTCPServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg ServerConfig) {
 	target, err := parseMasqueTarget("tcp", r.URL.Path)
 	if err != nil {
-		zlog.Errorf("[%s] ❌ MASQUE 路径解析失败: %s, Err: %v", sessionID, r.URL.Path, err)
-		http.Error(w, "Bad Request", http.StatusBadRequest)
-		return
+		_, target = GetXDst(r)
 	}
 
-	// 判断是否允许访问
 	if target == "" || !checkTargetIsAvailable(target, cfg) {
-		zlog.Warnf("[%s] 🚫 被拒绝的目标地址: %s", sessionID, target)
+		zlog.Warnf("[%s] 🚫 Access denied for target address: %s", sessionID, target)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
 	start := time.Now()
-	zlog.Debugf("[%s] 正在拨号目标 TCP: %s", sessionID, target)
-	targetConn, err := net.Dial("tcp", target)
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		zlog.Errorf("[%s] ❌ 拨号目标失败: %v (耗时: %v)", sessionID, err, time.Since(start))
+		zlog.Errorf("[%s] ❌ Failed to dial target: %v (duration: %v)", sessionID, err, time.Since(start))
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	defer targetConn.Close()
-	zlog.Infof("[%s] 🔗 MASQUE-TCP 目标连接成功 (耗时: %v)", sessionID, time.Since(start))
+	zlog.Infof("[%s] 🔗 MASQUE-TCP target connected successfully (duration: %v)", sessionID, time.Since(start))
 
 	w.WriteHeader(http.StatusOK)
 	flusher, ok := w.(http.Flusher)
 	if ok {
 		flusher.Flush()
-		zlog.Debugf("[%s] 已向客户端 Flush 200 OK，开始双向数据流", sessionID)
-	} else {
-		zlog.Warnf("[%s] ⚠️ 警告: ResponseWriter 不支持 Flusher，代理可能发生缓冲延迟！", sessionID)
 	}
-	
-	proxyStream(sessionID, "tcp", targetConn, r.Body, w, flusher)
+
+	var tunnelReader io.Reader = &PaddingReader{r: r.Body}
+	var tunnelWriter io.Writer = &PaddingWriter{w: w}
+	proxyStream(sessionID, "tcp", targetConn, tunnelReader, tunnelWriter, flusher)
 }
 
-// 从头部获取目标
 func handleH2StreamServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg ServerConfig) {
 	network, target := GetXDst(r)
-
-	// 判断是否允许访问
 	if target == "" || !checkTargetIsAvailable(target, cfg) {
-		zlog.Warnf("[%s] 🚫 H2 被拒绝的目标地址: %s", sessionID, target)
+		zlog.Warnf("[%s] 🚫 Access denied for target address: %s", sessionID, target)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
 	isGRPC := r.Header.Get("Content-Type") == "application/grpc"
-	zlog.Debugf("[%s] 解析目标: %s (%s), gRPC伪装: %v", sessionID, target, network, isGRPC)
-
 	start := time.Now()
-	targetConn, err := net.Dial(network, target)
+	targetConn, err := net.DialTimeout(network, target, 10*time.Second)
 	if err != nil {
-		zlog.Errorf("[%s] ❌ 拨号目标失败: %v", sessionID, err)
+		zlog.Errorf("[%s] ❌ Failed to dial target: %v", sessionID, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	defer targetConn.Close()
-	zlog.Infof("[%s] 🔗 H2-Stream 目标连接成功 (耗时: %v)", sessionID, time.Since(start))
+	zlog.Infof("[%s] 🔗 H2-Stream target connected successfully (duration: %v)", sessionID, time.Since(start))
 
 	if isGRPC {
 		w.Header().Set("Content-Type", "application/grpc")
@@ -268,9 +379,7 @@ func handleH2StreamServer(w http.ResponseWriter, r *http.Request, sessionID stri
 	flusher, ok := w.(http.Flusher)
 	if ok {
 		flusher.Flush()
-		zlog.Debugf("[%s] 已发送 200 OK 并 Flush", sessionID)
-	} else {
-		zlog.Warnf("[%s] ⚠️ 警告: ResponseWriter 不支持 Flusher，代理可能发生缓冲延迟！", sessionID)
+		zlog.Debugf("[%s] Sent 200 OK and Flushed", sessionID)
 	}
 
 	var tunnelReader io.Reader = r.Body
@@ -279,57 +388,69 @@ func handleH2StreamServer(w http.ResponseWriter, r *http.Request, sessionID stri
 		tunnelReader = &grpcReader{r: r.Body}
 		tunnelWriter = &grpcWriter{w: w}
 	}
-	
+	if network != "udp" {
+		tunnelReader = &PaddingReader{r: tunnelReader}
+		tunnelWriter = &PaddingWriter{w: tunnelWriter}
+	}
+
 	proxyStream(sessionID, network, targetConn, tunnelReader, tunnelWriter, flusher)
 }
 
-// 从URL获取目标
 func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg ServerConfig) {
 	sessionID := fmt.Sprintf("MUDP-%s-%d", r.RemoteAddr, time.Now().UnixNano()%1000)
-	zlog.Debugf("[%s] === 新 MASQUE-UDP 请求 ===", sessionID)
+	zlog.Debugf("[%s] === New MASQUE-UDP request ===", sessionID)
+
+	// 1. 严格网络类型分流校验 (是否允许 UDP)
+	if !isNetworkAllowed("udp", cfg.Network) {
+		zlog.Warnf("[%s] 🚫 严格分流拦截: 服务端限制 Network='%s'，拒绝 MASQUE-UDP 请求 (IP: %s)", sessionID, cfg.Network, r.RemoteAddr)
+		http.Error(w, "UDP traffic forbidden by server policy", http.StatusForbidden)
+		return
+	}
+
+	// 2. 严格传输协议分流校验 (是否允许 MASQUE)
+	if err := checkStrictTransport(r, cfg.Transport, false, false, true); err != nil {
+		zlog.Warnf("[%s] 🚫 严格分流拦截: %v (IP: %s)", sessionID, err, r.RemoteAddr)
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 
 	if !checkAuth(r, cfg.ExpectedToken) {
-		zlog.Warnf("[%s] ❌ 认证失败", sessionID)
+		zlog.Warnf("[%s] ❌ Authentication failed", sessionID)
 		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
 		return
 	}
 
 	target, err := parseMasqueTarget("udp", r.URL.Path)
-	// 判断是否允许访问
 	if err != nil || target == "" || !checkTargetIsAvailable(target, cfg) {
-		zlog.Warnf("[%s] 🚫 MASQUE-UDP 目标拒绝或解析失败: %s", sessionID, r.URL.Path)
+		zlog.Warnf("[%s] 🚫 MASQUE-UDP target rejected or parse failed: %s", sessionID, r.URL.Path)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
-	
-	zlog.Debugf("[%s] 正在解析目标 UDP: %s", sessionID, target)
+
 	tAddr, err := net.ResolveUDPAddr("udp", target)
 	if err != nil {
-		zlog.Errorf("[%s] ❌ 解析 UDP 地址失败: %v", sessionID, err)
+		zlog.Errorf("[%s] ❌ Failed to resolve UDP address: %v", sessionID, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 
 	tConn, err := net.DialUDP("udp", nil, tAddr)
 	if err != nil {
-		zlog.Errorf("[%s] ❌ 连接目标 UDP 失败: %v", sessionID, err)
+		zlog.Errorf("[%s] ❌ Failed to dial target UDP: %v", sessionID, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	defer tConn.Close()
-	
-	// 这里可以设置一个相对宽松的 ReadDeadline，防止 UDP 僵尸连接，
-	// 也可以在 proxyStream 里统一定义。
+
 	tConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	zlog.Infof("[%s] 🔗 MASQUE-UDP 连接就绪 -> %s", sessionID, target)
+	zlog.Infof("[%s] 🔗 MASQUE-UDP connection ready -> %s", sessionID, target)
 
 	w.WriteHeader(http.StatusOK)
 	flusher, ok := w.(http.Flusher)
 	if ok {
 		flusher.Flush()
-		zlog.Debugf("[%s] 已发送 200 OK 并 Flush", sessionID)
-	} else {
-		zlog.Warnf("[%s] ⚠️ 警告: ResponseWriter 不支持 Flusher，代理可能发生缓冲延迟！", sessionID)
+		zlog.Debugf("[%s] Sent 200 OK and Flushed", sessionID)
 	}
+
 	proxyStream(sessionID, "masque-udp", tConn, r.Body, w, flusher)
 }

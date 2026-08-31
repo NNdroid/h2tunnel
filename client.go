@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -30,42 +29,35 @@ type WTSessionManager struct {
 func (m *WTSessionManager) GetSession(ctx context.Context) (*webtransport.Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.session != nil { return m.session, nil }
-	
-	zlog.Debugf("[WT Manager] 正在发起底层 WebTransport 握手...")
+	if m.session != nil {
+		select {
+		case <-m.session.Context().Done():
+			m.session = nil
+		default:
+			return m.session, nil
+		}
+	}
+
+	zlog.Debugf("[WT Manager] Initiating WebTransport handshake...")
 	start := time.Now()
 	_, session, err := m.dialer.Dial(ctx, m.reqUrl, m.headers)
-	if err != nil { 
-		zlog.Errorf("[WT Manager] ❌ WT 握手失败: %v", err)
-		return nil, err 
+	if err != nil {
+		zlog.Errorf("[WT Manager] ❌ WebTransport handshake failed: %v", err)
+		return nil, err
 	}
 	m.session = session
-	zlog.Infof("[WT Manager] ✅ 底层 WT 会话建立成功 (耗时: %v)", time.Since(start))
+	zlog.Infof("[WT Manager] ✅ Underlying WebTransport session established successfully (duration: %v)", time.Since(start))
 	return session, nil
 }
 
 func runClient(args []string) {
-	clientCmd := flag.NewFlagSet("client", flag.ExitOnError)
-	cfg := ClientConfig{}
-	clientCmd.StringVar(&cfg.ListenAddr, "listen", "127.0.0.1:2222", "本地监听地址")
-	clientCmd.StringVar(&cfg.ServerUrl, "server", "https://127.0.0.1:8443", "服务端 URL")
-	clientCmd.StringVar(&cfg.Path, "path", "/tunnel", "代理路径")
-	clientCmd.StringVar(&cfg.TargetAddr, "target", "127.0.0.1:22", "远端目标地址")
-	clientCmd.BoolVar(&cfg.Insecure, "insecure", true, "跳过证书校验")
-	clientCmd.StringVar(&cfg.CustomHost, "host", "", "Host 伪装")
-	clientCmd.StringVar(&cfg.ServerName, "sni", "", "SNI 伪装")
-	clientCmd.BoolVar(&cfg.UseH3, "h3", false, "使用 H3 POST")
-	clientCmd.BoolVar(&cfg.UseWT, "wt", false, "使用 WebTransport")
-	clientCmd.BoolVar(&cfg.UseMasque, "masque", false, "使用 MASQUE CONNECT")
-	clientCmd.BoolVar(&cfg.UseUDP, "udp", false, "代理 UDP")
-	clientCmd.BoolVar(&cfg.UseGRPC, "grpc", false, "使用 gRPC 协议伪装")
-	clientCmd.StringVar(&cfg.LogLevel, "loglevel", "info", "日志等级")
-	clientCmd.StringVar(&cfg.Token, "token", "", "Proxy-Authorization Token")
-	clientCmd.Parse(args)
+	startClientDirect(buildClientConfig(loadConfigFromArgs(args)))
+}
 
+func startClientDirect(cfg ClientConfig) {
 	initLogger(cfg.LogLevel)
 	defer zlog.Sync()
-	zlog.Infof("[Client] 🚀 h2tunnel %s 正在启动...", Version)
+	zlog.Infof("[Client] 🚀 Starting h2tunnel client v%s...", Version)
 
 	reqUrl := strings.TrimRight(cfg.ServerUrl, "/") + cfg.Path
 	isHTTPS := strings.HasPrefix(reqUrl, "https://")
@@ -74,18 +66,24 @@ func runClient(args []string) {
 	var wtManager *WTSessionManager
 
 	if cfg.UseMasque || cfg.UseH3 {
-		if !isHTTPS { zlog.Fatalf("[Client] ❌ H3/MASQUE 必须使用 HTTPS") }
+		if !isHTTPS {
+			zlog.Fatalf("[Client] ❌ HTTP/3 and MASQUE require HTTPS")
+		}
 		tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure, NextProtos: []string{"h3"}}
-		if cfg.ServerName != "" { tlsConfig.ServerName = cfg.ServerName }
+		if cfg.ServerName != "" {
+			tlsConfig.ServerName = cfg.ServerName
+		}
 		rt := &http3.Transport{
 			TLSClientConfig: tlsConfig,
-			QUICConfig: GetDefaultQUICConfig(),
+			QUICConfig:      GetDefaultQUICConfig(),
 		}
 		httpClient = &http.Client{Transport: rt}
-		zlog.Debugf("[Client] 已初始化 HTTP/3 Transport")
+		zlog.Debugf("[Client] Initialized HTTP/3 Transport")
 	} else if cfg.UseWT {
 		tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure, NextProtos: []string{http3.NextProtoH3}}
-		if cfg.ServerName != "" { tlsConfig.ServerName = cfg.ServerName }
+		if cfg.ServerName != "" {
+			tlsConfig.ServerName = cfg.ServerName
+		}
 		headers := make(http.Header)
 		headers.Set("Protocol", "webtransport")
 		SetXDst(headers, cfg)
@@ -93,49 +91,82 @@ func runClient(args []string) {
 		wtManager = &WTSessionManager{
 			dialer: &webtransport.Dialer{
 				TLSClientConfig: tlsConfig,
-				QUICConfig: GetDefaultQUICConfig(),
+				QUICConfig:      GetDefaultQUICConfig(),
 			},
-			reqUrl: reqUrl,
+			reqUrl:  reqUrl,
 			headers: headers,
 		}
-		zlog.Debugf("[Client] 已初始化 WebTransport Dialer")
+		zlog.Debugf("[Client] Initialized WebTransport Dialer")
 	} else {
 		transport := &http2.Transport{}
 		if isHTTPS {
 			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: cfg.Insecure, ServerName: cfg.ServerName}
 		} else {
 			transport.AllowHTTP = true
-			transport.DialTLSContext = func(ctx context.Context, n, a string, c *tls.Config) (net.Conn, error) { return net.Dial(n, a) }
+			transport.DialTLSContext = func(ctx context.Context, n, a string, c *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, n, a)
+			}
 		}
 		httpClient = &http.Client{Transport: transport}
-		zlog.Debugf("[Client] 已初始化 HTTP/2 Transport (gRPC: %v)", cfg.UseGRPC)
+		zlog.Debugf("[Client] Initialized HTTP/2 Transport (gRPC: %v)", cfg.UseGRPC)
 	}
 
-	if cfg.UseUDP {
-		if cfg.UseMasque {
-			runMasqueUDPClient(cfg, httpClient)
-		} else {
-			runStreamUDPClient(reqUrl, cfg, httpClient, wtManager)
-		}
-		return
+	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
+	if netMode == "" {
+		netMode = "tcp"
+	} else if netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" {
+		netMode = "all"
 	}
 
+	isTCP := netMode == "tcp" || netMode == "all"
+	isUDP := netMode == "udp" || netMode == "all"
+
+	zlog.Infof("[Client] 🎯 Protocol Network Mode: [%s] (TCP Active: %v, UDP Active: %v)", netMode, isTCP, isUDP)
+
+	if netMode == "udp" {
+		runUDPClient(reqUrl, cfg, httpClient, wtManager)
+	} else if netMode == "all" {
+		cfgUDP := cfg
+		cfgUDP.Network = "udp"
+		go runUDPClient(reqUrl, cfgUDP, httpClient, wtManager)
+		cfgTCP := cfg
+		cfgTCP.Network = "tcp"
+		runTCPClient(reqUrl, cfgTCP, httpClient, wtManager)
+	} else {
+		cfgTCP := cfg
+		cfgTCP.Network = "tcp"
+		runTCPClient(reqUrl, cfgTCP, httpClient, wtManager)
+	}
+}
+
+func runUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client, wtManager *WTSessionManager) {
+	if cfg.UseMasque {
+		runMasqueUDPClient(cfg, httpClient)
+	} else {
+		runStreamUDPClient(reqUrl, cfg, httpClient, wtManager)
+	}
+}
+
+func runTCPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client, wtManager *WTSessionManager) {
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil { zlog.Fatalf("[Client] ❌ 无法监听本地 TCP: %v", err) }
+	if err != nil {
+		zlog.Fatalf("[Client] ❌ Failed to listen on local TCP: %v", err)
+	}
 	defer listener.Close()
 
-	zlog.Infof("[Client] 🔗 监听就绪: TCP %s -> 隧道 -> %s", cfg.ListenAddr, cfg.TargetAddr)
+	zlog.Infof("[Client] 🟢 [TCP] Listening on %s -> Tunnel -> %s", cfg.ListenAddr, cfg.TargetAddr)
 
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
-			zlog.Errorf("[Client] Accept 失败: %v", err)
-			continue 
+			zlog.Errorf("[Client] Accept failed: %v", err)
+			continue
 		}
-		
+
 		sessionID := fmt.Sprintf("CLI-%s-%d", localConn.RemoteAddr().String(), time.Now().UnixNano()%1000)
-		zlog.Infof("[%s] 🟢 接入新本地连接 (客户端应用: %s)", sessionID, localConn.RemoteAddr())
-		
+		zlog.Infof("[%s] 🟢 New client connection from %s", sessionID, localConn.RemoteAddr())
+
 		if cfg.UseWT {
 			go handleWTTCPClientConn(localConn, sessionID, cfg, wtManager)
 		} else if cfg.UseMasque {
@@ -151,9 +182,11 @@ func runClient(args []string) {
 // ==========================================
 func executeHTTPTunnel(sessionID string, localConn net.Conn, req *http.Request, pw *io.PipeWriter, cfg ClientConfig, httpClient *http.Client) {
 	var writer io.Writer = pw
-	if cfg.UseGRPC { writer = &grpcWriter{w: pw} }
+	if cfg.UseGRPC {
+		writer = &grpcWriter{w: pw}
+	}
 	// ✅ 追加 Padding 拦截层
-	if !cfg.UseUDP {
+	if cfg.Network != "udp" {
 		writer = &PaddingWriter{w: writer}
 	}
 
@@ -165,11 +198,12 @@ func executeHTTPTunnel(sessionID string, localConn net.Conn, req *http.Request, 
 		defer wg.Done()
 		n, err := io.Copy(writer, localConn)
 		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-			zlog.Warnf("[%s] ⚠️ [本地->隧道] 上行异常: %v", sessionID, err)
+			zlog.Warnf("[%s] ⚠️ [本地->隧道] uplink error: %v", sessionID, err)
+			_ = pw.CloseWithError(err)
 		} else {
-			zlog.Debugf("[%s] ⬆️ [本地->隧道] 完成 (共上传 %d bytes)", sessionID, n)
+			zlog.Debugf("[%s] ⬆️ [本地->隧道] completed (uploaded %d bytes)", sessionID, n)
+			_ = pw.Close() // 触发 HTTP EOF
 		}
-		pw.Close() // 触发 HTTP EOF
 	}()
 
 	start := time.Now()
@@ -183,8 +217,8 @@ func executeHTTPTunnel(sessionID string, localConn net.Conn, req *http.Request, 
 
 	if err != nil {
 		zlog.Errorf("[%s] ❌ HTTP 握手异常: %v", sessionID, err)
-		// 如果握手失败，伪造一个错误让 wg 正常退出
-		localConn.Close()
+		// 如果握手失败，关闭本地连接让上行协程退出
+		_ = localConn.Close()
 		wg.Done() // 抵消下行的 wg.Done()
 		wg.Wait()
 		return
@@ -193,20 +227,26 @@ func executeHTTPTunnel(sessionID string, localConn net.Conn, req *http.Request, 
 
 	if resp.StatusCode >= 300 {
 		zlog.Warnf("[%s] ❌ 远端拒绝: HTTP %d", sessionID, resp.StatusCode)
-		localConn.Close()
+		_ = localConn.Close()
 		wg.Done()
 		wg.Wait()
 		return
 	}
-	zlog.Infof("[%s] 🚀 隧道握手建立成功 (耗时: %v)", sessionID, time.Since(start))
+	zlog.Infof("[%s] 🚀 隧道握手建立成功 (duration: %v)", sessionID, time.Since(start))
 
-	// 2. 下行 (隧道 -> 本地)
+	// 2. 下行 (Tunnel -> 本地)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			// 下行退出时（远端断开或下行结束），关闭本地连接以打断可能阻塞在上行的读取
+			_ = localConn.Close()
+		}()
 		var reader io.Reader = resp.Body
-		if cfg.UseGRPC { reader = &grpcReader{r: resp.Body} }
+		if cfg.UseGRPC {
+			reader = &grpcReader{r: resp.Body}
+		}
 		// ✅ 追加 Padding 拦截层
-		if !cfg.UseUDP {
+		if cfg.Network != "udp" {
 			reader = &PaddingReader{r: reader}
 		}
 
@@ -247,18 +287,18 @@ func withConnectionTrace(ctx context.Context, sessionID string) context.Context 
 func handleWTTCPClientConn(localConn net.Conn, sessionID string, cfg ClientConfig, wtManager *WTSessionManager) {
 	defer localConn.Close()
 	session, err := wtManager.GetSession(context.Background())
-	if err != nil { 
+	if err != nil {
 		zlog.Errorf("[%s] ❌ 无法获取 WT Session: %v", sessionID, err)
-		return 
+		return
 	}
-	
+
 	start := time.Now()
 	stream, err := session.OpenStreamSync(context.Background())
-	if err != nil { 
+	if err != nil {
 		zlog.Errorf("[%s] ❌ WT Stream 打开失败: %v", sessionID, err)
-		return 
+		return
 	}
-	zlog.Infof("[%s] 🚀 WT Stream 开启成功 (耗时: %v)", sessionID, time.Since(start))
+	zlog.Infof("[%s] 🚀 WT Stream 开启成功 (duration: %v)", sessionID, time.Since(start))
 
 	// 🌟 补齐 Padding 层包装
 	var reader io.Reader = stream
@@ -267,20 +307,29 @@ func handleWTTCPClientConn(localConn net.Conn, sessionID string, cfg ClientConfi
 	reader = &PaddingReader{r: stream}
 	writer = &PaddingWriter{w: stream}
 
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			_ = localConn.Close()
+			_ = stream.Close()
+		})
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	// 上行
 	go func() {
 		defer wg.Done()
+		defer closeBoth()
 		n, _ := io.Copy(writer, localConn)
 		zlog.Debugf("[%s] ⬆️ [本地->隧道] WT 上传完成 (共 %d bytes)", sessionID, n)
-		stream.Close() // 通知远端结束
 	}()
 
 	// 下行
 	go func() {
 		defer wg.Done()
+		defer closeBoth()
 		n, _ := io.Copy(localConn, reader)
 		zlog.Debugf("[%s] ⬇️ [隧道->本地] WT 下发完成 (共 %d bytes)", sessionID, n)
 		if tc, ok := localConn.(*net.TCPConn); ok {
@@ -295,13 +344,16 @@ func handleWTTCPClientConn(localConn net.Conn, sessionID string, cfg ClientConfi
 func handleMasqueTCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg ClientConfig, httpClient *http.Client) {
 	defer localConn.Close()
 	pr, pw := io.Pipe()
-	
+
 	// 🆕 注入 Trace
 	ctx, cancel := context.WithCancel(withConnectionTrace(context.Background(), sessionID))
 	defer cancel()
 
 	host, port, _ := net.SplitHostPort(cfg.TargetAddr)
-	if host == "" { host = cfg.TargetAddr; port = "22" }
+	if host == "" {
+		host = cfg.TargetAddr
+		port = "22"
+	}
 	masquePath := fmt.Sprintf("/.well-known/masque/tcp/%s/%s/", url.PathEscape(host), url.PathEscape(port))
 	u, _ := url.Parse(reqUrl)
 	u.Path = masquePath
@@ -309,7 +361,9 @@ func handleMasqueTCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg
 	req, _ := http.NewRequestWithContext(ctx, http.MethodConnect, u.String(), pr)
 	req.Proto = "HTTP/3"
 	req.Header.Set("Protocol", "connect-tcp")
-	if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
+	if cfg.CustomHost != "" {
+		req.Host = cfg.CustomHost
+	}
 	SetXDst(req.Header, cfg)
 	SetXAuth(req.Header, cfg)
 
@@ -321,16 +375,18 @@ func handleMasqueTCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg
 func handleH2TCPClientConn(localConn net.Conn, sessionID, reqUrl string, cfg ClientConfig, httpClient *http.Client) {
 	defer localConn.Close()
 	pr, pw := io.Pipe()
-	
+
 	// 🆕 注入 Trace
 	ctx, cancel := context.WithCancel(withConnectionTrace(context.Background(), sessionID))
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", reqUrl, pr)
-	if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
+	if cfg.CustomHost != "" {
+		req.Host = cfg.CustomHost
+	}
 	SetXDst(req.Header, cfg)
 	SetXAuth(req.Header, cfg)
-	
+
 	if cfg.UseGRPC {
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
@@ -383,6 +439,9 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 
 			go func(cAddr *net.UDPAddr, dataCh chan []byte) {
 				defer activeConns.Delete(cAddr.String())
+				done := make(chan struct{})
+				defer close(done)
+
 				pr, pw := io.Pipe()
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
@@ -391,19 +450,30 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 				req.Proto = "HTTP/3"
 				req.Header.Set("Protocol", "connect-udp")
 				req.Header.Set("Capsule-Protocol", "?1")
-				if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
+				if cfg.CustomHost != "" {
+					req.Host = cfg.CustomHost
+				}
 				SetXDst(req.Header, cfg)
 				SetXAuth(req.Header, cfg)
 
 				// 上行：封装 Capsule
 				go func() {
-					// ⚠️ 这里不需要归还池子，因为 payload 是由主循环或复用逻辑控制的
-					for p := range dataCh {
-						if err := writeUDPCapsule(pw, p); err != nil {
-							break
+					for {
+						select {
+						case <-done:
+							_ = pw.Close()
+							return
+						case p, ok := <-dataCh:
+							if !ok {
+								_ = pw.Close()
+								return
+							}
+							if err := writeUDPCapsule(pw, p); err != nil {
+								_ = pw.CloseWithError(err)
+								return
+							}
 						}
 					}
-					pw.Close()
 				}()
 
 				start := time.Now()
@@ -427,7 +497,7 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 					return
 				}
 
-				zlog.Infof("[M-UDP] 🚀 MASQUE 隧道就绪 (耗时: %v)", time.Since(start))
+				zlog.Infof("[M-UDP] 🚀 MASQUE 隧道就绪 (duration: %v)", time.Since(start))
 
 				// 下行：零分配解封装
 				bufRPtr := udpBufPool.Get().(*[]byte)
@@ -445,13 +515,17 @@ func runMasqueUDPClient(cfg ClientConfig, httpClient *http.Client) {
 				}
 			}(clientAddr, ch)
 
-			ch <- payload
+			// 首次数据进入：拷贝出独立切片并立刻归还大缓冲，避免池对象泄漏
+			tmp := make([]byte, n)
+			copy(tmp, payload)
+			udpBufPool.Put(bufPtr)
+			ch <- tmp
 		} else {
 			// 复用连接时的内存策略：
 			// 如果包很小，直接拷贝比占用 64KB 的池化内存更划算
 			tmp := make([]byte, n)
 			copy(tmp, payload)
-			
+
 			select {
 			case v.(chan []byte) <- tmp:
 			default:
@@ -471,7 +545,7 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client
 	}
 	defer localConn.Close()
 
-	zlog.Infof("[S-UDP] 🔗 监听就绪: UDP %s -> Stream隧道 -> %s", cfg.ListenAddr, cfg.TargetAddr)
+	zlog.Infof("[S-UDP] 🔗 监听就绪: UDP %s -> StreamTunnel -> %s", cfg.ListenAddr, cfg.TargetAddr)
 	var activeConns sync.Map
 
 	for {
@@ -492,11 +566,14 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client
 		if !ok {
 			zlog.Infof("[S-UDP] 🟢 发现新 UDP 客户端: %s", clientAddr.String())
 			// 传输指针，避免在大并发下 channel 拷贝字节切片头的开销
-			ch := make(chan []byte, 200) 
+			ch := make(chan []byte, 200)
 			activeConns.Store(clientAddr.String(), ch)
 
 			go func(cAddr *net.UDPAddr, dataCh chan []byte) {
 				defer activeConns.Delete(cAddr.String())
+				done := make(chan struct{})
+				defer close(done)
+
 				var r io.Reader
 				var w io.Writer
 				var closer func()
@@ -508,42 +585,62 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client
 						zlog.Errorf("[S-UDP] ❌ 无法获取 WT Session: %v", err)
 						return // 必须 return 结束当前协程
 					}
-					
+
 					stream, err := session.OpenStreamSync(context.Background())
 					if err != nil || stream == nil {
 						zlog.Errorf("[S-UDP] ❌ 无法打开 WT Stream: %v", err)
 						return // 必须 return
 					}
-					
+
 					r, w = stream, stream
 					closer = func() { stream.Close() }
 				} else {
 					pr, pw := io.Pipe()
 					req, _ := http.NewRequest("POST", reqUrl, pr)
-					if cfg.CustomHost != "" { req.Host = cfg.CustomHost }
+					if cfg.CustomHost != "" {
+						req.Host = cfg.CustomHost
+					}
 					SetXDst(req.Header, cfg)
 					SetXAuth(req.Header, cfg)
 					if cfg.UseGRPC {
 						req.Header.Set("Content-Type", "application/grpc")
 						req.Header.Set("TE", "trailers")
 					}
-					
+
 					go func() {
 						var writer io.Writer = pw
-						if cfg.UseGRPC { writer = &grpcWriter{w: pw} }
-						for p := range dataCh {
-							writeUDPPacket(writer, p)
-							// 重点：payload p 是从主循环传递过来的，包含了原有的 bufPtr 引用
-							// 但为了简单，我们在主循环统一处理 Put，或者这里加逻辑。
-							// 优化方案：这里写完后，不在这里放回池子，因为主循环会处理。
+						if cfg.UseGRPC {
+							writer = &grpcWriter{w: pw}
 						}
-						pw.Close()
+						for {
+							select {
+							case <-done:
+								_ = pw.Close()
+								return
+							case p, ok := <-dataCh:
+								if !ok {
+									_ = pw.Close()
+									return
+								}
+								if err := writeUDPPacket(writer, p); err != nil {
+									_ = pw.CloseWithError(err)
+									return
+								}
+							}
+						}
 					}()
 					resp, reqErr := httpClient.Do(req)
-					if reqErr != nil { return }
-					if resp.StatusCode >= 300 { resp.Body.Close(); return }
+					if reqErr != nil {
+						return
+					}
+					if resp.StatusCode >= 300 {
+						resp.Body.Close()
+						return
+					}
 					r = resp.Body
-					if cfg.UseGRPC { r = &grpcReader{r: resp.Body} }
+					if cfg.UseGRPC {
+						r = &grpcReader{r: resp.Body}
+					}
 					closer = func() { resp.Body.Close() }
 				}
 
@@ -552,8 +649,25 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client
 				// WT 模式的额外写入协程
 				if cfg.UseWT {
 					go func() {
-						for p := range dataCh { writeUDPPacket(w, p) }
-						if cw, ok := w.(interface{ CloseWrite() error }); ok { cw.CloseWrite() }
+						for {
+							select {
+							case <-done:
+								if cw, ok := w.(interface{ CloseWrite() error }); ok {
+									cw.CloseWrite()
+								}
+								return
+							case p, ok := <-dataCh:
+								if !ok {
+									if cw, ok := w.(interface{ CloseWrite() error }); ok {
+										cw.CloseWrite()
+									}
+									return
+								}
+								if err := writeUDPPacket(w, p); err != nil {
+									return
+								}
+							}
+						}
 					}()
 				}
 
@@ -570,9 +684,12 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, httpClient *http.Client
 					localConn.WriteToUDP(bufR[:n], cAddr)
 				}
 			}(clientAddr, ch)
-			
-			// 首次数据进入
-			ch <- payload
+
+			// 首次数据进入：拷贝出独立切片并立刻归还大缓冲，避免池对象泄漏
+			tmp := make([]byte, n)
+			copy(tmp, payload)
+			udpBufPool.Put(bufPtr)
+			ch <- tmp
 		} else {
 			// 复用连接：由于 payload 引用的是 buf，这里需要小心生命周期
 			// 为了绝对安全，建议在主循环中做一次小拷贝，或者直接通过 dataCh 传递后由子协程归还池子
