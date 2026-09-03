@@ -7,7 +7,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -38,6 +40,39 @@ type Config struct {
 	ALPN      string `json:"alpn"`       // Custom ALPN (client)
 	LocalOnly bool   `json:"local_only"` // Allow forwarding to localhost only (server)
 	LogLevel  string `json:"log_level"`  // debug, info, warn, error
+	// HeartbeatSec 应用层心跳间隔（秒）。CDN / 反代后面必须小于其空闲超时，
+	// 默认 25s（ALB 与 Nginx 默认 60s、Cloudflare 100s 的最小公约数的一半）。
+	// 设为 0 表示沿用默认值；设为负数则彻底关闭（仅限源站直连）。
+	HeartbeatSec int `json:"heartbeat_sec"`
+	// DrainTimeoutSec 收到 SIGTERM 后等待存量隧道排空的上限（秒），超时强制关闭。
+	DrainTimeoutSec int `json:"drain_timeout_sec"`
+	// Standby 已废弃：被 L3 ConnectionManager（primary_count/backup_count/
+	// establish_interval_sec）取代。保留解析但不再生效（no-op）。
+	Standby bool `json:"standby"`
+	// ConnMaxAgeSec 已废弃：被 ConnectionPolicy.EstablishInterval 取代。
+	// 保留解析但不再生效（no-op）。
+	ConnMaxAgeSec int `json:"conn_max_age_sec"`
+	// 注：resume 配置字段已移除——resume/2 是唯一数据面（恒启用），
+	// TCP 与 UDP 均无 resume:false 逃生通道（v1 已彻底删除）。
+	// SessionWindowKB 会话恢复窗口大小（KB），决定能恢复的断线时间上限
+	// （与服务端在此窗口内能接收/发送的最大字节量）。默认 256KB。
+	SessionWindowKB int `json:"session_window_kb"`
+	// BackupLine 备用线路策略：none=单线路；hot=热备；cold=冷备。默认 none。
+	BackupLine string `json:"backup_line"`
+	// HandshakeAckMs 数据面握手 HANDSHAKE-ACK 超时（毫秒），默认 3000ms。
+	HandshakeAckMs int `json:"handshake_ack_ms"`
+	// KeepaliveSec 备用线路/会话 KEEPALIVE 心跳间隔（秒），默认 15s。
+	KeepaliveSec int `json:"keepalive_sec"`
+	// PrimaryCount 主连接数量，默认 1。>1 时启用类型分流（tcp/udp 各管一条）。
+	PrimaryCount int `json:"primary_count"`
+	// BackupCount 备用连接数量，默认 1。
+	BackupCount int `json:"backup_count"`
+	// PrimaryDialIntervalSec 主连接拨号间隔（秒），默认 30s（节流防重拨风暴）。
+	PrimaryDialIntervalSec int `json:"primary_dial_interval_sec"`
+	// BackupDialIntervalSec 备用连接拨号间隔（秒），默认 15s（节流防重拨风暴）。
+	BackupDialIntervalSec int `json:"backup_dial_interval_sec"`
+	// EstablishIntervalSec 主/备建立间隔（秒），默认 100s。先拨主、错相后再拨备。
+	EstablishIntervalSec int `json:"establish_interval_sec"`
 }
 
 func (c *Config) UnmarshalJSON(data []byte) error {
@@ -137,25 +172,79 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Network = v
 	}
 	if v := getEnv("H2TUNNEL_TLS", "TLS"); v != "" {
-		cfg.TLS = (v == "1" || strings.ToLower(v) == "true")
+		cfg.TLS = v == "1" || strings.ToLower(v) == "true"
 	}
 	if v := getEnv("H2TUNNEL_LOG_LEVEL", "LOG_LEVEL", "LOGLEVEL"); v != "" {
 		cfg.LogLevel = v
 	}
+	if v := getEnv("H2TUNNEL_HEARTBEAT_SEC", "HEARTBEAT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.HeartbeatSec = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_DRAIN_TIMEOUT_SEC", "DRAIN_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.DrainTimeoutSec = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_BACKUP_LINE", "BACKUP_LINE"); v != "" {
+		cfg.BackupLine = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v := getEnv("H2TUNNEL_HANDSHAKE_ACK_MS", "HANDSHAKE_ACK_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.HandshakeAckMs = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_KEEPALIVE_SEC", "KEEPALIVE_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.KeepaliveSec = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_PRIMARY_COUNT", "PRIMARY_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.PrimaryCount = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_BACKUP_COUNT", "BACKUP_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.BackupCount = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_PRIMARY_DIAL_INTERVAL_SEC", "PRIMARY_DIAL_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.PrimaryDialIntervalSec = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_BACKUP_DIAL_INTERVAL_SEC", "BACKUP_DIAL_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.BackupDialIntervalSec = n
+		}
+	}
+	if v := getEnv("H2TUNNEL_ESTABLISH_INTERVAL_SEC", "ESTABLISH_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.EstablishIntervalSec = n
+		}
+	}
 }
 
 type ServerConfig struct {
-	ListenAddr    string `json:"listen"`
-	TLSCert       string `json:"cert"`
-	TLSKey        string `json:"key"`
-	EnableTLS     bool   `json:"tls"`
-	Path          string `json:"path"`
-	LocalOnly     bool   `json:"local_only"`
-	LogLevel      string `json:"log_level"`
-	EnableH3      bool   `json:"h3"`
-	Transport     string `json:"transport"`
-	Network       string `json:"network"` // "all", "tcp", "udp"
-	ExpectedToken string `json:"token"`
+	ListenAddr        string        `json:"listen"`
+	TLSCert           string        `json:"cert"`
+	TLSKey            string        `json:"key"`
+	EnableTLS         bool          `json:"tls"`
+	Path              string        `json:"path"`
+	LocalOnly         bool          `json:"local_only"`
+	LogLevel          string        `json:"log_level"`
+	EnableH3          bool          `json:"h3"`
+	Transport         string        `json:"transport"`
+	Network           string        `json:"network"` // "all", "tcp", "udp"
+	ExpectedToken     string        `json:"token"`
+	HeartbeatInterval time.Duration `json:"-"` // 由 heartbeat_sec 换算
+	DrainTimeout      time.Duration `json:"-"` // 由 drain_timeout_sec 换算
+	// SessionWindow 会话恢复环形缓冲容量（KB），服务端侧必须实现才能配合客户端恢复。
+	SessionWindow int `json:"-"`
+	// BackupLine 备用线路策略：none=单线路；hot=热备；cold=冷备。默认 none。
+	BackupLine string `json:"backup_line"`
 }
 
 type ClientConfig struct {
@@ -174,6 +263,22 @@ type ClientConfig struct {
 	Network    string `json:"network"` // "all" / "both", "tcp", "udp"
 	LogLevel   string `json:"log_level"`
 	Token      string `json:"token"`
+
+	// 以下两项为客户端侧的保活与排空参数，语义同 ServerConfig
+	HeartbeatInterval time.Duration `json:"-"`
+	DrainTimeout      time.Duration `json:"-"`
+	// SessionWindow 会话恢复环形缓冲容量（KB）
+	SessionWindow int `json:"-"`
+	// BackupLine 备用线路策略：none=单线路；hot=热备；cold=冷备。默认 none。
+	BackupLine string `json:"backup_line"`
+	// HandshakeAckMs 数据面握手 HANDSHAKE-ACK 超时（毫秒），默认 3000ms。
+	HandshakeAckMs int `json:"handshake_ack_ms"`
+	// KeepaliveSec 备用线路/会话 KEEPALIVE 心跳间隔（秒），默认 15s。
+	KeepaliveSec int `json:"keepalive_sec"`
+	// RoleBackup 标记当前请求是备用线路（内部透传，由 backupLine 设置）。
+	RoleBackup bool `json:"-"`
+	// ConnectionPolicy 连接管理策略（主备数量/间隔/类型分流）。
+	ConnectionPolicy ConnectionPolicy `json:"-"`
 }
 
 func (c *ClientConfig) IsUDP() bool {
@@ -386,6 +491,56 @@ func loadConfigFromArgs(args []string) *Config {
 	return cfg
 }
 
+// resolveHeartbeat 把秒级配置换算为心跳间隔。
+//
+//	0  → 采用默认值（推荐，25s）
+//	<0 → 关闭心跳（仅源站直连、中间无 CDN/反代时使用）
+//	>0 → 收敛到 [5s, 5min]
+func resolveHeartbeat(sec int) time.Duration {
+	if sec < 0 {
+		return 0
+	}
+	if sec == 0 {
+		return clampHeartbeat(0)
+	}
+	return clampHeartbeat(time.Duration(sec) * time.Second)
+}
+
+// resolveDrainTimeout 把秒级配置换算为优雅下线排空上限，默认 30s。
+func resolveDrainTimeout(sec int) time.Duration {
+	if sec <= 0 {
+		return drainDefault
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// resolveSessionWindow 会话恢复环形缓冲容量；0 或非法值 → 默认 256KB。
+// 上限与握手协商保持一致，避免错误配置在每个会话创建时分配过大的内存。
+const sessionWindowDefaultKB = 256
+
+func resolveSessionWindow(kb int) int {
+	if kb <= 0 || kb > maxWindowKB {
+		return sessionWindowDefaultKB
+	}
+	return kb
+}
+
+// resolveKeepaliveSec 会话/备用 KEEPALIVE 心跳间隔（秒）；0 或非法 → 默认 15s。
+func resolveKeepaliveSec(sec int) int {
+	if sec <= 0 || sec > maxKeepaliveSec {
+		return defaultKeepaliveSec
+	}
+	return sec
+}
+
+// resolveHandshakeAckMs 数据面握手 HANDSHAKE-ACK 超时（毫秒）；0 或非法 → 默认 3000ms。
+func resolveHandshakeAckMs(ms int) int {
+	if ms <= 0 || ms > maxHandshakeAckMs {
+		return defaultHandshakeAckMs
+	}
+	return ms
+}
+
 func buildServerConfig(cfg *Config) ServerConfig {
 	listen := cfg.Listen
 	if listen == "" {
@@ -405,21 +560,53 @@ func buildServerConfig(cfg *Config) ServerConfig {
 	}
 
 	return ServerConfig{
-		ListenAddr:    listen,
-		TLSCert:       cfg.Cert,
-		TLSKey:        cfg.Key,
-		EnableTLS:     cfg.TLS,
-		Path:          path,
-		LocalOnly:     cfg.LocalOnly,
-		LogLevel:      logLevel,
-		EnableH3:      cfg.H3,
-		Transport:     cfg.Transport,
-		Network:       netMode,
-		ExpectedToken: cfg.Token,
+		ListenAddr:        listen,
+		TLSCert:           cfg.Cert,
+		TLSKey:            cfg.Key,
+		EnableTLS:         cfg.TLS,
+		Path:              path,
+		LocalOnly:         cfg.LocalOnly,
+		LogLevel:          logLevel,
+		EnableH3:          cfg.H3,
+		Transport:         cfg.Transport,
+		Network:           netMode,
+		ExpectedToken:     cfg.Token,
+		HeartbeatInterval: resolveHeartbeat(cfg.HeartbeatSec),
+		DrainTimeout:      resolveDrainTimeout(cfg.DrainTimeoutSec),
+		SessionWindow:     resolveSessionWindow(cfg.SessionWindowKB),
+		BackupLine:        cfg.BackupLine,
 	}
 }
 
+// validateClientTransport 校验客户端传输互斥。一个客户端进程每次出站只走一种
+// 主传输（h3 / wt / masque / grpc），代码分派从不并行跑多协议——若同时开多个，
+// 之前只会按优先级静默取一（wt > h3/masque QUIC > h2/grpc），极易让人误以为
+// "多开=多路并行"。这里改为显式报错。返回空串表示无冲突，否则返回可读描述。
+func validateClientTransport(c *Config) string {
+	enabled := []string{}
+	if c.H3 {
+		enabled = append(enabled, "h3")
+	}
+	if c.WT {
+		enabled = append(enabled, "wt")
+	}
+	if c.Masque {
+		enabled = append(enabled, "masque")
+	}
+	if c.GRPC {
+		enabled = append(enabled, "grpc")
+	}
+	if len(enabled) > 1 {
+		return fmt.Sprintf("client transport 只能选一个，不能同时开启 %s（h3/wt/masque/grpc 互斥，代码不会并行跑多协议）",
+			strings.Join(enabled, " + "))
+	}
+	return ""
+}
+
 func buildClientConfig(cfg *Config) ClientConfig {
+	if msg := validateClientTransport(cfg); msg != "" {
+		zlog.Fatalf("[Client] ❌ %s", msg)
+	}
 	listen := cfg.Listen
 	if listen == "" {
 		listen = "127.0.0.1:2222"
@@ -448,21 +635,32 @@ func buildClientConfig(cfg *Config) ClientConfig {
 	}
 
 	return ClientConfig{
-		ListenAddr: listen,
-		ServerUrl:  server,
-		Path:       path,
-		TargetAddr: target,
-		Insecure:   cfg.Insecure,
-		CustomHost: cfg.Host,
-		ServerName: cfg.SNI,
-		Alpn:       cfg.ALPN,
-		UseH3:      cfg.H3,
-		UseWT:      cfg.WT,
-		UseMasque:  cfg.Masque,
-		UseGRPC:    cfg.GRPC,
-		Network:    netMode,
-		LogLevel:   logLevel,
-		Token:      cfg.Token,
+		ListenAddr:        listen,
+		ServerUrl:         server,
+		Path:              path,
+		TargetAddr:        target,
+		Insecure:          cfg.Insecure,
+		CustomHost:        cfg.Host,
+		ServerName:        cfg.SNI,
+		Alpn:              cfg.ALPN,
+		UseH3:             cfg.H3,
+		UseWT:             cfg.WT,
+		UseMasque:         cfg.Masque,
+		UseGRPC:           cfg.GRPC,
+		Network:           netMode,
+		LogLevel:          logLevel,
+		Token:             cfg.Token,
+		HeartbeatInterval: resolveHeartbeat(cfg.HeartbeatSec),
+		DrainTimeout:      resolveDrainTimeout(cfg.DrainTimeoutSec),
+		SessionWindow:     resolveSessionWindow(cfg.SessionWindowKB),
+		BackupLine:        cfg.BackupLine,
+		HandshakeAckMs:    resolveHandshakeAckMs(cfg.HandshakeAckMs),
+		KeepaliveSec:      resolveKeepaliveSec(cfg.KeepaliveSec),
+		ConnectionPolicy: resolveConnectionPolicy(
+			cfg.PrimaryCount, cfg.BackupCount,
+			cfg.PrimaryDialIntervalSec, cfg.BackupDialIntervalSec,
+			cfg.EstablishIntervalSec, defaultBackupMissedAck, nil,
+		),
 	}
 }
 

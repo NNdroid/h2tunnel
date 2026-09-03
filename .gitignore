@@ -4,6 +4,7 @@
 # Binaries for programs and plugins
 *.exe
 *.exe~
+/h2tunnel
 *.dll
 *.so
 *.dylib

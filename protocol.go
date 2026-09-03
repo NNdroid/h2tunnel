@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -19,6 +20,35 @@ import (
 
 // 预生成的随机字节数组，用于极速填充 Padding，避免运行时计算和内存分配
 var paddingGarbage [4096]byte
+
+// CDN 后各类反代的空闲超时上限（实测公约数）：
+//
+//	AWS ALB idle_timeout        默认 60s
+//	Nginx proxy_read_timeout    默认 60s
+//	Cloudflare 回源读超时        100s（超时返回 524）
+//
+// 取最小公约数 60s 的一半以下作为默认心跳间隔，留出重传与抖动余量。
+const (
+	heartbeatDefault = 25 * time.Second
+	heartbeatMin     = 5 * time.Second
+	heartbeatMax     = 5 * time.Minute
+	// 优雅下线时等待存量隧道排空的上限
+	drainDefault = 30 * time.Second
+)
+
+// clampHeartbeat 把用户配置的心跳间隔收敛到安全区间。
+// 返回 0 表示关闭心跳（仅建议在源站直连、无中间盒时使用）。
+func clampHeartbeat(d time.Duration) time.Duration {
+	switch {
+	case d <= 0:
+		return heartbeatDefault
+	case d < heartbeatMin:
+		return heartbeatMin
+	case d > heartbeatMax:
+		return heartbeatMax
+	}
+	return d
+}
 
 // maxCapsuleLen bounds the length of a MASQUE/QUIC UDP capsule we are willing to
 // consume. capsuleLen comes from the (attacker-controlled) wire, so without this
@@ -48,45 +78,6 @@ func fastRand(max int) int {
 		return 0
 	}
 	return mrand.Intn(max)
-}
-
-// calculatePadding 智能动态填充算法
-// 核心思想：反比例填充 + 块边界对齐
-func calculatePadding(dataLen int) int {
-	var targetPad int
-
-	// 阶梯式反比例基础填充
-	switch {
-	case dataLen < 128:
-		// 极小包（握手包、心跳包）：重度混淆，随机填充 128 ~ 384 字节
-		targetPad = 128 + fastRand(256)
-	case dataLen < 512:
-		// 小包（控制指令）：中度混淆，随机填充 64 ~ 192 字节
-		targetPad = 64 + fastRand(128)
-	case dataLen < 8192:
-		// 中等包：轻度混淆，随机填充 16 ~ 64 字节
-		targetPad = 16 + fastRand(48)
-	default:
-		// 大型数据流（高速下载）
-		targetPad = 0
-	}
-
-	// 块对齐增强 (Block Alignment)
-	// 强制让 (真实数据 + Padding) 的总长度对齐到 64 字节边界，
-	// 这会让流量看起来非常像 AES/ChaCha20 这种标准块加密算法的输出特征。
-	totalLen := dataLen + targetPad
-	remainder := totalLen % 64
-	if remainder != 0 {
-		targetPad += (64 - remainder)
-	}
-
-	// 绝对安全边界拦截
-	// 确保 Padding 永远不会超过我们预分配的 paddingGarbage 垃圾池大小
-	if targetPad >= len(paddingGarbage) {
-		targetPad = len(paddingGarbage) - 1
-	}
-
-	return targetPad
 }
 
 // NormalizeTargetAddr 标准化目标地址（支持 IP:Port 与 Domain:Port）
@@ -133,7 +124,12 @@ func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
 			host = target
 		}
 		host = strings.ToLower(strings.Trim(host, "[]"))
-		return host == "127.0.0.1" || host == "localhost" || host == "::1"
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.IsLoopback()
+		}
+		// Keep the conventional local hostname for user-friendly configs, but do
+		// not accept lookalike names such as localhost.example.com.
+		return host == "localhost"
 	}
 	return true
 }
@@ -215,9 +211,30 @@ func SetXDst(h http.Header, cfg ClientConfig) (string, string) {
 }
 
 func SetXAuth(h http.Header, cfg ClientConfig) {
-	if cfg.Token != "" {
-		h.Set("Proxy-Authorization", "Bearer "+cfg.Token)
+	if cfg.Token == "" {
+		return
 	}
+	// ⚠️ 同时投递三个头，是有意为之，不是冗余：
+	//   X-Auth-Token        自定义头，任何 CDN / 反代都会原样透传 —— CDN 场景的实际生效者
+	//   Authorization       标准头，Nginx / Cloudflare 默认透传 —— 次选
+	//   Proxy-Authorization RFC 7230 定义的 hop-by-hop 头，代理「必须」消耗掉，
+	//                       直连场景可用，过 CDN 会被剥离 —— 仅为兼容旧部署保留
+	// 单发 Proxy-Authorization 时在 CDN / Nginx 反代后面会恒定 407，这是历史 bug。
+	h.Set("X-Auth-Token", cfg.Token)
+	h.Set("Authorization", "Bearer "+cfg.Token)
+	h.Set("Proxy-Authorization", "Bearer "+cfg.Token)
+}
+
+// setTunnelRequestHeaders 设置隧道请求侧的反缓冲头，与 server 端的
+// setTunnelHeaders 配对：
+//
+//	Accept-Encoding: identity —— Go Transport 默认会自动补 gzip 并承诺解压，
+//	  中间盒看到 Accept-Encoding: gzip 可能直接对响应做压缩缓冲。显式
+//	  identity 同时阻止 Transport 自动补头和 CDN 主动压缩。
+//	Cache-Control: no-store, no-transform —— 要求 CDN 不缓存、不改写。
+func setTunnelRequestHeaders(h http.Header) {
+	h.Set("Accept-Encoding", "identity")
+	h.Set("Cache-Control", "no-store, no-transform")
 }
 
 // checkAuth 统一鉴权（支持多 Token 逗号分隔列表）
@@ -226,11 +243,13 @@ func checkAuth(r *http.Request, expectedTokens string) bool {
 		return true
 	}
 
-	authHeader := r.Header.Get("Proxy-Authorization")
-	if authHeader == "" {
-		authHeader = r.Header.Get("Authorization")
-	}
+	// 优先级：自定义头 > Authorization > Proxy-Authorization。
+	// 自定义头放首位是因为它是唯一能保证穿过任意中间盒的载体。
 	customTokenHeader := r.Header.Get("X-Auth-Token")
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		authHeader = r.Header.Get("Proxy-Authorization")
+	}
 
 	// 拆分支持多 Token 配置（例如: -token token1,token2）
 	tokens := strings.Split(expectedTokens, ",")
@@ -239,14 +258,49 @@ func checkAuth(r *http.Request, expectedTokens string) bool {
 		if cleanTok == "" {
 			continue
 		}
-		if authHeader == "Bearer "+cleanTok || authHeader == cleanTok || customTokenHeader == cleanTok {
+		// 常量时间比较，避免通过响应耗时逐字节爆破 token
+		if secureEqual(customTokenHeader, cleanTok) {
+			return true
+		}
+		if secureEqual(authHeader, cleanTok) || secureEqual(authHeader, "Bearer "+cleanTok) {
 			return true
 		}
 	}
 
 	// 鉴权失败时，只记录来源 IP，绝不打印客户端携带的 token（含 Bearer 明文），以防凭据泄露
-	zlog.Warnf("[Protocol] 鉴权拦截: 非法/缺失鉴权 (IP: %s)", r.RemoteAddr)
+	zlog.Warnf("[Protocol] 鉴权拦截: 非法/缺失鉴权 (IP: %s)", clientIP(r))
 	return false
+}
+
+// secureEqual 常量时间字符串比较（长度不等时也要走完，避免长度侧信道）
+func secureEqual(a, b string) bool {
+	if a == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// clientIP 还原真实客户端 IP。
+//
+// 在 CDN / 反代后面 r.RemoteAddr 恒为边缘节点地址，直接拿它做日志和审计
+// 等于什么都没记。这里按常见约定依次回退取值。
+//
+// ⚠️ 安全约束：这些头都可以被客户端伪造，因此本函数的返回值只能用于日志、
+// 限流统计等辅助用途，**绝不可作为鉴权或访问控制依据**。需要按 IP 做访问
+// 控制时，必须在最外层反代上校验，或显式配置可信代理层数后取倒数第 N 跳。
+func clientIP(r *http.Request) string {
+	for _, h := range []string{"CF-Connecting-IP", "True-Client-IP", "X-Real-IP"} {
+		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+			return v
+		}
+	}
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i > 0 {
+			return strings.TrimSpace(v[:i])
+		}
+		return strings.TrimSpace(v)
+	}
+	return r.RemoteAddr
 }
 
 // parseMasqueTarget 遵循 RFC 9298 解析 URI 模板
@@ -288,24 +342,19 @@ func parseMasqueTarget(protocol, reqPath string) (string, error) {
 
 // --- QUIC VarInt (极高频调用，仅保留严重错误日志) ---
 func writeVarInt(w io.Writer, val uint64) error {
+	var buf [8]byte
 	if val <= 0x3f {
-		_, err := w.Write([]byte{byte(val)})
-		return err
+		buf[0] = byte(val)
+		return writeAll(w, buf[:1])
 	} else if val <= 0x3fff {
-		buf := make([]byte, 2)
-		binary.BigEndian.PutUint16(buf, uint16(val)|0x4000)
-		_, err := w.Write(buf)
-		return err
+		binary.BigEndian.PutUint16(buf[:2], uint16(val)|0x4000)
+		return writeAll(w, buf[:2])
 	} else if val <= 0x3fffffff {
-		buf := make([]byte, 4)
-		binary.BigEndian.PutUint32(buf, uint32(val)|0x80000000)
-		_, err := w.Write(buf)
-		return err
+		binary.BigEndian.PutUint32(buf[:4], uint32(val)|0x80000000)
+		return writeAll(w, buf[:4])
 	}
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, val|0xc000000000000000)
-	_, err := w.Write(buf)
-	return err
+	binary.BigEndian.PutUint64(buf[:], val|0xc000000000000000)
+	return writeAll(w, buf[:])
 }
 
 func readVarInt(r io.Reader) (uint64, error) {
@@ -342,7 +391,7 @@ func writeUDPCapsule(w io.Writer, p []byte) error {
 			return err
 		}
 		if padLen > 0 {
-			if _, err := w.Write(paddingGarbage[:padLen]); err != nil {
+			if err := writeAll(w, paddingGarbage[:padLen]); err != nil {
 				return err
 			}
 		}
@@ -358,8 +407,7 @@ func writeUDPCapsule(w io.Writer, p []byte) error {
 	if err := writeVarInt(w, 0x00); err != nil {
 		return err
 	}
-	_, err := w.Write(p)
-	return err
+	return writeAll(w, p)
 }
 
 func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
@@ -419,8 +467,7 @@ func writeUDPPacket(w io.Writer, p []byte) error {
 		copy(buf[4+len(p):], paddingGarbage[:padLen])
 	}
 
-	_, err := w.Write(buf[:totalLen])
-	return err
+	return writeAll(w, buf[:totalLen])
 }
 
 func readUDPPacket(r io.Reader, payloadBuf []byte) (int, error) {
@@ -446,285 +493,4 @@ func readUDPPacket(r io.Reader, payloadBuf []byte) (int, error) {
 		}
 	}
 	return int(length), nil
-}
-
-// --- gRPC Wrappers ---
-type grpcWriter struct{ w io.Writer }
-
-func (g *grpcWriter) Write(p []byte) (n int, err error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	// 只分配 5 个字节的极小头部，Go 编译器会将其优化在栈上，不触发 GC
-	var header [5]byte
-	binary.BigEndian.PutUint32(header[1:5], uint32(len(p)))
-
-	// 连续写两次，只要底层的 w (如 http2.Stream) 带有缓冲，性能损耗极小
-	if _, err := g.w.Write(header[:]); err != nil {
-		return 0, err
-	}
-	if _, err := g.w.Write(p); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-type grpcReader struct {
-	r    io.Reader
-	left uint32
-}
-
-func (g *grpcReader) Read(p []byte) (n int, err error) {
-	for g.left == 0 {
-		var header [5]byte
-		if _, err := io.ReadFull(g.r, header[:]); err != nil {
-			// 连接自然断开时走到这里返回 EOF，不打 Error 日志
-			return 0, err
-		}
-		g.left = binary.BigEndian.Uint32(header[1:5])
-	}
-	toRead := uint32(len(p))
-	if toRead > g.left {
-		toRead = g.left
-	}
-	n, err = g.r.Read(p[:toRead])
-	if err != nil && err != io.EOF {
-		zlog.Debugf("[gRPC-Reader] 读取帧负载时发生异常: %v", err)
-	}
-	g.left -= uint32(n)
-	return n, err
-}
-
-// --- Stream Padding Wrappers ---
-
-// PaddingWriter 对标准 io.Writer 进行混淆包装
-type PaddingWriter struct {
-	w io.Writer
-}
-
-func (pw *PaddingWriter) Write(p []byte) (nTotal int, err error) {
-	for len(p) > 0 {
-		chunk := p
-		// 控制单帧最大限制为 1MB
-		if len(chunk) > 1048576 {
-			chunk = chunk[:1048576]
-		}
-
-		// 智能计算 Padding 长度
-		padLen := calculatePadding(len(chunk))
-		totalLen := 6 + len(chunk) + padLen
-
-		// 🌟 核心优化：从全局池子里“借”一块内存，坚决不用 make
-		bufPtr := paddingWritePool.Get().(*[]byte)
-		buf := *bufPtr
-
-		// 写入 6 字节 Header
-		binary.BigEndian.PutUint32(buf[0:4], uint32(len(chunk)))
-		binary.BigEndian.PutUint16(buf[4:6], uint16(padLen))
-
-		// 写入真实数据
-		copy(buf[6:], chunk)
-
-		// 写入垃圾 Padding
-		if padLen > 0 {
-			copy(buf[6+len(chunk):], paddingGarbage[:padLen])
-		}
-
-		// 🌟 提交给底层发送（切片截取到实际组装的 totalLen）
-		_, errW := pw.w.Write(buf[:totalLen])
-
-		// 🌟 用完立刻“还”回池子，供其他并发连接复用
-		paddingWritePool.Put(bufPtr)
-
-		if errW != nil {
-			return nTotal, errW
-		}
-
-		nTotal += len(chunk)
-		p = p[len(chunk):]
-	}
-	return nTotal, nil
-}
-
-// 傳遞關閉信號到底層 Writer
-func (pw *PaddingWriter) Close() error {
-	if closer, ok := pw.w.(io.Closer); ok {
-		return closer.Close()
-	}
-	return nil
-}
-
-// PaddingReader 对应的解包器
-type PaddingReader struct {
-	r        io.Reader
-	leftData uint32
-	leftPad  uint16
-}
-
-func (pr *PaddingReader) Read(p []byte) (n int, err error) {
-	for pr.leftData == 0 {
-		// 消耗掉上一帧残留的 Padding (如果有的话)
-		if pr.leftPad > 0 {
-			_, err := io.CopyN(io.Discard, pr.r, int64(pr.leftPad))
-			if err != nil {
-				return 0, err
-			}
-			pr.leftPad = 0
-		}
-
-		// 读取新帧的 6 字节 Header
-		var header [6]byte
-		if _, err := io.ReadFull(pr.r, header[:]); err != nil {
-			return 0, err
-		}
-		pr.leftData = binary.BigEndian.Uint32(header[0:4]) // 解析 4 字节数据长度
-		pr.leftPad = binary.BigEndian.Uint16(header[4:6])
-
-		// 边界防护：防御损坏或恶意超大报文导致内存耗尽
-		if pr.leftData > 16*1024*1024 || pr.leftPad > 16384 {
-			return 0, fmt.Errorf("corrupted padding frame: dataLen=%d, padLen=%d", pr.leftData, pr.leftPad)
-		}
-	}
-
-	// 读取真实载荷
-	toRead := pr.leftData
-	if uint32(len(p)) < toRead {
-		toRead = uint32(len(p)) // 防御性判断：不能超过用户传入的 slice 容量
-	}
-	n, err = pr.r.Read(p[:toRead])
-	if err != nil && err != io.EOF {
-		zlog.Debugf("[PaddingReader] 读取真实数据异常: %v", err)
-	}
-	pr.leftData -= uint32(n)
-	return n, err
-}
-
-// 傳遞關閉信號到底層 Reader
-func (pr *PaddingReader) Close() error {
-	if closer, ok := pr.r.(io.Closer); ok {
-		return closer.Close()
-	}
-	return nil
-}
-func proxyStream(sessionID string, network string, targetConn net.Conn, tunnelReader io.Reader, tunnelWriter io.Writer, flusher http.Flusher) {
-	zlog.Debugf("[%s] Proxy engine active, Network: %s", sessionID, network)
-
-	var closeOnce sync.Once
-	closeTarget := func() {
-		closeOnce.Do(func() {
-			_ = targetConn.Close()
-		})
-	}
-	defer closeTarget()
-
-	if network == "udp" || network == "masque-udp" {
-		errChan := make(chan error, 2)
-		go func() {
-			bufPtr := udpBufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer udpBufPool.Put(bufPtr)
-			for {
-				_ = targetConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-				n, err := targetConn.Read(buf)
-				if err != nil {
-					errChan <- err
-					closeTarget()
-					return
-				}
-				var writeErr error
-				if network == "masque-udp" {
-					writeErr = writeUDPCapsule(tunnelWriter, buf[:n])
-				} else {
-					writeErr = writeUDPPacket(tunnelWriter, buf[:n])
-				}
-				if writeErr != nil {
-					errChan <- writeErr
-					closeTarget()
-					return
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
-			}
-		}()
-		go func() {
-			bufPtr := udpBufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer udpBufPool.Put(bufPtr)
-			for {
-				var pkt []byte
-				var err error
-				if network == "masque-udp" {
-					n, rErr := readUDPCapsule(tunnelReader, buf)
-					if rErr != nil {
-						errChan <- rErr
-						closeTarget()
-						return
-					}
-					pkt = buf[:n]
-				} else {
-					n, rErr := readUDPPacket(tunnelReader, buf)
-					if rErr != nil {
-						errChan <- rErr
-						closeTarget()
-						return
-					}
-					pkt = buf[:n]
-				}
-				_ = targetConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-				if _, err = targetConn.Write(pkt); err != nil {
-					errChan <- err
-					closeTarget()
-					return
-				}
-			}
-		}()
-		err := <-errChan
-		closeTarget()
-		zlog.Debugf("[%s] UDP proxy stream terminated: %v", sessionID, err)
-	} else {
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// 1. 下行传输: targetConn -> tunnelWriter
-		go func() {
-			defer wg.Done()
-			defer closeTarget() // 下行结束（错误或目标关闭）立即关闭 targetConn，打断上行阻塞
-			bufPtr := tcpBufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer tcpBufPool.Put(bufPtr)
-			for {
-				n, err := targetConn.Read(buf)
-				if n > 0 {
-					_, wErr := tunnelWriter.Write(buf[:n])
-					if wErr != nil {
-						zlog.Debugf("[%s] Write to tunnel failed: %v", sessionID, wErr)
-						return
-					}
-					if flusher != nil {
-						flusher.Flush()
-					}
-				}
-				if err != nil {
-					zlog.Debugf("[%s] Downlink transfer finished: %v", sessionID, err)
-					return
-				}
-			}
-		}()
-
-		// 2. 上行传输: tunnelReader -> targetConn
-		go func() {
-			defer wg.Done()
-			defer closeTarget() // 上行结束（客户端中断或 EOF）立即关闭 targetConn，打断下行阻塞
-			n, err := io.Copy(targetConn, tunnelReader)
-			zlog.Debugf("[%s] Uplink transfer finished: Size %d, Err %v", sessionID, n, err)
-			if cw, ok := targetConn.(interface{ CloseWrite() error }); ok {
-				_ = cw.CloseWrite()
-			}
-		}()
-
-		wg.Wait()
-		zlog.Debugf("[%s] TCP proxy stream closed", sessionID)
-	}
 }
