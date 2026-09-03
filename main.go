@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -25,19 +27,14 @@ type Config struct {
 	Target    string `json:"target"`     // Target address to forward to (e.g. "127.0.0.1:22")
 	Path      string `json:"path"`       // HTTP proxy path (e.g. "/tunnel")
 	Token     string `json:"token"`      // Authorization token
-	Transport string `json:"transport"`  // "all", "h2", "h2c", "h3", "wt", "webtransport", "masque", "grpc"
-	Network   string `json:"network"`    // "all" (or "tcp,udp"), "tcp", "udp"
+	Transport string `json:"transport"`  // "all", "h2", "h2c", "h3", "wt", "masque", "grpc"
+	Network   string `json:"network"`    // "all", "tcp", "udp"
 	TLS       bool   `json:"tls"`        // Enable TLS (auto self-signed if cert/key not provided)
 	Cert      string `json:"cert"`       // TLS certificate path
 	Key       string `json:"key"`        // TLS private key path
-	H3        bool   `json:"h3"`         // Enable HTTP/3 (QUIC)
-	WT        bool   `json:"wt"`         // Enable WebTransport (client)
-	Masque    bool   `json:"masque"`     // Enable MASQUE CONNECT (client)
-	GRPC      bool   `json:"grpc"`       // Enable gRPC mode
 	Insecure  bool   `json:"insecure"`   // Skip TLS certificate verification (client)
 	Host      string `json:"host"`       // Custom Host header (client)
 	SNI       string `json:"sni"`        // Custom SNI (client)
-	ALPN      string `json:"alpn"`       // Custom ALPN (client)
 	LocalOnly bool   `json:"local_only"` // Allow forwarding to localhost only (server)
 	LogLevel  string `json:"log_level"`  // debug, info, warn, error
 	// HeartbeatSec 应用层心跳间隔（秒）。CDN / 反代后面必须小于其空闲超时，
@@ -46,27 +43,19 @@ type Config struct {
 	HeartbeatSec int `json:"heartbeat_sec"`
 	// DrainTimeoutSec 收到 SIGTERM 后等待存量隧道排空的上限（秒），超时强制关闭。
 	DrainTimeoutSec int `json:"drain_timeout_sec"`
-	// Standby 已废弃：被 L3 ConnectionManager（primary_count/backup_count/
-	// establish_interval_sec）取代。保留解析但不再生效（no-op）。
-	Standby bool `json:"standby"`
-	// ConnMaxAgeSec 已废弃：被 ConnectionPolicy.EstablishInterval 取代。
-	// 保留解析但不再生效（no-op）。
-	ConnMaxAgeSec int `json:"conn_max_age_sec"`
 	// 注：resume 配置字段已移除——resume/2 是唯一数据面（恒启用），
 	// TCP 与 UDP 均无 resume:false 逃生通道（v1 已彻底删除）。
 	// SessionWindowKB 会话恢复窗口大小（KB），决定能恢复的断线时间上限
 	// （与服务端在此窗口内能接收/发送的最大字节量）。默认 256KB。
 	SessionWindowKB int `json:"session_window_kb"`
-	// BackupLine 备用线路策略：none=单线路；hot=热备；cold=冷备。默认 none。
-	BackupLine string `json:"backup_line"`
 	// HandshakeAckMs 数据面握手 HANDSHAKE-ACK 超时（毫秒），默认 3000ms。
 	HandshakeAckMs int `json:"handshake_ack_ms"`
 	// KeepaliveSec 备用线路/会话 KEEPALIVE 心跳间隔（秒），默认 15s。
 	KeepaliveSec int `json:"keepalive_sec"`
 	// PrimaryCount 主连接数量，默认 1。>1 时启用类型分流（tcp/udp 各管一条）。
 	PrimaryCount int `json:"primary_count"`
-	// BackupCount 备用连接数量，默认 1。
-	BackupCount int `json:"backup_count"`
+	// BackupCount 备用连接数量；nil=默认 1，0=关闭备用。
+	BackupCount *int `json:"backup_count"`
 	// PrimaryDialIntervalSec 主连接拨号间隔（秒），默认 30s（节流防重拨风暴）。
 	PrimaryDialIntervalSec int `json:"primary_dial_interval_sec"`
 	// BackupDialIntervalSec 备用连接拨号间隔（秒），默认 15s（节流防重拨风暴）。
@@ -75,176 +64,200 @@ type Config struct {
 	EstablishIntervalSec int `json:"establish_interval_sec"`
 }
 
-func (c *Config) UnmarshalJSON(data []byte) error {
-	type Alias Config
-	aux := struct {
-		*Alias
-		RawToken     interface{} `json:"token"`
-		RawAuthToken interface{} `json:"auth_token"`
-		RawPSK       interface{} `json:"psk"`
-		RawProtocol  string      `json:"protocol"`
+func applyEnvOverrides(cfg *Config) error {
+	setString := func(key string, dst *string) {
+		if value, ok := os.LookupEnv(key); ok {
+			*dst = strings.TrimSpace(value)
+		}
+	}
+	setBool := func(key string, dst *bool) error {
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			return nil
+		}
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s must be a boolean: %w", key, err)
+		}
+		*dst = parsed
+		return nil
+	}
+	setInt := func(key string, dst *int) error {
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			return nil
+		}
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s must be an integer: %w", key, err)
+		}
+		*dst = parsed
+		return nil
+	}
+
+	setString("H2TUNNEL_MODE", &cfg.Mode)
+	setString("H2TUNNEL_LISTEN", &cfg.Listen)
+	setString("H2TUNNEL_SERVER", &cfg.Server)
+	setString("H2TUNNEL_TARGET", &cfg.Target)
+	setString("H2TUNNEL_PATH", &cfg.Path)
+	setString("H2TUNNEL_TOKEN", &cfg.Token)
+	setString("H2TUNNEL_TRANSPORT", &cfg.Transport)
+	setString("H2TUNNEL_NETWORK", &cfg.Network)
+	setString("H2TUNNEL_CERT", &cfg.Cert)
+	setString("H2TUNNEL_KEY", &cfg.Key)
+	setString("H2TUNNEL_HOST", &cfg.Host)
+	setString("H2TUNNEL_SNI", &cfg.SNI)
+	setString("H2TUNNEL_LOG_LEVEL", &cfg.LogLevel)
+
+	for _, field := range []struct {
+		key string
+		dst *bool
 	}{
-		Alias: (*Alias)(c),
-	}
-	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
-	}
-
-	collectToken := func(v interface{}) {
-		if v == nil || c.Token != "" {
-			return
-		}
-		switch val := v.(type) {
-		case string:
-			c.Token = strings.TrimSpace(val)
-		case []interface{}:
-			var tokens []string
-			for _, item := range val {
-				if s, ok := item.(string); ok {
-					trimmed := strings.TrimSpace(s)
-					if trimmed != "" {
-						tokens = append(tokens, trimmed)
-					}
-				}
-			}
-			c.Token = strings.Join(tokens, ",")
+		{"H2TUNNEL_TLS", &cfg.TLS},
+		{"H2TUNNEL_INSECURE", &cfg.Insecure},
+		{"H2TUNNEL_LOCAL_ONLY", &cfg.LocalOnly},
+	} {
+		if err := setBool(field.key, field.dst); err != nil {
+			return err
 		}
 	}
 
-	collectToken(aux.RawToken)
-	collectToken(aux.RawAuthToken)
-	collectToken(aux.RawPSK)
-
-	if aux.RawProtocol != "" && c.Transport == "" {
-		c.Transport = aux.RawProtocol
+	for _, field := range []struct {
+		key string
+		dst *int
+	}{
+		{"H2TUNNEL_HEARTBEAT_SEC", &cfg.HeartbeatSec},
+		{"H2TUNNEL_DRAIN_TIMEOUT_SEC", &cfg.DrainTimeoutSec},
+		{"H2TUNNEL_SESSION_WINDOW_KB", &cfg.SessionWindowKB},
+		{"H2TUNNEL_HANDSHAKE_ACK_MS", &cfg.HandshakeAckMs},
+		{"H2TUNNEL_KEEPALIVE_SEC", &cfg.KeepaliveSec},
+		{"H2TUNNEL_PRIMARY_COUNT", &cfg.PrimaryCount},
+		{"H2TUNNEL_PRIMARY_DIAL_INTERVAL_SEC", &cfg.PrimaryDialIntervalSec},
+		{"H2TUNNEL_BACKUP_DIAL_INTERVAL_SEC", &cfg.BackupDialIntervalSec},
+		{"H2TUNNEL_ESTABLISH_INTERVAL_SEC", &cfg.EstablishIntervalSec},
+	} {
+		if err := setInt(field.key, field.dst); err != nil {
+			return err
+		}
 	}
-
-	switch strings.ToLower(c.Transport) {
-	case "h3", "http3", "http/3":
-		c.H3 = true
-	case "wt", "webtransport":
-		c.WT = true
-	case "masque":
-		c.Masque = true
-	case "grpc":
-		c.GRPC = true
+	if value, ok := os.LookupEnv("H2TUNNEL_BACKUP_COUNT"); ok {
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("H2TUNNEL_BACKUP_COUNT must be an integer: %w", err)
+		}
+		cfg.BackupCount = &parsed
 	}
-
 	return nil
 }
 
-func applyEnvOverrides(cfg *Config) {
-	getEnv := func(keys ...string) string {
-		for _, k := range keys {
-			if v := os.Getenv(k); v != "" {
-				return strings.TrimSpace(v)
-			}
-		}
-		return ""
+func validateConfig(cfg *Config) error {
+	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if cfg.Mode == "" {
+		cfg.Mode = "server"
+	}
+	if cfg.Mode != "server" && cfg.Mode != "client" {
+		return fmt.Errorf("mode must be server or client, got %q", cfg.Mode)
+	}
+	cfg.Path = normalizeTunnelPath(cfg.Path)
+	cfg.LogLevel = strings.ToLower(strings.TrimSpace(cfg.LogLevel))
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("unsupported log_level %q", cfg.LogLevel)
+	}
+	if cfg.DrainTimeoutSec < 0 {
+		return fmt.Errorf("drain_timeout_sec must be >= 0")
+	}
+	if cfg.SessionWindowKB < 0 || cfg.SessionWindowKB > maxWindowKB {
+		return fmt.Errorf("session_window_kb must be 0 or between 1 and %d", maxWindowKB)
 	}
 
-	if v := getEnv("H2TUNNEL_MODE", "MODE"); v != "" {
-		cfg.Mode = v
-	}
-	if v := getEnv("H2TUNNEL_LISTEN", "LISTEN", "PORT"); v != "" {
-		if !strings.Contains(v, ":") && len(v) < 6 {
-			cfg.Listen = ":" + v
-		} else {
-			cfg.Listen = v
+	if cfg.Mode == "server" {
+		if cfg.Server != "" || cfg.Target != "" || cfg.Insecure || cfg.Host != "" || cfg.SNI != "" {
+			return fmt.Errorf("server mode contains client-only endpoint or TLS fields")
 		}
-	}
-	if v := getEnv("H2TUNNEL_SERVER", "SERVER"); v != "" {
-		cfg.Server = v
-	}
-	if v := getEnv("H2TUNNEL_TARGET", "TARGET"); v != "" {
-		cfg.Target = v
-	}
-	if v := getEnv("H2TUNNEL_PATH", "TUNNEL_PATH", "PROXY_PATH"); v != "" {
-		cfg.Path = v
-	}
-	if v := getEnv("H2TUNNEL_TOKEN", "H2TUNNEL_PSK", "TOKEN", "PSK"); v != "" {
-		cfg.Token = v
-	}
-	if v := getEnv("H2TUNNEL_TRANSPORT", "TRANSPORT"); v != "" {
-		cfg.Transport = v
-	}
-	if v := getEnv("H2TUNNEL_NETWORK", "NETWORK"); v != "" {
-		cfg.Network = v
-	}
-	if v := getEnv("H2TUNNEL_TLS", "TLS"); v != "" {
-		cfg.TLS = v == "1" || strings.ToLower(v) == "true"
-	}
-	if v := getEnv("H2TUNNEL_LOG_LEVEL", "LOG_LEVEL", "LOGLEVEL"); v != "" {
-		cfg.LogLevel = v
-	}
-	if v := getEnv("H2TUNNEL_HEARTBEAT_SEC", "HEARTBEAT_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.HeartbeatSec = n
+		if cfg.HeartbeatSec != 0 || cfg.HandshakeAckMs != 0 || cfg.KeepaliveSec != 0 ||
+			cfg.PrimaryCount != 0 || cfg.BackupCount != nil || cfg.PrimaryDialIntervalSec != 0 ||
+			cfg.BackupDialIntervalSec != 0 || cfg.EstablishIntervalSec != 0 {
+			return fmt.Errorf("server mode contains client-only connection policy fields")
 		}
-	}
-	if v := getEnv("H2TUNNEL_DRAIN_TIMEOUT_SEC", "DRAIN_TIMEOUT_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.DrainTimeoutSec = n
+		prepared, err := prepareServerConfig(ServerConfig{
+			EnableTLS: cfg.TLS,
+			Transport: cfg.Transport,
+			Network:   cfg.Network,
+		})
+		if err != nil {
+			return err
 		}
+		cfg.Transport = prepared.Transport
+		cfg.Network = prepared.Network
+		cfg.TLS = prepared.EnableTLS
+		return nil
 	}
-	if v := getEnv("H2TUNNEL_BACKUP_LINE", "BACKUP_LINE"); v != "" {
-		cfg.BackupLine = strings.ToLower(strings.TrimSpace(v))
+
+	if cfg.TLS || cfg.Cert != "" || cfg.Key != "" || cfg.LocalOnly {
+		return fmt.Errorf("client mode contains server-only TLS or local_only fields")
 	}
-	if v := getEnv("H2TUNNEL_HANDSHAKE_ACK_MS", "HANDSHAKE_ACK_MS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.HandshakeAckMs = n
-		}
+	if cfg.Server == "" {
+		cfg.Server = "https://127.0.0.1:8443"
 	}
-	if v := getEnv("H2TUNNEL_KEEPALIVE_SEC", "KEEPALIVE_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.KeepaliveSec = n
-		}
+	transport, err := resolveClientEndpointTransport(cfg, cfg.Server)
+	if err != nil {
+		return err
 	}
-	if v := getEnv("H2TUNNEL_PRIMARY_COUNT", "PRIMARY_COUNT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.PrimaryCount = n
-		}
+	cfg.Transport = transport
+	cfg.Network = normalizeNetwork(cfg.Network, networkTCP)
+	if !validNetwork(cfg.Network) {
+		return fmt.Errorf("unsupported network %q", cfg.Network)
 	}
-	if v := getEnv("H2TUNNEL_BACKUP_COUNT", "BACKUP_COUNT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.BackupCount = n
-		}
+	if cfg.HeartbeatSec > 300 {
+		return fmt.Errorf("heartbeat_sec must be <= 300; use a negative value to disable it")
 	}
-	if v := getEnv("H2TUNNEL_PRIMARY_DIAL_INTERVAL_SEC", "PRIMARY_DIAL_INTERVAL_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.PrimaryDialIntervalSec = n
-		}
+	if cfg.HandshakeAckMs < 0 || cfg.HandshakeAckMs > maxHandshakeAckMs {
+		return fmt.Errorf("handshake_ack_ms must be 0 or between 1 and %d", maxHandshakeAckMs)
 	}
-	if v := getEnv("H2TUNNEL_BACKUP_DIAL_INTERVAL_SEC", "BACKUP_DIAL_INTERVAL_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.BackupDialIntervalSec = n
-		}
+	if cfg.KeepaliveSec < 0 || cfg.KeepaliveSec > maxKeepaliveSec {
+		return fmt.Errorf("keepalive_sec must be 0 or between 1 and %d", maxKeepaliveSec)
 	}
-	if v := getEnv("H2TUNNEL_ESTABLISH_INTERVAL_SEC", "ESTABLISH_INTERVAL_SEC"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.EstablishIntervalSec = n
-		}
+	if cfg.PrimaryCount < 0 {
+		return fmt.Errorf("primary_count must be >= 0")
 	}
+	maxPrimary := 1
+	if cfg.Network == networkAll {
+		maxPrimary = 2
+	}
+	if cfg.PrimaryCount > maxPrimary {
+		return fmt.Errorf("primary_count must not exceed enabled network count %d", maxPrimary)
+	}
+	if cfg.BackupCount != nil && *cfg.BackupCount < 0 {
+		return fmt.Errorf("backup_count must be >= 0")
+	}
+	if cfg.PrimaryDialIntervalSec < 0 || cfg.BackupDialIntervalSec < 0 || cfg.EstablishIntervalSec < 0 {
+		return fmt.Errorf("connection interval fields must be >= 0")
+	}
+	return nil
 }
 
 type ServerConfig struct {
-	ListenAddr        string        `json:"listen"`
-	TLSCert           string        `json:"cert"`
-	TLSKey            string        `json:"key"`
-	EnableTLS         bool          `json:"tls"`
-	Path              string        `json:"path"`
-	LocalOnly         bool          `json:"local_only"`
-	LogLevel          string        `json:"log_level"`
-	EnableH3          bool          `json:"h3"`
-	Transport         string        `json:"transport"`
-	Network           string        `json:"network"` // "all", "tcp", "udp"
-	ExpectedToken     string        `json:"token"`
-	HeartbeatInterval time.Duration `json:"-"` // 由 heartbeat_sec 换算
-	DrainTimeout      time.Duration `json:"-"` // 由 drain_timeout_sec 换算
+	ListenAddr    string        `json:"listen"`
+	TLSCert       string        `json:"cert"`
+	TLSKey        string        `json:"key"`
+	EnableTLS     bool          `json:"tls"`
+	Path          string        `json:"path"`
+	LocalOnly     bool          `json:"local_only"`
+	LogLevel      string        `json:"log_level"`
+	EnableH3      bool          `json:"-"`
+	Transport     string        `json:"transport"`
+	Network       string        `json:"network"` // "all", "tcp", "udp"
+	ExpectedToken string        `json:"token"`
+	DrainTimeout  time.Duration `json:"-"` // 由 drain_timeout_sec 换算
 	// SessionWindow 会话恢复环形缓冲容量（KB），服务端侧必须实现才能配合客户端恢复。
 	SessionWindow int `json:"-"`
-	// BackupLine 备用线路策略：none=单线路；hot=热备；cold=冷备。默认 none。
-	BackupLine string `json:"backup_line"`
+	// routingPolicy 在启动时编译，供请求热路径做无分配位掩码判断。
+	routingPolicy routingPolicy
 }
 
 type ClientConfig struct {
@@ -255,12 +268,8 @@ type ClientConfig struct {
 	Insecure   bool   `json:"insecure"`
 	CustomHost string `json:"host"`
 	ServerName string `json:"sni"`
-	Alpn       string `json:"alpn"`
-	UseH3      bool   `json:"h3"`
-	UseWT      bool   `json:"wt"`
-	UseMasque  bool   `json:"masque"`
-	UseGRPC    bool   `json:"grpc"`
-	Network    string `json:"network"` // "all" / "both", "tcp", "udp"
+	Transport  string `json:"transport"`
+	Network    string `json:"network"` // "all", "tcp", "udp"
 	LogLevel   string `json:"log_level"`
 	Token      string `json:"token"`
 
@@ -269,8 +278,6 @@ type ClientConfig struct {
 	DrainTimeout      time.Duration `json:"-"`
 	// SessionWindow 会话恢复环形缓冲容量（KB）
 	SessionWindow int `json:"-"`
-	// BackupLine 备用线路策略：none=单线路；hot=热备；cold=冷备。默认 none。
-	BackupLine string `json:"backup_line"`
 	// HandshakeAckMs 数据面握手 HANDSHAKE-ACK 超时（毫秒），默认 3000ms。
 	HandshakeAckMs int `json:"handshake_ack_ms"`
 	// KeepaliveSec 备用线路/会话 KEEPALIVE 心跳间隔（秒），默认 15s。
@@ -282,13 +289,13 @@ type ClientConfig struct {
 }
 
 func (c *ClientConfig) IsUDP() bool {
-	netMode := strings.ToLower(strings.TrimSpace(c.Network))
-	return netMode == "udp" || netMode == "all" || netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp"
+	netMode := normalizeNetwork(c.Network, networkTCP)
+	return netMode == networkUDP || netMode == networkAll
 }
 
 func (c *ClientConfig) IsTCP() bool {
-	netMode := strings.ToLower(strings.TrimSpace(c.Network))
-	return netMode == "tcp" || netMode == "all" || netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" || netMode == ""
+	netMode := normalizeNetwork(c.Network, networkTCP)
+	return netMode == networkTCP || netMode == networkAll
 }
 
 func initLogger(levelStr string) {
@@ -324,10 +331,20 @@ func loadConfigFile(path string) (*Config, error) {
 		return nil, err
 	}
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, err
 	}
-	applyEnvOverrides(&cfg)
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("configuration must contain exactly one JSON object")
+	}
+	if err := applyEnvOverrides(&cfg); err != nil {
+		return nil, err
+	}
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
@@ -389,48 +406,39 @@ func runGenURI(args []string) {
 
 	// 配置优先于内置默认，但命令行 flag 可覆盖配置中的任意字段
 	if *cfgPath != "" {
-		if fileCfg, err := loadConfigFile(*cfgPath); err == nil {
-			// 优先从 client 配置的 server URL 反解出公网 host/port
-			if *host == "" && fileCfg.Server != "" {
-				if u, err := url.Parse(fileCfg.Server); err == nil && u.Host != "" {
-					*host = u.Hostname()
-					if u.Port() != "" {
-						*port = u.Port()
-					}
+		fileCfg, err := loadConfigFile(*cfgPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config file %s: %v\n", *cfgPath, err)
+			os.Exit(1)
+		}
+		// 优先从 client 配置的 server URL 反解出公网 host/port
+		if *host == "" && fileCfg.Server != "" {
+			if u, err := url.Parse(fileCfg.Server); err == nil && u.Host != "" {
+				*host = u.Hostname()
+				if u.Port() != "" {
+					*port = u.Port()
 				}
 			}
-			if *port == "" && fileCfg.Listen != "" {
-				if _, p, err := net.SplitHostPort(fileCfg.Listen); err == nil {
-					*port = p
-				}
+		}
+		if *port == "" && fileCfg.Listen != "" {
+			if _, p, err := net.SplitHostPort(fileCfg.Listen); err == nil {
+				*port = p
 			}
-			if *path == "" && fileCfg.Path != "" {
-				*path = fileCfg.Path
-			}
-			if *target == "" && fileCfg.Target != "" {
-				*target = fileCfg.Target
-			}
-			if *token == "" && fileCfg.Token != "" {
-				*token = fileCfg.Token
-			}
-			if *sni == "" && fileCfg.SNI != "" {
-				*sni = fileCfg.SNI
-			}
-			// transport 兼容 "transport":"h3" 字符串与 {"h3":true} 布尔两种写法
-			if *transport == "" {
-				switch {
-				case fileCfg.H3:
-					*transport = "h3"
-				case fileCfg.WT:
-					*transport = "wt"
-				case fileCfg.Masque:
-					*transport = "masque"
-				case fileCfg.GRPC:
-					*transport = "grpc"
-				case fileCfg.Transport != "":
-					*transport = fileCfg.Transport
-				}
-			}
+		}
+		if *path == "" && fileCfg.Path != "" {
+			*path = fileCfg.Path
+		}
+		if *target == "" && fileCfg.Target != "" {
+			*target = fileCfg.Target
+		}
+		if *token == "" && fileCfg.Token != "" {
+			*token = fileCfg.Token
+		}
+		if *sni == "" && fileCfg.SNI != "" {
+			*sni = fileCfg.SNI
+		}
+		if *transport == "" && fileCfg.Transport != "" {
+			*transport = fileCfg.Transport
 		}
 	}
 
@@ -447,6 +455,11 @@ func runGenURI(args []string) {
 	if *transport == "" {
 		*transport = "h2"
 	}
+	*transport = canonicalTransport(*transport)
+	if !validTransport(*transport, false) {
+		fmt.Fprintf(os.Stderr, "Invalid transport %q\n", *transport)
+		os.Exit(1)
+	}
 	if *target == "" {
 		*target = "127.0.0.1:22"
 	}
@@ -461,10 +474,9 @@ func runGenURI(args []string) {
 
 // loadConfigFromArgs parses only -c/--config and returns the merged Config.
 // The per-parameter command-line flags have been removed; the configuration
-// file is now the single source of truth. When no file is given, built-in
-// defaults are applied by the build*Config helpers, and the old `-insecure`
-// default (true) is preserved so a bare client run still works.
-func loadConfigFromArgs(args []string) *Config {
+// file and H2TUNNEL_* environment variables are the only configuration inputs.
+// When no file is given, the build*Config helpers apply secure defaults.
+func loadConfigFromArgs(args []string, mode string) *Config {
 	fs := flag.NewFlagSet("config", flag.ExitOnError)
 	c := fs.String("c", "", "Path to configuration file")
 	conf := fs.String("config", "", "Path to configuration file")
@@ -481,13 +493,22 @@ func loadConfigFromArgs(args []string) *Config {
 			fmt.Fprintf(os.Stderr, "Failed to load config file %s: %v\n", cp, err)
 			os.Exit(1)
 		}
+		if fileCfg.Mode != mode {
+			fmt.Fprintf(os.Stderr, "Config mode %q does not match %s subcommand\n", fileCfg.Mode, mode)
+			os.Exit(1)
+		}
 		cfg = fileCfg
 	} else {
-		// bare run: preserve the old `-insecure` flag default
-		cfg.Insecure = true
-		fmt.Fprintln(os.Stderr, "⚠️ 警告: 未指定配置文件，客户端默认跳过 TLS 证书校验 (Insecure=true)，在不可信网络中易被中间人攻击。生产环境请通过配置文件显式设置并校验证书指纹。")
+		cfg.Mode = mode
+		if err := applyEnvOverrides(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid environment configuration: %v\n", err)
+			os.Exit(1)
+		}
+		if err := validateConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid configuration: %v\n", err)
+			os.Exit(1)
+		}
 	}
-	applyEnvOverrides(cfg)
 	return cfg
 }
 
@@ -546,67 +567,37 @@ func buildServerConfig(cfg *Config) ServerConfig {
 	if listen == "" {
 		listen = ":8443"
 	}
-	path := cfg.Path
-	if path == "" {
-		path = "/tunnel"
-	}
+	path := normalizeTunnelPath(cfg.Path)
 	logLevel := cfg.LogLevel
 	if logLevel == "" {
 		logLevel = "info"
 	}
-	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
-	if netMode == "" || netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" {
-		netMode = "all"
+	netMode := normalizeNetwork(cfg.Network, networkAll)
+	transport, err := normalizeTransportList(cfg.Transport)
+	if err != nil {
+		zlog.Fatalf("[Server] ❌ %v", err)
+	}
+	if transport == "" {
+		transport = transportH2
 	}
 
 	return ServerConfig{
-		ListenAddr:        listen,
-		TLSCert:           cfg.Cert,
-		TLSKey:            cfg.Key,
-		EnableTLS:         cfg.TLS,
-		Path:              path,
-		LocalOnly:         cfg.LocalOnly,
-		LogLevel:          logLevel,
-		EnableH3:          cfg.H3,
-		Transport:         cfg.Transport,
-		Network:           netMode,
-		ExpectedToken:     cfg.Token,
-		HeartbeatInterval: resolveHeartbeat(cfg.HeartbeatSec),
-		DrainTimeout:      resolveDrainTimeout(cfg.DrainTimeoutSec),
-		SessionWindow:     resolveSessionWindow(cfg.SessionWindowKB),
-		BackupLine:        cfg.BackupLine,
+		ListenAddr:    listen,
+		TLSCert:       cfg.Cert,
+		TLSKey:        cfg.Key,
+		EnableTLS:     cfg.TLS,
+		Path:          path,
+		LocalOnly:     cfg.LocalOnly,
+		LogLevel:      logLevel,
+		Transport:     transport,
+		Network:       netMode,
+		ExpectedToken: cfg.Token,
+		DrainTimeout:  resolveDrainTimeout(cfg.DrainTimeoutSec),
+		SessionWindow: resolveSessionWindow(cfg.SessionWindowKB),
 	}
-}
-
-// validateClientTransport 校验客户端传输互斥。一个客户端进程每次出站只走一种
-// 主传输（h3 / wt / masque / grpc），代码分派从不并行跑多协议——若同时开多个，
-// 之前只会按优先级静默取一（wt > h3/masque QUIC > h2/grpc），极易让人误以为
-// "多开=多路并行"。这里改为显式报错。返回空串表示无冲突，否则返回可读描述。
-func validateClientTransport(c *Config) string {
-	enabled := []string{}
-	if c.H3 {
-		enabled = append(enabled, "h3")
-	}
-	if c.WT {
-		enabled = append(enabled, "wt")
-	}
-	if c.Masque {
-		enabled = append(enabled, "masque")
-	}
-	if c.GRPC {
-		enabled = append(enabled, "grpc")
-	}
-	if len(enabled) > 1 {
-		return fmt.Sprintf("client transport 只能选一个，不能同时开启 %s（h3/wt/masque/grpc 互斥，代码不会并行跑多协议）",
-			strings.Join(enabled, " + "))
-	}
-	return ""
 }
 
 func buildClientConfig(cfg *Config) ClientConfig {
-	if msg := validateClientTransport(cfg); msg != "" {
-		zlog.Fatalf("[Client] ❌ %s", msg)
-	}
 	listen := cfg.Listen
 	if listen == "" {
 		listen = "127.0.0.1:2222"
@@ -615,10 +606,11 @@ func buildClientConfig(cfg *Config) ClientConfig {
 	if server == "" {
 		server = "https://127.0.0.1:8443"
 	}
-	path := cfg.Path
-	if path == "" {
-		path = "/tunnel"
+	transport, err := resolveClientEndpointTransport(cfg, server)
+	if err != nil {
+		zlog.Fatalf("[Client] ❌ %s", err)
 	}
+	path := normalizeTunnelPath(cfg.Path)
 	target := cfg.Target
 	if target == "" {
 		target = "127.0.0.1:22"
@@ -627,12 +619,23 @@ func buildClientConfig(cfg *Config) ClientConfig {
 	if logLevel == "" {
 		logLevel = "info"
 	}
-	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
-	if netMode == "" {
-		netMode = "tcp"
-	} else if netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" {
-		netMode = "all"
+	netMode := normalizeNetwork(cfg.Network, networkTCP)
+	if !validNetwork(netMode) {
+		zlog.Fatalf("[Client] ❌ unsupported network %q", cfg.Network)
 	}
+	primaryNetworks := []string{netMode}
+	backupCount := defaultBackupCount
+	if cfg.BackupCount != nil {
+		if *cfg.BackupCount < 0 {
+			zlog.Fatalf("[Client] ❌ backup_count must be >= 0")
+		}
+		backupCount = *cfg.BackupCount
+	}
+	policy := resolveConnectionPolicy(
+		cfg.PrimaryCount, backupCount,
+		cfg.PrimaryDialIntervalSec, cfg.BackupDialIntervalSec,
+		cfg.EstablishIntervalSec, defaultBackupMissedAck, primaryNetworks,
+	)
 
 	return ClientConfig{
 		ListenAddr:        listen,
@@ -642,25 +645,16 @@ func buildClientConfig(cfg *Config) ClientConfig {
 		Insecure:          cfg.Insecure,
 		CustomHost:        cfg.Host,
 		ServerName:        cfg.SNI,
-		Alpn:              cfg.ALPN,
-		UseH3:             cfg.H3,
-		UseWT:             cfg.WT,
-		UseMasque:         cfg.Masque,
-		UseGRPC:           cfg.GRPC,
+		Transport:         transport,
 		Network:           netMode,
 		LogLevel:          logLevel,
 		Token:             cfg.Token,
 		HeartbeatInterval: resolveHeartbeat(cfg.HeartbeatSec),
 		DrainTimeout:      resolveDrainTimeout(cfg.DrainTimeoutSec),
 		SessionWindow:     resolveSessionWindow(cfg.SessionWindowKB),
-		BackupLine:        cfg.BackupLine,
 		HandshakeAckMs:    resolveHandshakeAckMs(cfg.HandshakeAckMs),
 		KeepaliveSec:      resolveKeepaliveSec(cfg.KeepaliveSec),
-		ConnectionPolicy: resolveConnectionPolicy(
-			cfg.PrimaryCount, cfg.BackupCount,
-			cfg.PrimaryDialIntervalSec, cfg.BackupDialIntervalSec,
-			cfg.EstablishIntervalSec, defaultBackupMissedAck, nil,
-		),
+		ConnectionPolicy:  policy,
 	}
 }
 
@@ -670,11 +664,14 @@ func runFromConfig(path string) {
 		fmt.Fprintf(os.Stderr, "Failed to read config file %s: %v\n", path, err)
 		os.Exit(1)
 	}
-	applyEnvOverrides(cfg)
-	if strings.ToLower(cfg.Mode) == "client" {
+	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+	case "client":
 		startClientDirect(buildClientConfig(cfg))
-	} else {
+	case "", "server":
 		startServerDirect(buildServerConfig(cfg))
+	default:
+		fmt.Fprintf(os.Stderr, "Invalid mode %q: expected server or client\n", cfg.Mode)
+		os.Exit(1)
 	}
 }
 

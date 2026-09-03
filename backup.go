@@ -98,17 +98,18 @@ type backupLine struct {
 // client 为线路专属 http.Client（独立传输/连接池）；为空则回退用共享 httpClient。
 func newManagedLine(id string, role managedRole, netType string, cfg ClientConfig, reqUrl string, httpClient, client *http.Client, maxMissedAcks int) *backupLine {
 	bl := &backupLine{
-		primaryID:   id,
-		role:        role,
-		netType:     netType,
-		cfg:         cfg,
-		reqUrl:      reqUrl,
-		httpClient:  httpClient,
-		client:      client,
-		state:       backupIdle,
-		keepaliveNs: int64(resolveKeepaliveSec(cfg.KeepaliveSec)) * int64(time.Second),
-		handshakeMs: resolveHandshakeAckMs(cfg.HandshakeAckMs),
-		closeCh:     make(chan struct{}),
+		primaryID:     id,
+		role:          role,
+		netType:       netType,
+		cfg:           cfg,
+		reqUrl:        reqUrl,
+		httpClient:    httpClient,
+		client:        client,
+		state:         backupIdle,
+		maxMissedAcks: maxMissedAcks,
+		keepaliveNs:   int64(resolveKeepaliveSec(cfg.KeepaliveSec)) * int64(time.Second),
+		handshakeMs:   resolveHandshakeAckMs(cfg.HandshakeAckMs),
+		closeCh:       make(chan struct{}),
 	}
 	if bl.maxMissedAcks <= 0 {
 		bl.maxMissedAcks = backupMaxMissedAcks
@@ -119,11 +120,6 @@ func newManagedLine(id string, role managedRole, netType string, cfg ClientConfi
 		bl.backupID = id
 	}
 	return bl
-}
-
-// newBackupLine 创建备用线路执行器（保留旧签名，供既有调用/测试）。
-func newBackupLine(primaryID string, cfg ClientConfig, reqUrl string, httpClient *http.Client) *backupLine {
-	return newManagedLine(primaryID, roleBackup, "tcp", cfg, reqUrl, httpClient, nil, 0)
 }
 
 // Client 返回本线路使用的 http.Client：优先线路专属 client，否则共享 httpClient。
@@ -214,7 +210,7 @@ func (b *backupLine) doHandshake() bool {
 	var resp *http.Response
 	var err error
 	client := b.Client()
-	if rt, ok := client.Transport.(http.RoundTripper); ok && cfg.UseMasque {
+	if rt, ok := client.Transport.(http.RoundTripper); ok && cfg.usesMasque() {
 		resp, err = rt.RoundTrip(req)
 	} else {
 		resp, err = client.Do(req)
@@ -336,5 +332,5 @@ func (b *backupLine) listenKeepaliveAck(ackCh chan struct{}) {
 // isDatagramCap 判断该客户端传输是否为 datagram（UDP）模式。
 // UDP 备用不做 B 层握手（服务端对 datagram 跳过），仅 A 层。
 func isDatagramCap(cfg ClientConfig) bool {
-	return cfg.IsUDP() && !cfg.UseWT
+	return cfg.IsUDP() && !cfg.usesWT()
 }

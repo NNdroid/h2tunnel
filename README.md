@@ -52,31 +52,37 @@ journalctl -u h2tunnel -f   # View live logs
 | `mode` | `string` | `"server"` | Operational mode: `"server"` or `"client"`. |
 | `listen` | `string` | `":8443"` | Listening address (`":8443"` for server; `"127.0.0.1:2222"` for client). |
 | `server` | `string` | `""` | Server URL for client mode (e.g. `"https://example.com:8443"`). |
-| `target` | `string` | `"127.0.0.1:22"` | Target backend service to forward to. |
+| `target` | `string` | `"127.0.0.1:22"` | Client-only target backend requested from the server. |
 | `path` | `string` | `"/tunnel"` | HTTP endpoint path. |
-| `transport` | `string` | `"all"` | **Semantics differ by side.** *Server* = an **allow-list** of protocols it will accept; supports **multiple comma-separated values** (e.g. `"h2,h3,masque"`), or `"all"`/`"auto"` to accept every protocol on the shared port. *Client* = the **single transport** that process actually runs (`"h2"`, `"h2c"`, `"h3"`, `"wt"`, `"masque"`, `"grpc"`). |
-| `token` | `string` | `""` | Proxy-Authorization Token (aliases `auth_token`/`psk`). |
-| `tls` | `bool` | `true` | Enable TLS encryption (auto self-signed if cert/key omitted). |
+| `transport` | `string` | `"h2"` | **Semantics differ by side.** *Server* = an **allow-list** of protocols it will accept; supports **multiple comma-separated values** (e.g. `"h2,h3,masque"`), or `"all"` to accept every protocol on the shared port. *Client* = the **single transport** that process actually runs (`"h2"`, `"h2c"`, `"h3"`, `"wt"`, `"masque"`, `"grpc"`). |
+| `network` | `string` | server: `"all"`; client: `"tcp"` | Accepted values: `"tcp"`, `"udp"`, or `"all"`. |
+| `token` | `string` | `""` | Single authentication token, sent through CDN-safe request headers. |
+| `tls` | `bool` | transport-derived | Server only. `h2`/`h3`/`wt`/`masque`/`all` require TLS, `h2c` disables it, and `grpc` follows this field. |
 | `cert` | `string` | `""` | Path to custom TLS certificate. |
 | `key` | `string` | `""` | Path to custom TLS private key. |
 | `local_only` | `bool` | `false` | Restrict proxying strictly to localhost (server). |
+| `insecure` | `bool` | `false` | Client only. Skip upstream TLS certificate verification. |
+| `host` | `string` | `""` | Client only. Override the HTTP Host header. |
+| `sni` | `string` | `""` | Client only. Override TLS SNI. |
 | `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
-| `heartbeat_sec` | `int` | `25` | Application-layer keepalive interval in seconds. Must stay below your CDN/reverse-proxy idle timeout. Negative value disables it (direct connections only). |
+| `heartbeat_sec` | `int` | `25` | Client only. Application-layer keepalive interval in seconds. Must stay below your CDN/reverse-proxy idle timeout. Negative value disables it (direct connections only). |
 | `drain_timeout_sec` | `int` | `30` | Max seconds to drain existing tunnels after `SIGTERM` before force close. |
 | `session_window_kb` | `int` | `256` | Ring-buffer window size for recovery; a disconnect longer than this window degrades the session honestly (`ErrGap`). |
-| `backup_line` | `string` | `"none"` | Backup-line strategy: `none` (single line), `hot` (pre-warmed standby, instant failover), `cold` (establish only on failover). Default `none`. |
-| `handshake_ack_ms` | `int` | `3000` | Data-plane handshake `HANDSHAKE-ACK` timeout (ms). |
-| `keepalive_sec` | `int` | `15` | `KEEPALIVE` heartbeat interval for backup lines / sessions (sec). |
-| `primary_count` | `int` | `1` | Number of primary (main) connections. `>1` enables **type sharding** (e.g. `tcp` and `udp` each get their own primary). |
-| `backup_count` | `int` | `1` | Number of backup connections kept warm for failover. |
-| `primary_dial_interval_sec` | `int` | `30` | Re-dial throttle for primary connections (prevents re-dial storms). |
-| `backup_dial_interval_sec` | `int` | `15` | Re-dial throttle for backup / replacement connections. |
-| `establish_interval_sec` | `int` | `100` | Primary/backup establish phase offset (sec). Primary dials first, then backup dials out of phase so a CDN idle-kill never takes down both at once. |
+| `handshake_ack_ms` | `int` | `3000` | Client only. Data-plane handshake `HANDSHAKE-ACK` timeout (ms). |
+| `keepalive_sec` | `int` | `15` | Client only. `KEEPALIVE` heartbeat interval for backup lines / sessions (sec). |
+| `primary_count` | `int` | `1` | Client only. Number of primary connections. `2` with `network: "all"` separates TCP and UDP. |
+| `backup_count` | `int` | `1` | Client only. Number of warm backup connections; set to `0` to disable backups. |
+| `primary_dial_interval_sec` | `int` | `30` | Client only. Re-dial throttle for primary connections. |
+| `backup_dial_interval_sec` | `int` | `15` | Client only. Re-dial throttle for backup / replacement connections. |
+| `establish_interval_sec` | `int` | `100` | Client only. Primary/backup establish phase offset so a CDN idle-kill does not take down both together. |
 
 > **`transport` is intentionally asymmetric** — a single shared field whose meaning depends on `mode`:
 > - **Server = a gateway allow-list.** One `listen` port multiplexes `h2`/`h3`/`grpc`/`wt`/`masque` simultaneously, telling them apart by HTTP method, `Content-Type`, `Protocol` header and HTTP/3. So `"h2,h3,masque"` means "accept these kinds of clients together" — the server never picks just one.
-> - **Client = a single choice.** A client process is one tunnel endpoint; each outbound connection can only ride **one** transport stack (WT session, QUIC/h3, or h2/h2c/grpc). The string maps to one boolean at load time (`h3`/`wt`/`masque`/`grpc`), and dispatch resolves to a single path per network type. Opening several of these booleans together is **rejected at startup** (they are mutually exclusive) rather than silently picking one — a client never runs parallel transports.
+> - **Client = a single choice.** A client process is one tunnel endpoint; each outbound connection can only ride **one** transport stack (WT session, QUIC/h3, or h2/h2c/grpc). `transport` is normalized once and is the only runtime source of truth.
 > - Prefer one process per transport on the client side if you need several protocols at once; the server side needs only one config row to serve them all.
+> - `h2c` is cleartext and cannot share one listening address with TLS/QUIC transports. For CDN deployment, use `h2` (or `grpc` when the CDN explicitly supports it); the origin may receive HTTP/1.1 after CDN protocol translation and is still classified as the `h2` POST-stream family.
+> - Configuration parsing is strict: unknown/removed fields and non-canonical transport or network values are rejected instead of being silently ignored.
+> - Mode-specific no-op fields are rejected (for example, `target` in server mode or `local_only` in client mode). Every field can be overridden with its canonical `H2TUNNEL_*` environment variable, such as `H2TUNNEL_TRANSPORT` or `H2TUNNEL_BACKUP_COUNT`; malformed typed values fail fast.
 
 ---
 

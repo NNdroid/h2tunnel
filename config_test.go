@@ -13,14 +13,14 @@ import (
 func TestH2Tunnel_JSONConfigParsing(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// 1. Test Server Config Parsing with Array Token & Aliases
+	// 1. Test Server Config Parsing
 	serverJSON := `{
 		"mode": "server",
 		"listen": ":18443",
 		"path": "/my-tunnel",
-		"token": ["token1", "token2"],
+		"token": "token1",
 		"tls": true,
-		"h3": true,
+		"transport": "h3",
 		"local_only": true,
 		"log_level": "debug"
 	}`
@@ -33,11 +33,11 @@ func TestH2Tunnel_JSONConfigParsing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load server config failed: %v", err)
 	}
-	if sCfg.Mode != "server" || sCfg.Listen != ":18443" || sCfg.Path != "/my-tunnel" || !sCfg.TLS || !sCfg.H3 || !sCfg.LocalOnly || sCfg.LogLevel != "debug" {
+	if sCfg.Mode != "server" || sCfg.Listen != ":18443" || sCfg.Path != "/my-tunnel" || !sCfg.TLS || sCfg.Transport != transportH3 || !sCfg.LocalOnly || sCfg.LogLevel != "debug" {
 		t.Fatalf("parsed server config mismatch: %+v", sCfg)
 	}
-	if sCfg.Token != "token1,token2" {
-		t.Fatalf("parsed array tokens mismatch: got %q, want %q", sCfg.Token, "token1,token2")
+	if sCfg.Token != "token1" {
+		t.Fatalf("parsed token mismatch: got %q", sCfg.Token)
 	}
 
 	// 2. Test Client Config Parsing with Transport Enum
@@ -47,7 +47,7 @@ func TestH2Tunnel_JSONConfigParsing(t *testing.T) {
 		"server": "https://tunnel.example.com:8443",
 		"target": "127.0.0.1:22",
 		"path": "/my-tunnel",
-		"auth_token": "secret_bearer_token",
+		"token": "secret_bearer_token",
 		"transport": "masque",
 		"insecure": true,
 		"sni": "tunnel.example.com",
@@ -63,8 +63,12 @@ func TestH2Tunnel_JSONConfigParsing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load client config failed: %v", err)
 	}
-	if cCfg.Mode != "client" || cCfg.Listen != "127.0.0.1:3333" || cCfg.Server != "https://tunnel.example.com:8443" || cCfg.Target != "127.0.0.1:22" || cCfg.Path != "/my-tunnel" || cCfg.Token != "secret_bearer_token" || !cCfg.Masque || !cCfg.Insecure || cCfg.SNI != "tunnel.example.com" || cCfg.LogLevel != "warn" {
+	if cCfg.Mode != "client" || cCfg.Listen != "127.0.0.1:3333" || cCfg.Server != "https://tunnel.example.com:8443" || cCfg.Target != "127.0.0.1:22" || cCfg.Path != "/my-tunnel" || cCfg.Token != "secret_bearer_token" || cCfg.Transport != transportMasque || !cCfg.Insecure || cCfg.SNI != "tunnel.example.com" || cCfg.LogLevel != "warn" {
 		t.Fatalf("parsed client config mismatch: %+v", cCfg)
+	}
+	built := buildClientConfig(cCfg)
+	if built.Transport != transportMasque || !built.usesMasque() {
+		t.Fatalf("transport enum was not normalized: %+v", built)
 	}
 }
 
@@ -108,7 +112,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 		"listen": "%s",
 		"path": "/tunnel",
 		"token": "%s",
-		"tls": false,
+		"transport": "h2c",
 		"log_level": "debug"
 	}`, serverListen, token)
 	serverConfPath := filepath.Join(tempDir, "server_e2e.json")
@@ -121,12 +125,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load server_e2e.json failed: %v", err)
 	}
-	go startServerDirect(ServerConfig{
-		ListenAddr:    sCfg.Listen,
-		Path:          sCfg.Path,
-		ExpectedToken: sCfg.Token,
-		LogLevel:      sCfg.LogLevel,
-	})
+	go startServerDirect(buildServerConfig(sCfg))
 	time.Sleep(100 * time.Millisecond)
 
 	// 5. Find free port for Client Listen
@@ -158,14 +157,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load client_e2e.json failed: %v", err)
 	}
-	go startClientDirect(ClientConfig{
-		ListenAddr: cCfg.Listen,
-		ServerUrl:  cCfg.Server,
-		Path:       cCfg.Path,
-		TargetAddr: cCfg.Target,
-		Token:      cCfg.Token,
-		LogLevel:   cCfg.LogLevel,
-	})
+	go startClientDirect(buildClientConfig(cCfg))
 	time.Sleep(150 * time.Millisecond)
 
 	// 8. Connect to Client Listener & Test Echo

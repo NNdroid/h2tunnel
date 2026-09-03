@@ -190,10 +190,8 @@ negotiated = min( clientMaxSupported, serverMaxSupported )
 
 ### 3.1 概念区分（本期完整实现，非二期）
 - **主线路**：本次 resume 隧道的主数据通道。
-- **备用线路**：冗余/备份通道，本期实现两种角色：
-  - **热备（hot standby）**：已建立握手、已拨 targetConn、处于待命，主线路断时**秒级**接管。
-  - **冷备（cold standby）**：仅保存会话元数据，主线路断时才实际建流握手，接管较慢但零常驻开销。
-- 主/备由配置 `BackupLine` 决定：`none`=单线路；`hot`=热备；`cold`=冷备。默认 `none`，用户按需开启。
+- **备用线路**：冗余/备份通道。当前统一实现为预建立并持续探活的热备，主线路断开时可直接升级接管。
+- 主/备由 `ConnectionPolicy` 决定：`backup_count=0` 为单线路，正数表示维持对应数量的热备。
 
 ### 3.2 握手流程（主/备）
 - **主线路**：完整执行第 1 节握手（版本/能力/参数 + ack）。主握手成功 = `X-Resume-Ack:ok` + `HANDSHAKE-ACK` 收到。
@@ -267,9 +265,9 @@ negotiated = min( clientMaxSupported, serverMaxSupported )
 - 上行/下行读写经 `resumeSessionWriter`/`pw` 串行化（控制帧优先，见 §2.7）。
 
 ### 4.5 `main.go`
-- `Config` 增加：`ProtocolVersion`（默认 2，恒 2）、`Capabilities []string`、`ResumeParams map[string]int`（`handshake_ack_timeout`/`keepalive_interval`）、`BackupLine string`（`none`/`hot`/`cold`）。
-- 移除 `resumeSet`/`Resume bool` 的"逃生通道"语义 → **整个 `Resume bool` 配置字段已删除**，`ResumeEnabled` 内部字段亦已彻底删除（其已无任何读取点，属死字段），`resume:false` 分支（含 UDP 裸转发）全部删除，resume/2 恒启用、无降级目标、无任何开关痕迹。
-- `buildServerConfig/buildClientConfig` 透传新字段。
+- 协议版本与能力集合固定在内部协商层，不暴露无效配置开关；外部只保留实际生效的 `session_window_kb`、`handshake_ack_ms`、`keepalive_sec` 与连接策略字段。
+- `Resume bool`、`ResumeEnabled` 和 `backup_line` 均已删除；`resume:false` 分支（含 UDP 裸转发）不再存在，resume/2 恒启用且无降级目标。
+- `buildServerConfig/buildClientConfig` 只透传当前运行时真正使用的字段。
 
 ### 4.6 `session.go` 控制帧优先（writer 互斥锁串行化）
 - `resumeSessionWriter` 持 `mu`：所有写路径（`writeFrame` / `writeControl` / `writeEnd` / `writeRaw`）都先锁 `mu` 再写整帧并 flush，保证帧原子性（控制帧永不被 DATA 拆裂）。
@@ -387,7 +385,7 @@ package main
 迁移与变更：
 
 - **WT 数据面**统一为 resume/2 帧协议：客户端 `handleWTTCPClientConn` 与服务端 `proxyWTStreamV2` 用 `writeFrame/readFrame`（TCP）承载 DATA/END 帧；UDP 走 `writeUDPPacket/readUDPPacket` 数据报分帧。
-- **客户端 TCP 分派**改为 resume-only：`runTCPClient` 去掉 `UseMasque`/非 resume 旧分支，直接 `executeResumableTunnel`（h2/h3/grpc/masque-tcp）。
+- **客户端 TCP 分派**改为 resume-only：`runTCPClient` 只按 `Transport` 分派并直接进入 `executeResumableTunnel`（h2/h3/grpc/masque-tcp）。
 - **服务端分派**：POST/MASQUE-TCP/MASQUE-UDP 均要求 `X-Tunnel-Proto: resume/2`，否则 426 `resume/2 required`（无 v1 兜底）。
 - **UDP 流客户端**：非 WT UDP 全走 `connectResumeUDP`（v2），v1 的 `grpcWriter/grpcReader` POST 兜底分支删除。
 - **测试迁移**：`features_test.go`、`heartbeat_test.go` 全部客户端/服务端补 `ResumeEnabled: true`；删除已过时的 `TestPaddingPingFrameRoundTrip`/`TestPaddingReaderAcceptsConsecutivePings`（v1 Padding 单测）。*（后注：随 `ResumeEnabled` 字段彻底删除，测试中这批 `ResumeEnabled: true` 冗余赋值也已统一清除。）*

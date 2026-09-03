@@ -57,10 +57,10 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
+		Transport:     transportH2,
 		ExpectedToken: token,
 		LogLevel:      "error",
 		SessionWindow: 256,
-		BackupLine:    "hot",
 		Network:       "all",
 	})
 	time.Sleep(2 * time.Second)
@@ -78,7 +78,6 @@ func connMgrClient(serverURL, echoAddr, token string, network string) ClientConf
 		Network:        network,
 		LogLevel:       "error",
 		SessionWindow:  256,
-		BackupLine:     "hot",
 		HandshakeAckMs: 3000,
 		KeepaliveSec:   1,
 	}
@@ -112,11 +111,10 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
-		EnableH3:      true,
+		Transport:     transportAll,
 		ExpectedToken: token,
 		LogLevel:      "error",
 		SessionWindow: 256,
-		BackupLine:    "hot",
 		Network:       "all",
 	})
 	time.Sleep(2 * time.Second)
@@ -125,18 +123,15 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 		name      string
 		port      int
 		network   string
-		useH3     bool
-		useWT     bool
-		useMasque bool
-		useGRPC   bool
+		transport string
 	}{
-		{"H2_TCP_Resume", 29101, "tcp", false, false, false, false},
-		{"gRPC_TCP_Resume", 29102, "tcp", false, false, false, true},
-		{"H3_TCP_Resume", 29103, "tcp", true, false, false, false},
-		{"WT_TCP_Resume", 29104, "tcp", false, true, false, false},
-		{"MASQUE_TCP_Resume", 29105, "tcp", false, false, true, false},
-		{"H2_UDP_Resume", 29106, "udp", false, false, false, false},
-		{"MASQUE_UDP_Resume", 29107, "udp", false, false, true, false},
+		{"H2_TCP_Resume", 29101, "tcp", transportH2},
+		{"gRPC_TCP_Resume", 29102, "tcp", transportGRPC},
+		{"H3_TCP_Resume", 29103, "tcp", transportH3},
+		{"WT_TCP_Resume", 29104, "tcp", transportWT},
+		{"MASQUE_TCP_Resume", 29105, "tcp", transportMasque},
+		{"H2_UDP_Resume", 29106, "udp", transportH2},
+		{"MASQUE_UDP_Resume", 29107, "udp", transportMasque},
 	}
 
 	for _, tc := range cases {
@@ -144,10 +139,7 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cc := connMgrClient(serverURL, targetAddr, token, tc.network)
 			cc.ListenAddr = fmt.Sprintf("127.0.0.1:%d", tc.port)
-			cc.UseH3 = tc.useH3
-			cc.UseWT = tc.useWT
-			cc.UseMasque = tc.useMasque
-			cc.UseGRPC = tc.useGRPC
+			cc.Transport = tc.transport
 			go startClientDirect(cc)
 			time.Sleep(1 * time.Second)
 
@@ -227,7 +219,7 @@ func TestConnManagerPrimaryBackupCounts(t *testing.T) {
 // =========================================
 
 func TestConnManagerTypeSharding(t *testing.T) {
-	policy := resolveConnectionPolicy(2, 1, 0, 0, 1, 2, nil) // 主2备1，shard={tcp,udp}
+	policy := resolveConnectionPolicy(2, 1, 0, 0, 1, 2, nil) // 主2备1，网络={tcp,udp}
 	m, _, _ := startConnManagerEnv(t, 2, policy)
 	m.Start()
 
@@ -314,7 +306,7 @@ func TestConnManagerDialIntervalThrottle(t *testing.T) {
 		BackupDialInterval:   backupDialDefault,
 		EstablishInterval:    1 * time.Second,
 		BackoffMaxMissedAcks: 2,
-		Shard:                normalizeShard(nil),
+		PrimaryNetworks:      []string{networkTCP, networkUDP},
 	}
 	m, _, _ := startConnManagerEnv(t, 5, policy)
 	m.Start()
@@ -438,7 +430,7 @@ func TestConnManagerVersionUnsupported(t *testing.T) {
 // =========================================
 
 func TestConnectionPolicyDefaults(t *testing.T) {
-	p := resolveConnectionPolicy(0, 0, 0, 0, 0, 0, nil)
+	p := resolveConnectionPolicy(0, -1, 0, 0, 0, 0, nil)
 	if p.PrimaryCount != 1 || p.BackupCount != 1 {
 		t.Fatalf("默认主备应为 1+1，实际 %d+%d", p.PrimaryCount, p.BackupCount)
 	}
@@ -451,27 +443,26 @@ func TestConnectionPolicyDefaults(t *testing.T) {
 	if p.BackoffMaxMissedAcks != 3 {
 		t.Fatalf("默认失效阈值应为 3，实际 %d", p.BackoffMaxMissedAcks)
 	}
-	if p.Shard["tcp"] != "h2" || p.Shard["udp"] != "masque-udp" {
-		t.Fatalf("默认分流表错误: %v", p.Shard)
+	if got := p.PrimaryNetworks; len(got) != 2 || got[0] != networkTCP || got[1] != networkUDP {
+		t.Fatalf("默认分流网络错误: %v", got)
 	}
 	t.Logf("✅ ConnectionPolicy 默认值全部正确")
 }
 
 // =========================================
-// K. 边界：primary_count/backup_count=0 回退默认
+// K. 边界：backup_count=0 明确关闭备用
 // =========================================
 
 func TestConnectionPolicyBoundary(t *testing.T) {
-	// 负数/0 → 默认
+	// 主连接 0 → 默认 1；备用 0 → 明确关闭
 	p := resolveConnectionPolicy(0, 0, 0, 0, 0, 0, nil)
-	if p.PrimaryCount != 1 || p.BackupCount != 1 {
-		t.Fatalf("0 → 默认 1+1，实际 %d+%d", p.PrimaryCount, p.BackupCount)
+	if p.PrimaryCount != 1 || p.BackupCount != 0 {
+		t.Fatalf("预期 1 主 + 0 备，实际 %d+%d", p.PrimaryCount, p.BackupCount)
 	}
-	// 自定义分流表覆盖默认
-	shard := map[string]string{"tcp": "grpc", "udp": "stream-udp"}
-	p2 := resolveConnectionPolicy(2, 1, 0, 0, 0, 0, shard)
-	if p2.Shard["tcp"] != "grpc" || p2.Shard["udp"] != "stream-udp" {
-		t.Fatalf("自定义分流表未生效: %v", p2.Shard)
+	// 显式网络集合会去重并固定为 tcp、udp 顺序
+	p2 := resolveConnectionPolicy(2, 1, 0, 0, 0, 0, []string{"udp", "tcp", "udp"})
+	if got := p2.PrimaryNetworks; len(got) != 2 || got[0] != networkTCP || got[1] != networkUDP {
+		t.Fatalf("分流网络归一失败: %v", got)
 	}
 	// 非法建立间隔(负) → 默认 100s
 	p3 := resolveConnectionPolicy(1, 1, 0, 0, -5, 0, nil)

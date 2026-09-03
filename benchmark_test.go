@@ -29,7 +29,7 @@ func setupBenchmarkEnv() (serverURL, targetAddr, testToken string) {
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
-		EnableH3:      true,
+		Transport:     transportAll,
 		ExpectedToken: testToken,
 		LogLevel:      "fatal", // 压测时关掉服务端日志
 	})
@@ -79,20 +79,15 @@ func BenchmarkH2TunnelAllProtocols(b *testing.B) {
 		for i := 0; i < len(tc.args); i++ {
 			switch tc.args[i] {
 			case "-grpc":
-				cc.UseGRPC = true
+				cc.Transport = transportGRPC
 			case "-h3":
-				cc.UseH3 = true
+				cc.Transport = transportH3
 			case "-wt":
-				cc.UseWT = true
+				cc.Transport = transportWT
 			case "-masque":
-				cc.UseMasque = true
+				cc.Transport = transportMasque
 			case "-udp":
 				cc.Network = "udp"
-			case "-alpn":
-				if i+1 < len(tc.args) {
-					cc.Alpn = tc.args[i+1]
-					i++
-				}
 			}
 		}
 		go startClientDirect(cc)

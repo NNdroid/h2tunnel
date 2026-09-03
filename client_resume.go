@@ -93,7 +93,7 @@ func executeResumableTunnel(sessionID string, localConn net.Conn, reqUrl string,
 // body 是 io.Pipe 的 reader（上行 resume 帧由 send goroutine 写入 pw）。
 func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clientDownlink *uint64, ringBuf *resumeClientRingBuf, reqUrl string, cfg ClientConfig) *http.Request {
 	var method, reqURL string
-	if cfg.UseMasque {
+	if cfg.usesMasque() {
 		// MASQUE-TCP：CONNECT masque 路径，目标由 path + X-Dst 头携带
 		method = http.MethodConnect
 		host, port, _ := net.SplitHostPort(cfg.TargetAddr)
@@ -128,12 +128,12 @@ func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clie
 	SetXAuth(req.Header, cfg)
 	setTunnelRequestHeaders(req.Header)
 
-	if cfg.UseMasque {
+	if cfg.usesMasque() {
 		req.Header.Set("Protocol", "connect-tcp")
 		// http3.Transport 需要显式声明 HTTP/3，否则 CONNECT 目标路径可能被改写为空
 		req.Proto = "HTTP/3"
 	}
-	if cfg.UseGRPC {
+	if cfg.usesGRPC() {
 		// gRPC 仅作为外层 Content-Type 标记，resume 帧不套 grpc 分帧
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
@@ -171,7 +171,7 @@ func runResumeAttempt(sessID string, serverUplink *uint64, clientDownlink *uint6
 	req := buildResumeRequest(ctx, pr, sessID, clientDownlink, ringBuf, reqUrl, cfg)
 	var resp *http.Response
 	var err error
-	if rt, ok := httpClient.Transport.(http.RoundTripper); ok && cfg.UseMasque {
+	if rt, ok := httpClient.Transport.(http.RoundTripper); ok && cfg.usesMasque() {
 		resp, err = rt.RoundTrip(req)
 	} else {
 		resp, err = httpClient.Do(req)

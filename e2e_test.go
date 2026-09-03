@@ -111,7 +111,7 @@ func TestH2TunnelAllModes(t *testing.T) {
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
-		EnableH3:      true, // 开启 H3 以支持 WT 和 MASQUE
+		Transport:     transportAll,
 		ExpectedToken: testToken,
 		LogLevel:      "error", // 减少测试时的日志刷屏，想看详细过程可以改为 debug
 	})
@@ -135,7 +135,6 @@ func TestH2TunnelAllModes(t *testing.T) {
 		{"H3_TCP", "20003", false, []string{"-h3"}},
 		{"WT_TCP", "20004", false, []string{"-wt"}},
 		{"MASQUE_TCP", "20005", false, []string{"-masque"}},
-		{"MASQUE_H2_TCP", "20011", false, []string{"-masque", "-alpn", "h2"}},
 
 		// ---- UDP 系列 ----
 		{"H2_UDP_Stream", "20006", true, []string{"-udp"}},
@@ -163,20 +162,15 @@ func TestH2TunnelAllModes(t *testing.T) {
 			for i := 0; i < len(tc.args); i++ {
 				switch tc.args[i] {
 				case "-grpc":
-					cc.UseGRPC = true
+					cc.Transport = transportGRPC
 				case "-h3":
-					cc.UseH3 = true
+					cc.Transport = transportH3
 				case "-wt":
-					cc.UseWT = true
+					cc.Transport = transportWT
 				case "-masque":
-					cc.UseMasque = true
+					cc.Transport = transportMasque
 				case "-udp":
 					cc.Network = "udp"
-				case "-alpn":
-					if i+1 < len(tc.args) {
-						cc.Alpn = tc.args[i+1]
-						i++
-					}
 				}
 			}
 			go startClientDirect(cc)
@@ -280,6 +274,7 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
+		Transport:     transportH2,
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 	})
@@ -373,7 +368,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			UseGRPC:    false, // 故意不使用 gRPC
+			Transport:  transportH2, // 故意不使用 gRPC
 			Token:      testToken,
 			LogLevel:   "error",
 		})
@@ -409,7 +404,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			UseGRPC:    true, // 正确使用 gRPC
+			Transport:  transportGRPC, // 正确使用 gRPC
 			Token:      testToken,
 			LogLevel:   "error",
 		})
@@ -448,7 +443,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			UseGRPC:    true,
+			Transport:  transportGRPC,
 			Network:    "udp", // 请求 UDP
 			Token:      testToken,
 			LogLevel:   "error",

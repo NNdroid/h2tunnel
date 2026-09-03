@@ -317,7 +317,7 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager,
 			// resume/2 恒启用：每个 clientAddr 一个逻辑会话，HTTP 流断线
 			// 自动用同 session id 重建，服务端保持 UDP socket。
 			// （WT 走自身 WTSessionManager 会话模型，不适用此数据面。）
-			if !cfg.UseWT {
+			if !cfg.usesWT() {
 				udpSess := connectResumeUDP(newClientSessionID(), cfg, reqUrl, pickClient(mgr, "udp"), localConn, clientAddr)
 				if udpSess == nil {
 					// 无可用主线路：丢弃本包，等下次触发重试
@@ -416,7 +416,7 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager,
 			// ⚠️ 必须 select+default：这里的阻塞发生在主 accept 循环里，
 			// 一旦队列满 200 卡住，所有 UDP 客户端的数据都会一起停摆。
 			// 与 runMasqueUDPClient 的丢弃策略保持一致：宁可丢包也不阻塞。
-			if !cfg.UseWT {
+			if !cfg.usesWT() {
 				// 复用现有 resume 会话：直接入队（内部 select+default 防阻塞）
 				if sess, ok := v.(*udpSession); ok {
 					udpBufPool.Put(bufPtr) // 归还原始大缓冲区

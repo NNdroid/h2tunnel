@@ -159,7 +159,7 @@ func TestWTResumeReconnect(t *testing.T) {
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
-		EnableH3:      true,
+		Transport:     transportWT,
 		ExpectedToken: token,
 		LogLevel:      "error",
 		SessionWindow: 256,

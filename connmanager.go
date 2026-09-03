@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -49,7 +50,7 @@ type ConnectionPolicy struct {
 	BackupDialInterval   time.Duration
 	EstablishInterval    time.Duration
 	BackoffMaxMissedAcks int
-	Shard                map[string]string // netType -> 协议
+	PrimaryNetworks      []string
 }
 
 // resolveDial 把秒级配置换算为间隔；0/非法 → 默认。
@@ -60,28 +61,41 @@ func resolveDial(sec int, def time.Duration) time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
-// normalizeShard 规范化类型分流表；缺省项补默认。
-// 默认分流：tcp→h2，udp→masque-udp。
-func normalizeShard(m map[string]string) map[string]string {
-	out := map[string]string{
-		"tcp": "h2",
-		"udp": "masque-udp",
+// normalizePrimaryNetworks 只保留实际支持的业务类型，并固定为 tcp→udp 顺序。
+func normalizePrimaryNetworks(networks []string) []string {
+	if len(networks) == 0 {
+		return []string{networkTCP, networkUDP}
 	}
-	for k, v := range m {
-		if k == "" || v == "" {
-			continue
+	var tcp, udp bool
+	for _, network := range networks {
+		switch strings.ToLower(strings.TrimSpace(network)) {
+		case networkAll:
+			tcp, udp = true, true
+		case networkTCP:
+			tcp = true
+		case networkUDP:
+			udp = true
 		}
-		out[k] = v
+	}
+	out := make([]string, 0, 2)
+	if tcp {
+		out = append(out, networkTCP)
+	}
+	if udp {
+		out = append(out, networkUDP)
+	}
+	if len(out) == 0 {
+		return []string{networkTCP, networkUDP}
 	}
 	return out
 }
 
 // resolveConnectionPolicy 从 Config 派生连接管理策略（含默认值兜底）。
-func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, shard map[string]string) ConnectionPolicy {
+func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, networks []string) ConnectionPolicy {
 	if pc <= 0 {
 		pc = defaultPrimaryCount
 	}
-	if bc <= 0 {
+	if bc < 0 {
 		bc = defaultBackupCount
 	}
 	if missed <= 0 {
@@ -91,6 +105,10 @@ func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, shard map[
 	if esSec > 0 {
 		establish = time.Duration(esSec) * time.Second
 	}
+	primaryNetworks := normalizePrimaryNetworks(networks)
+	if pc > 1 && pc > len(primaryNetworks) {
+		pc = len(primaryNetworks)
+	}
 	return ConnectionPolicy{
 		PrimaryCount:         pc,
 		BackupCount:          bc,
@@ -98,18 +116,25 @@ func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, shard map[
 		BackupDialInterval:   resolveDial(bdSec, backupDialDefault),
 		EstablishInterval:    establish,
 		BackoffMaxMissedAcks: missed,
-		Shard:                normalizeShard(shard),
+		PrimaryNetworks:      primaryNetworks,
 	}
 }
 
 // normalizePolicy 归一策略：全零值（未显式配置，如直接构造 ClientConfig 的测试/程序化调用）
-// 时套用默认 1 主 + 1 备 + 主拨号30s + 备拨号15s + 建立间隔100s + 失效阈值3 + 默认分流表。
+// 时套用默认 1 主 + 1 备 + 主拨号30s + 备拨号15s + 建立间隔100s + 失效阈值3 + tcp/udp 网络序列。
 // 已部分配置则仅对 0/非法项兜底，不覆盖显式值。
 func normalizePolicy(p ConnectionPolicy) ConnectionPolicy {
+	allZero := p.PrimaryCount == 0 && p.BackupCount == 0 &&
+		p.PrimaryDialInterval == 0 && p.BackupDialInterval == 0 &&
+		p.EstablishInterval == 0 && p.BackoffMaxMissedAcks == 0 && len(p.PrimaryNetworks) == 0
+	if allZero {
+		return resolveConnectionPolicy(0, -1, 0, 0, 0, 0, nil)
+	}
 	if p.PrimaryCount <= 0 {
 		p.PrimaryCount = defaultPrimaryCount
 	}
-	if p.BackupCount <= 0 {
+	// 0 是显式关闭备用；负数才按非法值回退。全零策略已在上面处理为默认。
+	if p.BackupCount < 0 {
 		p.BackupCount = defaultBackupCount
 	}
 	if p.PrimaryDialInterval <= 0 {
@@ -124,30 +149,26 @@ func normalizePolicy(p ConnectionPolicy) ConnectionPolicy {
 	if p.BackoffMaxMissedAcks <= 0 {
 		p.BackoffMaxMissedAcks = defaultBackupMissedAck
 	}
-	if len(p.Shard) == 0 {
-		p.Shard = normalizeShard(nil)
+	p.PrimaryNetworks = normalizePrimaryNetworks(p.PrimaryNetworks)
+	if p.PrimaryCount > 1 && p.PrimaryCount > len(p.PrimaryNetworks) {
+		p.PrimaryCount = len(p.PrimaryNetworks)
 	}
 	return p
 }
 
 // primaryTypes 计算需要维护主连接的业务类型集合。
 //   - PrimaryCount<=1 → 单条默认类型 "default"（不启用分流）。
-//   - PrimaryCount>1  → 取分流表的前 N 个 key 作为类型集合（启用类型分流）。
+//   - PrimaryCount>1  → 取已启用网络的前 N 项作为类型集合（启用类型分流）。
 func (p ConnectionPolicy) primaryTypes() []string {
 	if p.PrimaryCount <= 1 {
 		return []string{"default"}
 	}
-	types := make([]string, 0, p.PrimaryCount)
-	for k := range p.Shard {
-		types = append(types, k)
-		if len(types) >= p.PrimaryCount {
-			break
-		}
+	networks := normalizePrimaryNetworks(p.PrimaryNetworks)
+	count := min(p.PrimaryCount, len(networks))
+	if count == 0 {
+		return []string{"default"}
 	}
-	if len(types) == 0 {
-		types = []string{"default"}
-	}
-	return types
+	return networks[:count]
 }
 
 // ConnectionManager 主/备连接管理器。
@@ -158,6 +179,7 @@ type ConnectionManager struct {
 	httpClient    *http.Client        // 共享默认客户端（探活线路回退）
 	clientFactory func() *http.Client // 每线路专属客户端工厂（接入真实数据路径时设置）
 	sessPrefix    string
+	primaryKinds  []string // 启动时一次性编译，避免监控热路径反复遍历/排序 map
 
 	mu        sync.Mutex
 	primaries map[string]*backupLine // netType -> 主连接（类型分流）
@@ -173,15 +195,17 @@ type ConnectionManager struct {
 
 // NewConnectionManager 创建连接管理器。sessPrefix 用于生成每条的独立 session id。
 func NewConnectionManager(policy ConnectionPolicy, cfg ClientConfig, reqUrl string, httpClient *http.Client, sessPrefix string) *ConnectionManager {
+	policy = normalizePolicy(policy)
 	return &ConnectionManager{
-		policy:     policy,
-		cfg:        cfg,
-		reqUrl:     reqUrl,
-		httpClient: httpClient,
-		sessPrefix: sessPrefix,
-		primaries:  make(map[string]*backupLine),
-		lastDial:   make(map[string]time.Time),
-		closeCh:    make(chan struct{}),
+		policy:       policy,
+		cfg:          cfg,
+		reqUrl:       reqUrl,
+		httpClient:   httpClient,
+		sessPrefix:   sessPrefix,
+		primaryKinds: policy.primaryTypes(),
+		primaries:    make(map[string]*backupLine),
+		lastDial:     make(map[string]time.Time),
+		closeCh:      make(chan struct{}),
 	}
 }
 
@@ -204,7 +228,7 @@ func (m *ConnectionManager) SetClientFactory(factory func() *http.Client) {
 func (m *ConnectionManager) PickClient(typ string) *http.Client {
 	// 单主（未分流）时，任何类型都落到 "default" 主线路
 	lookup := typ
-	if m.policy.PrimaryCount <= 1 {
+	if len(m.primaryKinds) <= 1 {
 		lookup = "default"
 	}
 	deadline := time.Now().Add(pickClientTimeout)
@@ -239,11 +263,17 @@ func (m *ConnectionManager) Start() {
 	m.startedAt = time.Now()
 	m.mu.Unlock()
 
-	for _, typ := range m.policy.primaryTypes() {
+	for _, typ := range m.primaryKinds {
 		m.dialPrimaryLocked(typ)
 	}
 	go m.monitor()
-	go m.establishBackupsAfterDelay()
+	if m.policy.BackupCount > 0 {
+		go m.establishBackupsAfterDelay()
+	} else {
+		m.mu.Lock()
+		m.backupsEstablished = true
+		m.mu.Unlock()
+	}
 }
 
 // dialPrimaryLocked 为指定类型拨一条主连接（遵循主拨号间隔节流）。
@@ -336,7 +366,7 @@ func (m *ConnectionManager) reconcile() {
 	now := time.Now()
 
 	// 1. 主连接失效/缺失 → 升级备用 / 补主
-	for _, typ := range m.policy.primaryTypes() {
+	for _, typ := range m.primaryKinds {
 		cur := m.primaries[typ]
 		need := cur == nil || cur.State() == backupFailed || cur.State() == backupIdle || cur.IsClosed()
 		if !need {

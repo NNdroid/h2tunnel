@@ -189,7 +189,7 @@ func SetXTarget(h http.Header, target string) {
 
 func SetXDst(h http.Header, cfg ClientConfig) (string, string) {
 	network := "tcp"
-	if cfg.Network == "udp" {
+	if normalizeNetwork(cfg.Network, networkTCP) == networkUDP {
 		network = "udp"
 	}
 	defaultPort := "22"
@@ -214,15 +214,9 @@ func SetXAuth(h http.Header, cfg ClientConfig) {
 	if cfg.Token == "" {
 		return
 	}
-	// ⚠️ 同时投递三个头，是有意为之，不是冗余：
-	//   X-Auth-Token        自定义头，任何 CDN / 反代都会原样透传 —— CDN 场景的实际生效者
-	//   Authorization       标准头，Nginx / Cloudflare 默认透传 —— 次选
-	//   Proxy-Authorization RFC 7230 定义的 hop-by-hop 头，代理「必须」消耗掉，
-	//                       直连场景可用，过 CDN 会被剥离 —— 仅为兼容旧部署保留
-	// 单发 Proxy-Authorization 时在 CDN / Nginx 反代后面会恒定 407，这是历史 bug。
+	// 自定义头与标准 Authorization 均可穿过常见 CDN / 反代。
 	h.Set("X-Auth-Token", cfg.Token)
 	h.Set("Authorization", "Bearer "+cfg.Token)
-	h.Set("Proxy-Authorization", "Bearer "+cfg.Token)
 }
 
 // setTunnelRequestHeaders 设置隧道请求侧的反缓冲头，与 server 端的
@@ -237,34 +231,21 @@ func setTunnelRequestHeaders(h http.Header) {
 	h.Set("Cache-Control", "no-store, no-transform")
 }
 
-// checkAuth 统一鉴权（支持多 Token 逗号分隔列表）
-func checkAuth(r *http.Request, expectedTokens string) bool {
-	if strings.TrimSpace(expectedTokens) == "" {
+// checkAuth 校验单一配置 Token；不接受旧头名或多 Token 隐式语法。
+func checkAuth(r *http.Request, expectedToken string) bool {
+	if expectedToken == "" {
 		return true
 	}
 
-	// 优先级：自定义头 > Authorization > Proxy-Authorization。
-	// 自定义头放首位是因为它是唯一能保证穿过任意中间盒的载体。
-	customTokenHeader := r.Header.Get("X-Auth-Token")
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		authHeader = r.Header.Get("Proxy-Authorization")
+	if secureEqual(r.Header.Get("X-Auth-Token"), expectedToken) {
+		return true
 	}
-
-	// 拆分支持多 Token 配置（例如: -token token1,token2）
-	tokens := strings.Split(expectedTokens, ",")
-	for _, tok := range tokens {
-		cleanTok := strings.TrimSpace(tok)
-		if cleanTok == "" {
-			continue
-		}
-		// 常量时间比较，避免通过响应耗时逐字节爆破 token
-		if secureEqual(customTokenHeader, cleanTok) {
-			return true
-		}
-		if secureEqual(authHeader, cleanTok) || secureEqual(authHeader, "Bearer "+cleanTok) {
-			return true
-		}
+	const bearerPrefix = "Bearer "
+	authHeader := r.Header.Get("Authorization")
+	if len(authHeader) == len(bearerPrefix)+len(expectedToken) &&
+		strings.EqualFold(authHeader[:len(bearerPrefix)], bearerPrefix) &&
+		secureEqual(authHeader[len(bearerPrefix):], expectedToken) {
+		return true
 	}
 
 	// 鉴权失败时，只记录来源 IP，绝不打印客户端携带的 token（含 Bearer 明文），以防凭据泄露

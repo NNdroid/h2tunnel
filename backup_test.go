@@ -42,10 +42,10 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
+		Transport:     transportH2,
 		ExpectedToken: "backup-token",
 		LogLevel:      "error",
 		SessionWindow: 256,
-		BackupLine:    "hot",
 		Network:       "all",
 	})
 	time.Sleep(2 * time.Second)
@@ -74,13 +74,12 @@ func TestBackupHotStandbyAlive(t *testing.T) {
 		Network:        "tcp",
 		LogLevel:       "error",
 		SessionWindow:  256,
-		BackupLine:     "hot",
 		HandshakeAckMs: 3000,
 		KeepaliveSec:   1,
 	}
 	hc := newInsecureHTTPClient()
 
-	bl := newBackupLine("sess-backup-test", cfg, serverURL+"/tunnel", hc)
+	bl := newManagedLine("sess-backup-test", roleBackup, networkTCP, cfg, serverURL+"/tunnel", hc, nil, 0)
 	go bl.Start()
 	defer bl.close()
 
@@ -116,14 +115,13 @@ func TestBackupTakeoverOnlyIfConfirmed(t *testing.T) {
 		Network:        "tcp",
 		LogLevel:       "error",
 		SessionWindow:  256,
-		BackupLine:     "hot",
 		HandshakeAckMs: 3000,
 		KeepaliveSec:   1,
 	}
 	hc := newInsecureHTTPClient()
 
 	// 场景 A：新建未启动的备用 → 未确认 → 禁止接管
-	bl := newBackupLine("sess-takeover-a", cfg, serverURL+"/tunnel", hc)
+	bl := newManagedLine("sess-takeover-a", roleBackup, networkTCP, cfg, serverURL+"/tunnel", hc, nil, 0)
 	if bl.Alive() {
 		t.Fatal("未启动的备用不应 Alive（禁止接管）")
 	}
@@ -168,13 +166,12 @@ func TestBackupWrongTokenRejected(t *testing.T) {
 		Network:        "tcp",
 		LogLevel:       "error",
 		SessionWindow:  256,
-		BackupLine:     "hot",
 		HandshakeAckMs: 3000,
 		KeepaliveSec:   1,
 	}
 	hc := newInsecureHTTPClient()
 
-	bl := newBackupLine("sess-bad-token", cfg, serverURL+"/tunnel", hc)
+	bl := newManagedLine("sess-bad-token", roleBackup, networkTCP, cfg, serverURL+"/tunnel", hc, nil, 0)
 	go bl.Start()
 	defer bl.close()
 

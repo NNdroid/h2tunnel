@@ -42,121 +42,19 @@ func setTunnelHeaders(h http.Header) {
 	h.Set("Content-Encoding", "identity")
 }
 
-func isNetworkAllowed(reqNet, configuredNet string) bool {
-	configuredNet = strings.ToLower(strings.TrimSpace(configuredNet))
-	if configuredNet == "" || configuredNet == "all" || configuredNet == "both" || configuredNet == "tcp+udp" || configuredNet == "tcp,udp" {
-		return true
-	}
-	reqNet = strings.ToLower(strings.TrimSpace(reqNet))
-	return reqNet == configuredNet
-}
-
-// parseTransportList 把 transport 配置（逗号分隔或单值）解析为小写协议集合。
-// "all"/"auto" 返回空集（表示全协议网关模式，全部放行）。
-func parseTransportList(configuredTransport string) map[string]bool {
-	trans := strings.ToLower(strings.TrimSpace(configuredTransport))
-	if trans == "" || trans == "all" || trans == "auto" {
-		return nil // nil = 全放行
-	}
-	set := make(map[string]bool)
-	for _, part := range strings.Split(trans, ",") {
-		p := strings.TrimSpace(part)
-		if p != "" {
-			set[p] = true
-		}
-	}
-	if len(set) == 0 {
-		return nil
-	}
-	return set
-}
-
-func checkStrictTransport(r *http.Request, configuredTransport string, isWT, isMasqueTCP, isMasqueUDP bool) error {
-	set := parseTransportList(configuredTransport)
-	if set == nil {
-		return nil // 全协议网关模式，全部允许
-	}
-
-	isGRPC := r.Method == http.MethodPost && (r.Header.Get("Content-Type") == "application/grpc" || strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc"))
-	isH2Stream := r.Method == http.MethodPost && !isGRPC
-	isMasque := isMasqueTCP || isMasqueUDP
-	isH3 := r.ProtoMajor == 3 || strings.HasPrefix(r.Proto, "HTTP/3")
-
-	// 逐项判定当前请求命中的协议标签，再检查是否在放行集合内。
-	allowed := func(keys ...string) bool {
-		for _, k := range keys {
-			if set[k] {
-				return true
-			}
-		}
-		return false
-	}
-
-	switch {
-	case isGRPC:
-		if allowed("grpc", "gRPC") {
-			return nil
-		}
-	case isH2Stream:
-		// h2-stream POST 可被 h2 / h2c / grpc(非) 之外的流协议匹配
-		if allowed("h2", "h2c", "h3", "http3", "http/3") {
-			return nil
-		}
-	case isMasque:
-		if allowed("masque") {
-			return nil
-		}
-	case isWT:
-		if allowed("wt", "webtransport") {
-			return nil
-		}
-	}
-
-	// 特别处理：若列表里只有 H3，但请求是 H3 流
-	if isH3 && allowed("h3", "http3", "http/3") {
-		return nil
-	}
-
-	return fmt.Errorf("transport policy violation: allowed=[%s], got Method=%s Proto=%s Content-Type=%s Protocol=%s",
-		configuredTransport, r.Method, r.Proto, r.Header.Get("Content-Type"), r.Header.Get("Protocol"))
-}
-
 func runServer(args []string) {
-	startServerDirect(buildServerConfig(loadConfigFromArgs(args)))
+	startServerDirect(buildServerConfig(loadConfigFromArgs(args, "server")))
 }
 
 func startServerDirect(cfg ServerConfig) {
 	initLogger(cfg.LogLevel)
 	defer zlog.Sync()
 
-	// Apply transport mode if specified
-	switch strings.ToLower(cfg.Transport) {
-	case "h3", "http3", "http/3", "quic":
-		cfg.EnableH3 = true
-		cfg.EnableTLS = true
-	case "wt", "webtransport":
-		cfg.EnableH3 = true
-		cfg.EnableTLS = true
-	case "masque":
-		cfg.EnableH3 = true
-		cfg.EnableTLS = true
-	case "grpc":
-		cfg.EnableH3 = false
-	case "h2", "tls":
-		cfg.EnableTLS = true
-		cfg.EnableH3 = false
-	case "h2c", "cleartext", "plain":
-		cfg.EnableTLS = false
-		cfg.EnableH3 = false
-	case "all", "auto":
-		cfg.EnableH3 = true
+	var err error
+	cfg, err = prepareServerConfig(cfg)
+	if err != nil {
+		zlog.Fatalf("[Server] ❌ invalid routing configuration: %v", err)
 	}
-
-	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
-	if netMode == "" {
-		netMode = "all"
-	}
-	cfg.Network = netMode
 
 	zlog.Infof("[Server] 🚀 h2tunnel %s starting...", Version)
 	// resume/2 是唯一数据面（恒启用，v1 逃生通道已移除），服务端恒启动会话回收。
@@ -352,14 +250,15 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg ServerConfig
 	}
 
 	// 1. 严格网络类型分流校验 (TCP / UDP 限制)
-	if !isNetworkAllowed(reqNetwork, cfg.Network) {
+	policy := cfg.effectiveRoutingPolicy()
+	if !policy.allowsNetwork(reqNetwork) {
 		zlog.Warnf("[%s] 🚫 严格分流拦截: 服务端限制 Network='%s'，拒绝 %s 请求 (IP: %s)", sessionID, cfg.Network, strings.ToUpper(reqNetwork), clientIP(r))
 		http.Error(w, fmt.Sprintf("%s traffic forbidden by server policy", strings.ToUpper(reqNetwork)), http.StatusForbidden)
 		return
 	}
 
 	// 2. 严格传输协议分流校验 (Transport 限制)
-	if err := checkStrictTransport(r, cfg.Transport, isWT, isMasqueTCP, false); err != nil {
+	if err := checkStrictTransportPolicy(r, policy, cfg.Transport, isWT, isMasqueTCP, false); err != nil {
 		zlog.Warnf("[%s] 🚫 严格分流拦截: %v (IP: %s)", sessionID, err, clientIP(r))
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -496,14 +395,10 @@ func resumeRoleLabel(isBackup bool) string {
 
 // serverCapabilities 服务端支持的能力集（由 cfg 派生）。
 func serverCapabilities(cfg ServerConfig) resumeCaps {
-	c := resumeCaps{}
-	if isNetworkAllowed("udp", cfg.Network) {
-		c.datagram = true
+	return resumeCaps{
+		datagram:   cfg.effectiveRoutingPolicy().allowsNetwork(networkUDP),
+		backupLine: true,
 	}
-	if cfg.BackupLine != "" {
-		c.backupLine = true
-	}
-	return c
 }
 
 // doServerHandshakeAck 等待客户端 HANDSHAKE 控制帧并回 HANDSHAKE-ACK。

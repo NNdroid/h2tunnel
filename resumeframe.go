@@ -203,7 +203,7 @@ func writeFrame(w io.Writer, typ byte, seq uint64, data []byte, padLen int) erro
 	return nil
 }
 
-// writeResumeFrame 写一个 DATA 帧（业务数据）。兼容旧调用点。
+// writeResumeFrame 写一个 DATA 帧（业务数据）。
 func writeResumeFrame(w io.Writer, seq uint64, data []byte, padLen int) error {
 	return writeFrame(w, resumeFrameData, seq, data, padLen)
 }
@@ -260,7 +260,7 @@ func readFrame(r io.Reader, payloadBuf []byte) (typ byte, seq uint64, n int, err
 	return typ, seq, int(dataLen), nil
 }
 
-// readResumeFrame 读一个 DATA 帧（兼容旧调用点）。非 DATA 帧返回错误。
+// readResumeFrame 读一个 DATA 帧；非 DATA 帧返回错误。
 func readResumeFrame(r io.Reader, payloadBuf []byte) (seq uint64, n int, err error) {
 	typ, seq, n, err := readFrame(r, payloadBuf)
 	if err != nil {

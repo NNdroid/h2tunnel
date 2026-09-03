@@ -188,28 +188,24 @@ func (m *ConnectionManager) dialOne(role SessionRole, proto string) *ResumeSessi
 
 **触发条件**：`PrimaryCount > 1`。
 
-**核心思想**：主连接不是「N 条完全等价」的冗余，而是**按类型（网络/协议维度）各管一摊**。即一个客户端同时维持多条主连接，每条服务一类流量。
+**核心思想**：主连接不是「N 条完全等价」的冗余，而是按网络类型分担流量。即一个客户端同时维持多条主连接，每条服务一类流量。
 
 分流维度（当前代码的两类网络）：
-- **TCP 类**：h2 / h3 / grpc / masque-tcp / wt —— 服务 SSH 等流式字节流业务。
-- **UDP 类**：masque-udp / stream-udp —— 服务 DNS 等数据报业务。
+- **TCP 类**：服务 SSH 等流式字节流业务。
+- **UDP 类**：服务 DNS 等数据报业务。
 
 ```
 PrimaryCount=2 时：
-  primary["tcp"] → h2 (ResumeSession, role=primary)
-  primary["udp"] → masque-udp (ResumeSession, role=primary)
+  primary["tcp"] → 当前 transport (ResumeSession, role=primary)
+  primary["udp"] → 当前 transport (ResumeSession, role=primary)
 
 业务流入：
-  TCP 业务 → Pick("tcp") → 走 h2 主连接
-  UDP 业务 → Pick("udp") → 走 masque-udp 主连接
+  TCP 业务 → Pick("tcp") → 走 TCP 主连接
+  UDP 业务 → Pick("udp") → 走 UDP 主连接
 ```
 
-**分流表（可扩展）**：`map[string]string`（业务类型 → 协议）。默认：
-
-| 业务类型 | 默认协议 | 说明 |
-|----------|----------|------|
-| tcp | h2 | 最通用；可配 h3/grpc/masque-tcp/wt |
-| udp | masque-udp | 数据报语义；可配 stream-udp |
+分流类型直接由 `network` 生成有序数组：`tcp`、`udp` 或 `[tcp, udp]`。
+传输协议不在此层重复配置，始终使用唯一的 `transport`。
 
 > **注意**：这里的「类型分流」是**连接/通道级**分流，不是会话级（同一业务类型内部仍可并行多会话）。多条主连接之间**互不重复**——各自独占一个类型，避免 CDN 同时杀掉多条的问题退化为「N 条重复冗余」。
 
@@ -303,7 +299,7 @@ type ConnectionPolicy struct {
     BackupDialInterval   time.Duration // 备用连接拨号间隔（§5.1）
     EstablishInterval    time.Duration // 主/备建立间隔（§5.2），默认 100s
     BackoffMaxMissedAcks int          // 备用失效判定阈值，默认 3
-    Shard map[string]string           // 类型分流表：tcp→h2, udp→masque-udp
+    PrimaryNetworks []string          // 启用的主线路网络类型，固定 tcp→udp 顺序
 }
 ```
 
@@ -315,11 +311,12 @@ type ConnectionPolicy struct {
   "backup_count": 1,           // 备用连接数，默认 1
   "primary_dial_interval_sec": 0,   // 主连接拨号间隔（秒），0=默认（见 §5.1）
   "backup_dial_interval_sec": 0,    // 备用连接拨号间隔（秒），0=默认
-  "establish_interval_sec": 100,    // 主/备建立间隔（秒），默认 100
-  "backup_missed_acks": 3,          // 备用失效阈值（连续丢 ACK 判失效），默认 3
-  "shard": { "tcp": "h2", "udp": "masque-udp" }  // 类型分流表（PrimaryCount>1 生效）
+  "establish_interval_sec": 100     // 主/备建立间隔（秒），默认 100
 }
 ```
+
+分流不提供独立映射配置：`transport` 是唯一传输事实来源，`network` 决定启用
+`tcp`、`udp` 或两者，`primary_count > 1` 时按固定的 `tcp → udp` 顺序拆分主线路。
 
 ### 5.0 上层协议唯一性（只保留 Resume v2）
 
@@ -357,21 +354,9 @@ const (
     defaultBackupMissedAck = 3
 )
 
-func resolveConnectionPolicy(cfg *Config) ConnectionPolicy {
-    p := ConnectionPolicy{
-        PrimaryCount:        cfg.PrimaryCount,       // 0→1
-        BackupCount:         cfg.BackupCount,        // 0→1
-        PrimaryDialInterval: resolveDial(cfg.PrimaryDialIntervalSec, primaryDialDefault),
-        BackupDialInterval:  resolveDial(cfg.BackupDialIntervalSec, backupDialDefault),
-        EstablishInterval:   resolveDial(cfg.EstablishIntervalSec, defaultEstablishSec*time.Second), // 默认100s
-        BackoffMaxMissedAcks: cfg.BackupMissedAcks,  // 0→3
-        Shard: normalizeShard(cfg.Shard),            // 默认 {tcp:h2, udp:masque-udp}
-    }
-    if p.PrimaryCount > 1 {
-        // 类型分流：校验 shard 覆盖所有业务类型，未覆盖的类型并入默认
-    }
-    return p
-}
+// backup_count 使用指针区分“未配置”和显式 0：
+// nil → 默认 1；0 → 关闭备用；正数 → 对应备用数量。
+// PrimaryNetworks 由 network 派生，不存在额外的 shard 配置。
 ```
 
 **主备数量规则（用户需求逐条对应）**：
@@ -383,8 +368,6 @@ func resolveConnectionPolicy(cfg *Config) ConnectionPolicy {
 | `primary_dial_interval_sec` | 0→30s | 主连接断后重拨的最小间隔（节流，防风暴） |
 | `backup_dial_interval_sec` | 0→15s | 备用补位的最小间隔（节流） |
 | `establish_interval_sec` | 100 | 主/备**建立动作之间的错相间隔**；先拨主、等 100s 再拨备 |
-| `backup_missed_acks` | 3 | 备用连续丢 KEEPALIVE-ACK 次数阈值 → 判失效 |
-| `shard` | `{tcp:h2, udp:masque-udp}` | 类型→协议分流表（PrimaryCount>1 时生效） |
 
 > **主备切换语义**：`primary_count=1` 时退化为「1 主 + 1 备」经典模式。`primary_count=2` 时 `tcp`/`udp` 各一条主（类型分流）；某条主阵亡 → 从备用池挑 `backupAlive` 的备用升级为主 → 再拨一条新备补足 `backup_count`。
 
@@ -410,7 +393,7 @@ backup.go                 // 逻辑迁入 ResumeSession(role=backup) + connmanag
 standby.go                // 退役：其「错相轮换」职责由 ConnectionPolicy.EstablishInterval 替代
 ```
 
-> **退役声明**：`standbyRoundTripper` 与 `backupLine` 两套旧热备实现，被 `ConnectionManager` + `ResumeSession(role)` 统一取代。`standby` 配置项与 `backup_line` 配置项**合并语义**到 `ConnectionPolicy`（主备数量/间隔），不再保留独立入口。
+> **退役声明**：`standbyRoundTripper` 与旧的独立热备入口，被 `ConnectionManager` + `ResumeSession(role)` 统一取代。配置仅保留 `backup_count` 与连接间隔策略。
 
 ---
 
@@ -464,9 +447,9 @@ t=300s   h2 主断 → 备 S3 升级为主(role=tcp) → 补一条新备
    - 方案 B：备用维持独立 id，接管时业务侧新建会话。放弃断点续传。
    - 设计默认 **方案 A**：`UpgradeToPrimary` 时把备用连接重拨为原类型的原 session id（若无新断点，几乎零开销）。
 3. **类型分流 ≠ 无限扩容**：PrimaryCount 建议 ≤ 业务类型数（默认 2：tcp+udp）。PrimaryCount=1 时退化为「单主+单备」经典模式，不启用分流。
-4. **向后兼容**：新增配置均带默认值，不配置时行为等于当前「1 主 + 1 备 + 错相轮换」。
-5. **datagram 会话**（UDP）：备用/UDP 跳过 B 层握手，仅 A 层；分流表里 udp 默认 masque-udp。
-6. **旧配置废弃**：`standby` / `conn_max_age_sec` / `backup_line` 三个旧字段在本设计落地后废弃，由 `primary_count`/`backup_count`/`establish_interval_sec` 取代；迁移期保留兼容读取（映射到默认 ConnectionPolicy）。
+4. **默认行为**：不配置连接策略时使用「1 主 + 1 备 + 错相轮换」。
+5. **datagram 会话**（UDP）：备用/UDP 跳过 B 层握手，仅 A 层；仍使用客户端选定的唯一 `transport`。
+6. **配置入口唯一**：主备策略只由 `primary_count` / `backup_count` / 两个拨号间隔 / `establish_interval_sec` 表达，其中 `backup_count=0` 表示关闭备用。
 
 ---
 
@@ -486,7 +469,7 @@ t=300s   h2 主断 → 备 S3 升级为主(role=tcp) → 补一条新备
 | T8 | `handshake_frame_test`（帧编解码） | resume v2 帧编解码 | DATA/END/ERROR/HANDSHAKE/HANDSHAKE-ACK/KEEPALIVE/KEEPALIVE-ACK 编解码往返 + 版本/类型校验正确（控制帧优先由 writer 互斥锁串行化保证，见 §2.3） |
 | T9 | `TestConnManagerTransportResumeMatrix` | 传输×resume 矩阵 | h2/grpc/masque-tcp/wt/h3 TCP + h2-udp/masque-udp 各在 resume/2 之上全双工回显通过 |
 | T10 | `TestConnManagerVersionUnsupported` / `TestConnManagerAuthFailureNoTakeover` | 异常处理 | 握手超时 / 鉴权失败 / 版本不匹配 → 优雅拒绝，备用不接管 |
-| T11 | `TestConnectionPolicyDefaults` / `TestConnectionPolicyBoundary` | 边界 | primary_count=0 / backup_count=0 / 非法间隔 → 回退默认；超过业务类型数的主连接 clamp |
+| T11 | `TestConnectionPolicyDefaults` / `TestConnectionPolicyBoundary` | 边界 | primary_count=0 回退默认；backup_count=0 关闭备用；程序化调用会安全归一；外部配置超出已启用网络数时直接拒绝 |
 
 ---
 

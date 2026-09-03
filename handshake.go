@@ -188,14 +188,10 @@ func negotiateVersion(clientMax, serverMax int) int {
 
 // clientCapabilities 客户端声明的能力集（由 cfg 派生）。
 func clientCapabilities(cfg ClientConfig) resumeCaps {
-	c := resumeCaps{}
-	if cfg.IsUDP() {
-		c.datagram = true
+	return resumeCaps{
+		datagram:   cfg.IsUDP(),
+		backupLine: true,
 	}
-	if cfg.BackupLine == "hot" || cfg.BackupLine == "cold" {
-		c.backupLine = true
-	}
-	return c
 }
 
 // clientParams 客户端请求的握手参数（由 cfg 派生，未配置用默认）。

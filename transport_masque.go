@@ -52,14 +52,15 @@ func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg ServerConfig) {
 	zlog.Debugf("[%s] === New MASQUE-UDP request ===", sessionID)
 
 	// 1. 严格网络类型分流校验 (是否允许 UDP)
-	if !isNetworkAllowed("udp", cfg.Network) {
+	policy := cfg.effectiveRoutingPolicy()
+	if !policy.allowsNetwork(networkUDP) {
 		zlog.Warnf("[%s] 🚫 严格分流拦截: 服务端限制 Network='%s'，拒绝 MASQUE-UDP 请求 (IP: %s)", sessionID, cfg.Network, clientIP(r))
 		http.Error(w, "UDP traffic forbidden by server policy", http.StatusForbidden)
 		return
 	}
 
 	// 2. 严格传输协议分流校验 (是否允许 MASQUE)
-	if err := checkStrictTransport(r, cfg.Transport, false, false, true); err != nil {
+	if err := checkStrictTransportPolicy(r, policy, cfg.Transport, false, false, true); err != nil {
 		zlog.Warnf("[%s] 🚫 严格分流拦截: %v (IP: %s)", sessionID, err, clientIP(r))
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return

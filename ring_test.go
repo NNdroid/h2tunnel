@@ -156,7 +156,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 		},
 		{
 			name:           "grpc POST",
-			mutate:         func(c *ClientConfig) { c.UseGRPC = true },
+			mutate:         func(c *ClientConfig) { c.Transport = transportGRPC },
 			wantMethod:     "POST",
 			wantPathPrefix: "/tunnel",
 			wantProto:      "resume/2",
@@ -164,7 +164,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 		},
 		{
 			name:           "masque-tcp CONNECT",
-			mutate:         func(c *ClientConfig) { c.UseMasque = true },
+			mutate:         func(c *ClientConfig) { c.Transport = transportMasque },
 			wantMethod:     "CONNECT",
 			wantPathPrefix: "/.well-known/masque/tcp/",
 			wantProto:      "resume/2",
@@ -208,12 +208,12 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 			if got := req.Header.Get("Content-Type"); got != tc.wantCT {
 				t.Errorf("Content-Type = %q, want %q", got, tc.wantCT)
 			}
-			if cfg.UseMasque {
+			if cfg.usesMasque() {
 				if got := req.Header.Get("Protocol"); got != "connect-tcp" {
 					t.Errorf("Protocol = %q, want connect-tcp", got)
 				}
 			}
-			if cfg.UseGRPC {
+			if cfg.usesGRPC() {
 				if got := req.Header.Get("TE"); got != "trailers" {
 					t.Errorf("TE = %q, want trailers", got)
 				}

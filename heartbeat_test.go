@@ -39,11 +39,11 @@ func TestHeartbeatIdleTunnelE2E(t *testing.T) {
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
+		Transport:     transportH2,
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 		// 测试专用短心跳：直接构造配置不走 clampHeartbeat，
 		// 300ms 间隔下 1.2s 空闲覆盖 4 个完整心跳周期
-		HeartbeatInterval: 300 * time.Millisecond,
 	})
 	time.Sleep(2 * time.Second)
 

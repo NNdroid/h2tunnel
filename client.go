@@ -25,7 +25,7 @@ import (
 )
 
 func runClient(args []string) {
-	startClientDirect(buildClientConfig(loadConfigFromArgs(args)))
+	startClientDirect(buildClientConfig(loadConfigFromArgs(args, "client")))
 }
 
 // clientListenerRegistry 记录客户端持有的全部监听器（TCP listener 与 UDP
@@ -92,7 +92,7 @@ func startClientDirect(cfg ClientConfig) {
 	var mgr *ConnectionManager // L3 连接管理（非 WT 传输：h2/h3/grpc/masque 的主备/分流）
 	var wtManager *WTSessionManager
 
-	if cfg.UseWT {
+	if cfg.usesWT() {
 		// WT 使用独立的 WebTransport 会话模型（自身有主/备 session 预热），不走 http.Client。
 		tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure, NextProtos: []string{http3.NextProtoH3}}
 		if cfg.ServerName != "" {
@@ -116,7 +116,7 @@ func startClientDirect(cfg ClientConfig) {
 		// 每条主/备线路拥有独立 http.Client（独立传输/连接池，传输层彼此隔离）。
 		// 业务隧道经 mgr.PickClient(typ) 取当前活跃主线路的客户端；
 		// 主线路阵亡 → 备用（含其预热传输池）升级为主 → 业务隧道立即切到备用传输。
-		if cfg.UseMasque || cfg.UseH3 {
+		if cfg.usesMasque() || cfg.usesH3() {
 			if !isHTTPS {
 				zlog.Fatalf("[Client] ❌ HTTP/3 and MASQUE require HTTPS")
 			}
@@ -126,7 +126,7 @@ func startClientDirect(cfg ClientConfig) {
 		policy := normalizePolicy(cfg.ConnectionPolicy)
 		mgr = NewConnectionManager(policy, cfg, reqUrl, nil, "CM")
 		mgr.SetClientFactory(func() *http.Client {
-			if cfg.UseMasque || cfg.UseH3 {
+			if cfg.usesMasque() || cfg.usesH3() {
 				// h3 / masque（均走 QUIC）用独立 http3.Transport（见 transport_h3.go）。
 				return newH3Transport(cfg)
 			}
@@ -148,7 +148,7 @@ func startClientDirect(cfg ClientConfig) {
 			return &http.Client{Transport: t2}
 		})
 		mgr.Start()
-		if cfg.UseMasque || cfg.UseH3 {
+		if cfg.usesMasque() || cfg.usesH3() {
 			zlog.Infof("[Client] 🚀 L3 连接管理已启用 (HTTP/3/MASQUE, 主=%d 备=%d)",
 				policy.PrimaryCount, policy.BackupCount)
 		} else {
@@ -157,36 +157,31 @@ func startClientDirect(cfg ClientConfig) {
 		}
 	}
 
-	netMode := strings.ToLower(strings.TrimSpace(cfg.Network))
-	if netMode == "" {
-		netMode = "tcp"
-	} else if netMode == "both" || netMode == "tcp+udp" || netMode == "tcp,udp" {
-		netMode = "all"
-	}
+	netMode := normalizeNetwork(cfg.Network, networkTCP)
 
-	isTCP := netMode == "tcp" || netMode == "all"
-	isUDP := netMode == "udp" || netMode == "all"
+	isTCP := netMode == networkTCP || netMode == networkAll
+	isUDP := netMode == networkUDP || netMode == networkAll
 
 	zlog.Infof("[Client] 🎯 Protocol Network Mode: [%s] (TCP Active: %v, UDP Active: %v)", netMode, isTCP, isUDP)
 
-	if netMode == "udp" {
+	if netMode == networkUDP {
 		runUDPClient(reqUrl, cfg, mgr, wtManager)
-	} else if netMode == "all" {
+	} else if netMode == networkAll {
 		cfgUDP := cfg
-		cfgUDP.Network = "udp"
+		cfgUDP.Network = networkUDP
 		go runUDPClient(reqUrl, cfgUDP, mgr, wtManager)
 		cfgTCP := cfg
-		cfgTCP.Network = "tcp"
+		cfgTCP.Network = networkTCP
 		runTCPClient(reqUrl, cfgTCP, mgr, wtManager)
 	} else {
 		cfgTCP := cfg
-		cfgTCP.Network = "tcp"
+		cfgTCP.Network = networkTCP
 		runTCPClient(reqUrl, cfgTCP, mgr, wtManager)
 	}
 }
 
 func runUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager, wtManager *WTSessionManager) {
-	if cfg.UseMasque {
+	if cfg.usesMasque() {
 		runMasqueUDPClient(cfg, mgr)
 	} else {
 		runStreamUDPClient(reqUrl, cfg, mgr, wtManager)
@@ -236,7 +231,7 @@ func runTCPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager, wtMan
 		sessionID := fmt.Sprintf("CLI-%s-%d", localConn.RemoteAddr().String(), time.Now().UnixNano()%1000)
 		zlog.Infof("[%s] 🟢 New client connection from %s", sessionID, localConn.RemoteAddr())
 
-		if cfg.UseWT {
+		if cfg.usesWT() {
 			// WT 接入 resume/2：每条隧道独立 WTSessionManager（headers 带该隧道
 			// X-Session-ID），executeResumeWT 在 stream 断后同 session id 重开新流续传。
 			wtMgr := newWTManagerForTunnel(cfg, reqUrl, sessionID)

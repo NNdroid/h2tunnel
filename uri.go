@@ -34,9 +34,9 @@ func GenerateH2TunnelURI(transport, host, port, path, target, token, sni, remark
 
 	tunType := "h2"
 	switch strings.ToLower(transport) {
-	case "h3", "http3", "quic":
+	case "h3":
 		tunType = "h3"
-	case "wt", "webtransport":
+	case "wt":
 		tunType = "wt"
 	case "masque":
 		tunType = "masque"

@@ -10,9 +10,9 @@ import (
 
 // ============================================================================
 // 1. 本地双栈转发测试 (Dual-Stack TCP + UDP 同端口并发代理)
-// 验证 network="both" 时，客户端在同个端口上同时接受并代理 TCP 和 UDP 流量
+// 验证 network="all" 时，客户端在同个端口上同时接受并代理 TCP 和 UDP 流量
 // ============================================================================
-func TestH2Tunnel_Network_DualStack_Both(t *testing.T) {
+func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 	certFile := "test_cert_dualstack.pem"
 	keyFile := "test_key_dualstack.pem"
 	generateTestCerts(certFile, keyFile)
@@ -41,14 +41,14 @@ func TestH2Tunnel_Network_DualStack_Both(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	clientListen := "127.0.0.1:23001"
-	// 启动客户端，明确配置 network="both"
+	// 启动客户端，明确配置 network="all"
 	go startClientDirect(ClientConfig{
 		ListenAddr: clientListen,
 		ServerUrl:  serverURL,
 		Path:       "/tunnel",
 		TargetAddr: targetAddr,
 		Insecure:   true,
-		Network:    "both", // 🌟 核心：双栈模式
+		Network:    "all", // 🌟 核心：双栈模式
 		Token:      testToken,
 		LogLevel:   "error",
 	})
@@ -234,7 +234,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			UseGRPC:    true, // 违规协议
+			Transport:  transportGRPC, // 违规协议
 			Token:      testToken,
 			LogLevel:   "error",
 		})
@@ -265,8 +265,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			UseMasque:  true, // 违规协议
-			Alpn:       "h2",
+			Transport:  transportMasque, // 违规协议
 			Token:      testToken,
 			LogLevel:   "error",
 		})
@@ -415,10 +414,10 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 }
 
 // ============================================================================
-// 5. 配置文件与环境变量兼容解析测试
-// 验证 Network 别名、老配置 udp: true 自动映射、环境变量覆盖
+// 5. 配置文件与环境变量解析测试
+// 验证 Network 正式值与环境变量覆盖
 // ============================================================================
-func TestH2Tunnel_Config_NetworkAliasesAndEnv(t *testing.T) {
+func TestH2Tunnel_Config_NetworkAndEnv(t *testing.T) {
 	tempDir := t.TempDir()
 
 	// 1. 测试显式 network="udp"
@@ -443,21 +442,21 @@ func TestH2Tunnel_Config_NetworkAliasesAndEnv(t *testing.T) {
 	}
 	t.Log("✅ 显式 network='udp' 成功激活 UDP 专属模式！")
 
-	// 2. 测试 network="both" / "all"
+	// 2. 测试 network="all"
 	dualJSON := `{
 		"mode": "client",
 		"listen": "127.0.0.1:1080",
 		"server": "https://example.com:8443",
-		"network": "both"
+		"network": "all"
 	}`
 	dualPath := filepath.Join(tempDir, "dual.json")
 	_ = os.WriteFile(dualPath, []byte(dualJSON), 0644)
 	dCfg, _ := loadConfigFile(dualPath)
 	dClientCfg := buildClientConfig(dCfg)
 	if !dClientCfg.IsUDP() || !dClientCfg.IsTCP() {
-		t.Fatalf("network='both' 未能同时开启 TCP 和 UDP: IsUDP=%v, IsTCP=%v", dClientCfg.IsUDP(), dClientCfg.IsTCP())
+		t.Fatalf("network='all' 未能同时开启 TCP 和 UDP: IsUDP=%v, IsTCP=%v", dClientCfg.IsUDP(), dClientCfg.IsTCP())
 	}
-	t.Log("✅ network='both' 成功同时激活 TCP 与 UDP 双栈！")
+	t.Log("✅ network='all' 成功同时激活 TCP 与 UDP 双栈！")
 
 	// 3. 测试环境变量覆盖
 	os.Setenv("H2TUNNEL_NETWORK", "udp")
@@ -466,7 +465,9 @@ func TestH2Tunnel_Config_NetworkAliasesAndEnv(t *testing.T) {
 	defer os.Unsetenv("H2TUNNEL_TRANSPORT")
 
 	envCfg := &Config{Network: "tcp", Transport: "h2"}
-	applyEnvOverrides(envCfg)
+	if err := applyEnvOverrides(envCfg); err != nil {
+		t.Fatal(err)
+	}
 	if envCfg.Network != "udp" || envCfg.Transport != "grpc" {
 		t.Fatalf("环境变量覆盖失败: %+v", envCfg)
 	}

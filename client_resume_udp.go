@@ -66,7 +66,7 @@ func newUDPSession(sessionID string, cfg ClientConfig, reqUrl string, httpClient
 		upstream:   make(chan []byte, 200),
 		done:       make(chan struct{}),
 	}
-	if cfg.UseMasque {
+	if cfg.usesMasque() {
 		s.frameW = writeUDPCapsule
 		s.frameR = readUDPCapsule
 	} else {
@@ -139,7 +139,7 @@ func (s *udpSession) runOneStream() error {
 	req := buildResumeUDPRequest(ctx, pr, s.sessionID, s.reqUrl, s.cfg)
 	var resp *http.Response
 	var err error
-	if rt, ok := s.httpClient.Transport.(http.RoundTripper); ok && s.cfg.UseMasque {
+	if rt, ok := s.httpClient.Transport.(http.RoundTripper); ok && s.cfg.usesMasque() {
 		resp, err = rt.RoundTrip(req)
 	} else {
 		resp, err = s.httpClient.Do(req)
@@ -206,7 +206,7 @@ func (s *udpSession) runOneStream() error {
 // 帧数据面：masque 用 capsule，其余用 datagram packet（不含 seq）。
 func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl string, cfg ClientConfig) *http.Request {
 	var method, reqURL string
-	if cfg.UseMasque {
+	if cfg.usesMasque() {
 		method = http.MethodConnect
 		host, port, _ := net.SplitHostPort(cfg.TargetAddr)
 		if host == "" {
@@ -238,13 +238,13 @@ func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl s
 	SetXAuth(req.Header, cfg)
 	setTunnelRequestHeaders(req.Header)
 
-	if cfg.UseMasque {
+	if cfg.usesMasque() {
 		req.Header.Set("Protocol", "connect-udp")
 		req.Header.Set("Capsule-Protocol", "?1")
 		// http3.Transport 需要显式声明 HTTP/3，否则 CONNECT 目标路径可能被改写为空
 		req.Proto = "HTTP/3"
 	}
-	if cfg.UseGRPC {
+	if cfg.usesGRPC() {
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
 	}
