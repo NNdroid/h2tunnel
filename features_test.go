@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"net"
@@ -27,7 +27,7 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 	testToken := "dualstack-token"
 
 	// 启动服务端（默认允许所有网络与传输类型）
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -42,7 +42,7 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 
 	clientListen := "127.0.0.1:23001"
 	// 启动客户端，明确配置 network="all"
-	go startClientDirect(ClientConfig{
+	go startClientDirect(clientConfig{
 		ListenAddr: clientListen,
 		ServerUrl:  serverURL,
 		Path:       "/tunnel",
@@ -117,7 +117,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 	testToken := "udponly-token"
 
 	// 服务端严格配置仅允许 UDP 代理
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -133,7 +133,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 	// A. 尝试通过客户端发起 TCP 连接 -> 服务端必须拦截（返回 403）
 	t.Run("Reject_TCP_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:24001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -164,7 +164,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 	// B. 尝试通过客户端发起 UDP 连接 -> 必须正常通行
 	t.Run("Accept_UDP_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:24002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -212,7 +212,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 	testToken := "h2only-token"
 
 	// 启动严格限定为 h2 的服务端
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -228,7 +228,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 	// A. 客户端尝试用 gRPC 协议连接 -> 服务端应拦截
 	t.Run("Reject_gRPC_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:25001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -259,7 +259,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 	// B. 客户端尝试用 MASQUE 协议连接 -> 服务端应拦截
 	t.Run("Reject_MASQUE_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:25002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -290,7 +290,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 	// C. 客户端使用标准 H2 POST 连接 -> 必须成功
 	t.Run("Accept_H2_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:25003"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -338,7 +338,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 	testToken := "localonly-token"
 
 	// 开启 LocalOnly 保护模式
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -354,7 +354,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 	// A. 请求合法本地目标 -> 允许通行
 	t.Run("Allow_Local_Target", func(t *testing.T) {
 		clientListen := "127.0.0.1:26001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -385,7 +385,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 	// B. 尝试请求外部公网目标 -> 服务端必须拦截（返回 403 Forbidden）
 	t.Run("Block_External_Public_Target", func(t *testing.T) {
 		clientListen := "127.0.0.1:26002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -438,7 +438,7 @@ func TestH2Tunnel_Config_NetworkAndEnv(t *testing.T) {
 	}
 	cConfig := buildClientConfig(cfg)
 	if !cConfig.IsUDP() || cConfig.IsTCP() {
-		t.Fatalf("ClientConfig 状态解析错误: IsUDP=%v, IsTCP=%v", cConfig.IsUDP(), cConfig.IsTCP())
+		t.Fatalf("clientConfig 状态解析错误: IsUDP=%v, IsTCP=%v", cConfig.IsUDP(), cConfig.IsTCP())
 	}
 	t.Log("✅ 显式 network='udp' 成功激活 UDP 专属模式！")
 
@@ -464,7 +464,7 @@ func TestH2Tunnel_Config_NetworkAndEnv(t *testing.T) {
 	defer os.Unsetenv("H2TUNNEL_NETWORK")
 	defer os.Unsetenv("H2TUNNEL_TRANSPORT")
 
-	envCfg := &Config{Network: "tcp", Transport: "h2"}
+	envCfg := &fileConfig{Network: "tcp", Transport: "h2"}
 	if err := applyEnvOverrides(envCfg); err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"bytes"
@@ -33,7 +33,7 @@ func TestHeartbeatIdleTunnelE2E(t *testing.T) {
 
 	serverAddr := "127.0.0.1:20901"
 	testToken := "hb-e2e-token"
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -48,7 +48,7 @@ func TestHeartbeatIdleTunnelE2E(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	clientListen := "127.0.0.1:20902"
-	go startClientDirect(ClientConfig{
+	go startClientDirect(clientConfig{
 		ListenAddr:        clientListen,
 		ServerUrl:         "https://" + serverAddr,
 		Path:              "/tunnel",

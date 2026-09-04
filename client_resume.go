@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"context"
@@ -48,8 +48,24 @@ func (s *seqWriter) Write(p []byte) (int, error) {
 // executeResumableTunnel 是启用 Resume 时客户端 TCP 入口。
 // 它建立会话表中的逻辑会话，断线后自动用同一 session id 在新 HTTP 流
 // 上续传，对 SSH 这种长流应用语义是「永不中断」（受 SessionWindowKB 限制）。
-func executeResumableTunnel(sessionID string, localConn net.Conn, reqUrl string, cfg ClientConfig, mgr *ConnectionManager) {
+func executeResumableTunnel(sessionID string, localConn net.Conn, reqUrl string, cfg clientConfig, mgr *connectionManager) {
+	_ = executeResumableTunnelContext(context.Background(), sessionID, localConn, reqUrl, cfg, mgr, nil)
+}
+
+func executeResumableTunnelContext(ctx context.Context, sessionID string, localConn net.Conn, reqUrl string, cfg clientConfig, mgr *connectionManager, ready chan<- error) error {
 	defer localConn.Close()
+	readyOnce := sync.Once{}
+	notifyReady := func(err error) {
+		if ready == nil {
+			return
+		}
+		readyOnce.Do(func() { ready <- err })
+	}
+	defer func() {
+		if ctx.Err() != nil {
+			notifyReady(ctx.Err())
+		}
+	}()
 	ringBuf := newResumeClientRingBuf(cfg.SessionWindow)
 	sessID := sessionID
 	var serverUplink uint64
@@ -57,25 +73,30 @@ func executeResumableTunnel(sessionID string, localConn net.Conn, reqUrl string,
 	// 经 L3 取当前活跃主线路的 http.Client（主断 → 备升级即切换传输池）。
 	httpClient := pickClient(mgr, "tcp")
 	if httpClient == nil {
-		zlog.Warnf("[Resume] ❌ 无可用主线路客户端，放弃隧道")
-		return
+		err := errors.New("h2tunnel: no ready transport connection")
+		notifyReady(err)
+		return err
 	}
 
 	for attempt := 1; attempt <= resumeMaxAttempts; attempt++ {
-		ok, err := runResumeAttempt(sessID, &serverUplink, &clientDownlink, localConn, ringBuf, reqUrl, cfg, httpClient)
+		ok, err := runResumeAttemptContext(ctx, sessID, &serverUplink, &clientDownlink, localConn, ringBuf, reqUrl, cfg, httpClient, func() { notifyReady(nil) })
 		if ok {
-			return // 正常结束（EOF/对端关闭）
+			return nil // 正常结束（EOF/对端关闭）
 		}
 		if err != nil {
+			if isPermanentTunnelError(err) || ctx.Err() != nil {
+				notifyReady(err)
+				return err
+			}
 			zlog.Warnf("[Resume] ❌ 会话不可恢复: %v", err)
-			return
 		}
 		// 流断：每次重拨前重新取一次主线路客户端（若主已切换，则用新传输重拨续传）
 		if mgr != nil {
 			httpClient = mgr.PickClient("tcp")
 			if httpClient == nil {
-				zlog.Warnf("[Resume] ❌ 重拨前无可用主线路客户端，放弃隧道")
-				return
+				err := errors.New("h2tunnel: no ready transport connection")
+				notifyReady(err)
+				return err
 			}
 		}
 		// backoff 后尝试恢复（同 session id，同 serverUplink）
@@ -84,14 +105,40 @@ func executeResumableTunnel(sessionID string, localConn net.Conn, reqUrl string,
 			delay = resumeBackoffMax
 		}
 		zlog.Infof("[Resume] 🔁 第 %d 次重拨（同 session 续传），等待 %v", attempt, delay)
-		time.Sleep(delay)
+		select {
+		case <-ctx.Done():
+			notifyReady(ctx.Err())
+			return ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 	zlog.Warnf("[Resume] 超过最大重试次数 (%d)，会话终止", resumeMaxAttempts)
+	err := errors.New("h2tunnel: resume attempts exhausted")
+	notifyReady(err)
+	return err
+}
+
+type tunnelHTTPError struct {
+	status int
+}
+
+func (e *tunnelHTTPError) Error() string {
+	return fmt.Sprintf("h2tunnel: server rejected tunnel with HTTP %d", e.status)
+}
+
+func isPermanentTunnelError(err error) bool {
+	var statusErr *tunnelHTTPError
+	return errors.As(err, &statusErr) || errors.Is(err, errGap) || errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrForbidden)
 }
 
 // buildResumeRequest 依据传输类型构造 resume 会话请求。
 // body 是 io.Pipe 的 reader（上行 resume 帧由 send goroutine 写入 pw）。
-func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clientDownlink *uint64, ringBuf *resumeClientRingBuf, reqUrl string, cfg ClientConfig) *http.Request {
+func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clientDownlink *uint64, ringBuf *resumeClientRingBuf, reqUrl string, cfg clientConfig) *http.Request {
+	req, _ := buildResumeRequestChecked(ctx, body, sessID, clientDownlink, ringBuf, reqUrl, cfg)
+	return req
+}
+
+func buildResumeRequestChecked(ctx context.Context, body io.Reader, sessID string, clientDownlink *uint64, ringBuf *resumeClientRingBuf, reqUrl string, cfg clientConfig) (*http.Request, error) {
 	var method, reqURL string
 	if cfg.usesMasque() {
 		// MASQUE-TCP：CONNECT masque 路径，目标由 path + X-Dst 头携带
@@ -109,7 +156,13 @@ func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clie
 		reqURL = reqUrl
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, method, reqURL, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyClientCredentials(ctx, req.Header, cfg); err != nil {
+		return nil, err
+	}
 	req.Header.Set("X-Tunnel-Proto", resumeFrameTypeResume)
 	req.Header.Set("X-Session-ID", sessID)
 	// 下行续传水位：本地已投递给应用的下行字节数（非上行环游标），服务端据此补发缺口。
@@ -124,8 +177,7 @@ func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clie
 	if cfg.CustomHost != "" {
 		req.Host = cfg.CustomHost
 	}
-	SetXDst(req.Header, cfg)
-	SetXAuth(req.Header, cfg)
+	setXDst(req.Header, cfg)
 	setTunnelRequestHeaders(req.Header)
 
 	if cfg.usesMasque() {
@@ -138,19 +190,26 @@ func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clie
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
 	}
-	return req
+	return req, nil
 }
 
 // runResumeAttempt 单条流的完整生命周期：建流 → 重放/实时 → 收 END。
 // 返回 (normalEnd=true, nil) 表示本端 EOF/对端 END；
 // (false, nil) 表示流中断（应进入下次重拨）；
-// (false, ErrGap) 表示缺口不可恢复（应终止会话）。
+// (false, errGap) 表示缺口不可恢复（应终止会话）。
 func runResumeAttempt(sessID string, serverUplink *uint64, clientDownlink *uint64,
 	localConn net.Conn, ringBuf *resumeClientRingBuf,
-	reqUrl string, cfg ClientConfig, httpClient *http.Client,
+	reqUrl string, cfg clientConfig, httpClient *http.Client,
+) (bool, error) {
+	return runResumeAttemptContext(context.Background(), sessID, serverUplink, clientDownlink, localConn, ringBuf, reqUrl, cfg, httpClient, nil)
+}
+
+func runResumeAttemptContext(parent context.Context, sessID string, serverUplink *uint64, clientDownlink *uint64,
+	localConn net.Conn, ringBuf *resumeClientRingBuf,
+	reqUrl string, cfg clientConfig, httpClient *http.Client, onReady func(),
 ) (bool, error) {
 	pr, pw := io.Pipe()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
 	// 本 attempt 结束时打断可能阻塞在 localConn.Read 的发送协程，避免旧 sendLoop
@@ -168,9 +227,12 @@ func runResumeAttempt(sessID string, serverUplink *uint64, clientDownlink *uint6
 	//  - h2 / h3 / grpc：POST cfg.Path，目标由 X-Target/X-Network 头携带
 	//  - masque-tcp：CONNECT masque 路径，目标由 URL path + X-Dst 头携带
 	// resume 帧作为内层统一数据面，各传输只贡献外层管道（grpc 仅打 Content-Type 标记）。
-	req := buildResumeRequest(ctx, pr, sessID, clientDownlink, ringBuf, reqUrl, cfg)
+	req, err := buildResumeRequestChecked(ctx, pr, sessID, clientDownlink, ringBuf, reqUrl, cfg)
+	if err != nil {
+		return false, err
+	}
 	var resp *http.Response
-	var err error
+	err = nil
 	if rt, ok := httpClient.Transport.(http.RoundTripper); ok && cfg.usesMasque() {
 		resp, err = rt.RoundTrip(req)
 	} else {
@@ -178,12 +240,12 @@ func runResumeAttempt(sessID string, serverUplink *uint64, clientDownlink *uint6
 	}
 	if err != nil {
 		zlog.Warnf("[Resume] 建流失败: %v", err)
-		return false, nil
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		zlog.Warnf("[Resume] ❌ 服务端拒绝: HTTP %d", resp.StatusCode)
-		return false, nil
+		return false, &tunnelHTTPError{status: resp.StatusCode}
 	}
 
 	if v := resp.Header.Get("X-Resume-Uplink"); v != "" {
@@ -199,7 +261,7 @@ func runResumeAttempt(sessID string, serverUplink *uint64, clientDownlink *uint6
 		} else {
 			zlog.Warnf("[Resume] ❌ 握手未确认 (X-Resume-Ack=%q)，终止", ack)
 		}
-		return false, nil
+		return false, errors.New("h2tunnel: resume handshake was not acknowledged")
 	}
 	// 以服务端回传参数为准（协商对齐）。ring 窗口保持本地配置（动态 resize 风险高），
 	// 仅记录对齐值供日志与后续心跳使用。
@@ -213,19 +275,22 @@ func runResumeAttempt(sessID string, serverUplink *uint64, clientDownlink *uint6
 	// ===== B 层握手：先发 HANDSHAKE，等 HANDSHAKE-ACK，ack 前零业务字节 =====
 	if err := writeFrame(pw, resumeFrameHandshake, 0, nil, 0); err != nil {
 		zlog.Warnf("[Resume] ❌ 写 HANDSHAKE 控制帧失败: %v", err)
-		return false, nil
+		return false, err
 	}
 	hsBuf := make([]byte, 64*1024)
 	typ, _, _, err := readFrame(resp.Body, hsBuf)
 	if err != nil {
 		zlog.Warnf("[Resume] ❌ 读 HANDSHAKE-ACK 失败: %v", err)
-		return false, nil
+		return false, err
 	}
 	if typ != resumeFrameHandshakeAck {
 		zlog.Warnf("[Resume] ❌ 期望 HANDSHAKE-ACK，收到帧 0x%02x", typ)
-		return false, nil
+		return false, errors.New("h2tunnel: invalid resume handshake response")
 	}
 	zlog.Debugf("[Resume] ✅ B 层握手确认 (HANDSHAKE→HANDSHAKE-ACK)")
+	if onReady != nil {
+		onReady()
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -265,8 +330,8 @@ func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBu
 	// 阶段 A：从 ring 重放
 	replayed, err := ringBuf.ReplayFrom(startSeq, sw)
 	if err != nil {
-		if errors.Is(err, ErrGap) {
-			return ErrGap
+		if errors.Is(err, errGap) {
+			return errGap
 		}
 		return err
 	}
@@ -331,7 +396,7 @@ func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64) 
 	expected := *clientDownlink
 	for {
 		typ, seq, n, err := readFrame(body, payloadBuf)
-		if errors.Is(err, ErrResumeEndFrame) {
+		if errors.Is(err, errResumeEndFrame) {
 			if tc, ok := localConn.(*net.TCPConn); ok {
 				_ = tc.CloseWrite()
 			}
@@ -353,7 +418,7 @@ func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64) 
 		if seq != expected {
 			zlog.Warnf("[Resume] 下行 seq 不连续: 期望 %d, 收到 %d", expected, seq)
 			*clientDownlink = expected
-			return ErrGap
+			return errGap
 		}
 		if _, wErr := localConn.Write(payloadBuf[:n]); wErr != nil {
 			*clientDownlink = expected

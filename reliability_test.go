@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"bytes"
@@ -119,7 +119,7 @@ func TestCDNStreamingHeadersAndMissingSessionID(t *testing.T) {
 	req.Header.Set("X-Network", "tcp")
 	req.Header.Set("X-Target", "127.0.0.1:1")
 	rr := httptest.NewRecorder()
-	handleH2StreamResumeServer(rr, req, "missing-id", ServerConfig{SessionWindow: 1})
+	handleH2StreamResumeServer(rr, req, "missing-id", serverConfig{SessionWindow: 1}, &sessionTable{sessions: make(map[string]*tunnelSession)})
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("missing session ID status = %d, want %d", rr.Code, http.StatusBadRequest)
 	}
@@ -129,7 +129,7 @@ func TestCDNStreamingHeadersAndMissingSessionID(t *testing.T) {
 }
 
 func TestLocalOnlyTargetPolicy(t *testing.T) {
-	cfg := ServerConfig{LocalOnly: true}
+	cfg := serverConfig{LocalOnly: true}
 	for _, target := range []string{"127.0.0.1:22", "127.0.0.42:22", "[::1]:22", "localhost:22"} {
 		if !checkTargetIsAvailable(target, cfg) {
 			t.Errorf("local target %q was rejected", target)
@@ -148,8 +148,8 @@ func TestSessionTableRejectsMissingIDAndUsesConfiguredWindow(t *testing.T) {
 	if _, _, err := table.getOrCreate("  ", func() (net.Conn, error) {
 		dialed = true
 		return nil, nil
-	}, 1, false, nil, nil); !errors.Is(err, ErrSessionIDRequired) {
-		t.Fatalf("missing id error = %v, want ErrSessionIDRequired", err)
+	}, 1, false, nil, nil); !errors.Is(err, errSessionIDRequired) {
+		t.Fatalf("missing id error = %v, want errSessionIDRequired", err)
 	}
 	if dialed {
 		t.Fatal("missing session id dialed a target")

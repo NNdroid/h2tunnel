@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"bytes"
@@ -35,9 +35,9 @@ func TestRingBufferRolling(t *testing.T) {
 	if rb.WindowStartSeq() != 1024 {
 		t.Fatalf("WindowStartSeq=%d, want 1024", rb.WindowStartSeq())
 	}
-	// seq=512（被覆盖）应返回 ErrGap
-	if _, err := rb.ReadAt(512, make([]byte, 16)); !errors.Is(err, ErrGap) {
-		t.Fatalf("expected ErrGap, got %v", err)
+	// seq=512（被覆盖）应返回 errGap
+	if _, err := rb.ReadAt(512, make([]byte, 16)); !errors.Is(err, errGap) {
+		t.Fatalf("expected errGap, got %v", err)
 	}
 	// seq=1024 起还能读到 1024 字节
 	got := make([]byte, 1024)
@@ -102,8 +102,8 @@ func TestResumeEndFrame(t *testing.T) {
 		t.Fatalf("write end: %v", err)
 	}
 	_, _, err := readResumeFrame(&wire, make([]byte, 1024))
-	if !errors.Is(err, ErrResumeEndFrame) {
-		t.Fatalf("expected ErrResumeEndFrame, got %v", err)
+	if !errors.Is(err, errResumeEndFrame) {
+		t.Fatalf("expected errResumeEndFrame, got %v", err)
 	}
 }
 
@@ -128,7 +128,7 @@ var _ io.Reader = (*bytes.Buffer)(nil)
 // h2 / grpc / masque-tcp 三种传输，各自生成正确的 method / path / 头。
 func TestResumeRequestBuilderTransports(t *testing.T) {
 	ring := newResumeClientRingBuf(256)
-	base := ClientConfig{
+	base := clientConfig{
 		ServerUrl:     "https://cdn.example.com",
 		Path:          "/tunnel",
 		TargetAddr:    "db.internal:5432",
@@ -140,7 +140,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 
 	cases := []struct {
 		name           string
-		mutate         func(*ClientConfig)
+		mutate         func(*clientConfig)
 		wantMethod     string
 		wantPathPrefix string
 		wantProto      string
@@ -148,7 +148,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 	}{
 		{
 			name:           "h2 POST",
-			mutate:         func(c *ClientConfig) {},
+			mutate:         func(c *clientConfig) {},
 			wantMethod:     "POST",
 			wantPathPrefix: "/tunnel",
 			wantProto:      "resume/2",
@@ -156,7 +156,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 		},
 		{
 			name:           "grpc POST",
-			mutate:         func(c *ClientConfig) { c.Transport = transportGRPC },
+			mutate:         func(c *clientConfig) { c.Transport = transportGRPC },
 			wantMethod:     "POST",
 			wantPathPrefix: "/tunnel",
 			wantProto:      "resume/2",
@@ -164,7 +164,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 		},
 		{
 			name:           "masque-tcp CONNECT",
-			mutate:         func(c *ClientConfig) { c.Transport = transportMasque },
+			mutate:         func(c *clientConfig) { c.Transport = transportMasque },
 			wantMethod:     "CONNECT",
 			wantPathPrefix: "/.well-known/masque/tcp/",
 			wantProto:      "resume/2",

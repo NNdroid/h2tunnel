@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/tls"
@@ -36,7 +36,7 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 	serverPort := 27443 + seq*2
 	startEchoServer(fmt.Sprintf("127.0.0.1:%d", echoPort))
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -65,7 +65,7 @@ func newInsecureHTTPClient() *http.Client {
 func TestBackupHotStandbyAlive(t *testing.T) {
 	env := startBackupTestEnv(t, 1)
 	serverURL, echoAddr := splitTestEnv(env)
-	cfg := ClientConfig{
+	cfg := clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,
@@ -106,7 +106,7 @@ func TestBackupHotStandbyAlive(t *testing.T) {
 func TestBackupTakeoverOnlyIfConfirmed(t *testing.T) {
 	env := startBackupTestEnv(t, 2)
 	serverURL, echoAddr := splitTestEnv(env)
-	cfg := ClientConfig{
+	cfg := clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,
@@ -157,7 +157,7 @@ func TestBackupTakeoverOnlyIfConfirmed(t *testing.T) {
 func TestBackupWrongTokenRejected(t *testing.T) {
 	env := startBackupTestEnv(t, 3)
 	serverURL, echoAddr := splitTestEnv(env)
-	cfg := ClientConfig{
+	cfg := clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,

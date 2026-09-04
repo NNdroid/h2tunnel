@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"fmt"
@@ -21,10 +21,12 @@ const (
 )
 
 // canonicalTransport 只做大小写和空白归一；配置仅接受文档列出的正式值。
+// canonicalTransport 归一传输类型名（大小写/空白）。供库用户校验输入。
 func canonicalTransport(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+// validTransport 校验传输类型名是否合法；allowAll 决定是否接受 "all"。
 func validTransport(value string, allowAll bool) bool {
 	switch value {
 	case transportH2, transportH2C, transportH3, transportWT, transportMasque, transportGRPC:
@@ -68,7 +70,7 @@ func normalizeTransportList(value string) (string, error) {
 }
 
 // resolveClientTransport 让 transport 字符串成为客户端唯一事实来源。
-func resolveClientTransport(cfg *Config) (string, error) {
+func resolveClientTransport(cfg *fileConfig) (string, error) {
 	transport := canonicalTransport(cfg.Transport)
 	if transport == "" {
 		return transportH2, nil
@@ -79,7 +81,7 @@ func resolveClientTransport(cfg *Config) (string, error) {
 	return transport, nil
 }
 
-func resolveClientEndpointTransport(cfg *Config, serverURL string) (string, error) {
+func resolveClientEndpointTransport(cfg *fileConfig, serverURL string) (string, error) {
 	transport, err := resolveClientTransport(cfg)
 	if err != nil {
 		return "", err
@@ -104,7 +106,7 @@ func resolveClientEndpointTransport(cfg *Config, serverURL string) (string, erro
 	return transport, nil
 }
 
-func (cfg ClientConfig) transportName() string {
+func (cfg clientConfig) transportName() string {
 	transport := canonicalTransport(cfg.Transport)
 	if transport != "" {
 		return transport
@@ -115,10 +117,10 @@ func (cfg ClientConfig) transportName() string {
 	return transportH2
 }
 
-func (cfg ClientConfig) usesH3() bool     { return cfg.transportName() == transportH3 }
-func (cfg ClientConfig) usesWT() bool     { return cfg.transportName() == transportWT }
-func (cfg ClientConfig) usesMasque() bool { return cfg.transportName() == transportMasque }
-func (cfg ClientConfig) usesGRPC() bool   { return cfg.transportName() == transportGRPC }
+func (cfg clientConfig) usesH3() bool     { return cfg.transportName() == transportH3 }
+func (cfg clientConfig) usesWT() bool     { return cfg.transportName() == transportWT }
+func (cfg clientConfig) usesMasque() bool { return cfg.transportName() == transportMasque }
+func (cfg clientConfig) usesGRPC() bool   { return cfg.transportName() == transportGRPC }
 
 func normalizeNetwork(value, fallback string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
@@ -226,7 +228,7 @@ func (p routingPolicy) allowsTransport(transport string) bool {
 	return p.transports&transportMaskFor(transport) != 0
 }
 
-func (cfg ServerConfig) effectiveRoutingPolicy() routingPolicy {
+func (cfg serverConfig) effectiveRoutingPolicy() routingPolicy {
 	if cfg.routingPolicy.ready {
 		return cfg.routingPolicy
 	}
@@ -239,7 +241,7 @@ func isNetworkAllowed(reqNet, configuredNet string) bool {
 
 // prepareServerConfig 在监听前一次性编译分流策略。请求热路径只做位运算，
 // 不再为每个请求 Split 字符串、分配 map。
-func prepareServerConfig(cfg ServerConfig) (ServerConfig, error) {
+func prepareServerConfig(cfg serverConfig) (serverConfig, error) {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8443"
 	}

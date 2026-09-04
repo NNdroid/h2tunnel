@@ -1,13 +1,13 @@
-package main
+package h2tunnel
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -17,10 +17,55 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-var Version = "1.1.0"
+var buildVersion = "1.1.0"
+
+// Version returns the build version embedded by the release workflow.
+func Version() string { return buildVersion }
+
+// zlog 是库内共享的日志器，默认 Nop（库嵌入时不打扰宿主程序的 stdout）。
+// CLI 通过 setLogLevel 初始化；库用户可用 setLogger / setLogLevel 注入。
 var zlog *zap.SugaredLogger = zap.NewNop().Sugar()
 
-type Config struct {
+// setLogger 注入自定义日志器（库嵌入推荐方式）。传 nil 恢复为静默。
+func setLogger(l *zap.SugaredLogger) {
+	if l == nil {
+		zlog = zap.NewNop().Sugar()
+		return
+	}
+	zlog = l
+}
+
+// setLogLevel 按级别构建控制台日志器并设为默认（CLI 使用）。
+func setLogLevel(levelStr string) {
+	var level zapcore.Level
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		level = zapcore.DebugLevel
+	case "info":
+		level = zapcore.InfoLevel
+	case "warn":
+		level = zapcore.WarnLevel
+	case "error":
+		level = zapcore.ErrorLevel
+	default:
+		level = zapcore.InfoLevel
+	}
+
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(encoderConfig),
+		zapcore.AddSync(os.Stdout),
+		level,
+	)
+	zlog = zap.New(core).Sugar()
+}
+
+func initLogger(levelStr string) { setLogLevel(levelStr) }
+
+type fileConfig struct {
 	Mode      string `json:"mode"`       // "server" or "client"
 	Listen    string `json:"listen"`     // Server listen address (e.g. ":8443") or client listen address (e.g. "127.0.0.1:2222")
 	Server    string `json:"server"`     // Client upstream server URL (e.g. "https://example.com:8443")
@@ -56,6 +101,9 @@ type Config struct {
 	PrimaryCount int `json:"primary_count"`
 	// BackupCount 备用连接数量；nil=默认 1，0=关闭备用。
 	BackupCount *int `json:"backup_count"`
+	// StandbyCount 是当前 CLI 使用的精简字段。旧 fileConfig 仅保留给内部测试工具；
+	// 真正的命令行解析位于 cmd/h2tunnel，且会拒绝 backup_count 等旧字段。
+	StandbyCount *int `json:"standby_connections"`
 	// PrimaryDialIntervalSec 主连接拨号间隔（秒），默认 30s（节流防重拨风暴）。
 	PrimaryDialIntervalSec int `json:"primary_dial_interval_sec"`
 	// BackupDialIntervalSec 备用连接拨号间隔（秒），默认 15s（节流防重拨风暴）。
@@ -64,7 +112,8 @@ type Config struct {
 	EstablishIntervalSec int `json:"establish_interval_sec"`
 }
 
-func applyEnvOverrides(cfg *Config) error {
+// applyEnvOverrides 用 H2TUNNEL_* 环境变量覆盖 fileConfig 字段。
+func applyEnvOverrides(cfg *fileConfig) error {
 	setString := func(key string, dst *string) {
 		if value, ok := os.LookupEnv(key); ok {
 			*dst = strings.TrimSpace(value)
@@ -147,10 +196,18 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.BackupCount = &parsed
 	}
+	if value, ok := os.LookupEnv("H2TUNNEL_STANDBY_CONNECTIONS"); ok {
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("H2TUNNEL_STANDBY_CONNECTIONS must be an integer: %w", err)
+		}
+		cfg.StandbyCount = &parsed
+	}
 	return nil
 }
 
-func validateConfig(cfg *Config) error {
+// validateConfig 校验并规范化 fileConfig（按 mode 分别校验）。
+func validateConfig(cfg *fileConfig) error {
 	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
 	if cfg.Mode == "" {
 		cfg.Mode = "server"
@@ -180,11 +237,11 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("server mode contains client-only endpoint or TLS fields")
 		}
 		if cfg.HeartbeatSec != 0 || cfg.HandshakeAckMs != 0 || cfg.KeepaliveSec != 0 ||
-			cfg.PrimaryCount != 0 || cfg.BackupCount != nil || cfg.PrimaryDialIntervalSec != 0 ||
+			cfg.PrimaryCount != 0 || cfg.BackupCount != nil || cfg.StandbyCount != nil || cfg.PrimaryDialIntervalSec != 0 ||
 			cfg.BackupDialIntervalSec != 0 || cfg.EstablishIntervalSec != 0 {
 			return fmt.Errorf("server mode contains client-only connection policy fields")
 		}
-		prepared, err := prepareServerConfig(ServerConfig{
+		prepared, err := prepareServerConfig(serverConfig{
 			EnableTLS: cfg.TLS,
 			Transport: cfg.Transport,
 			Network:   cfg.Network,
@@ -235,13 +292,17 @@ func validateConfig(cfg *Config) error {
 	if cfg.BackupCount != nil && *cfg.BackupCount < 0 {
 		return fmt.Errorf("backup_count must be >= 0")
 	}
+	if cfg.StandbyCount != nil && *cfg.StandbyCount < 0 {
+		return fmt.Errorf("standby_connections must be >= 0")
+	}
 	if cfg.PrimaryDialIntervalSec < 0 || cfg.BackupDialIntervalSec < 0 || cfg.EstablishIntervalSec < 0 {
 		return fmt.Errorf("connection interval fields must be >= 0")
 	}
 	return nil
 }
 
-type ServerConfig struct {
+// serverConfig 服务端运行时配置。可直接程序化构造（零值字段自动取默认）。
+type serverConfig struct {
 	ListenAddr    string        `json:"listen"`
 	TLSCert       string        `json:"cert"`
 	TLSKey        string        `json:"key"`
@@ -256,11 +317,26 @@ type ServerConfig struct {
 	DrainTimeout  time.Duration `json:"-"` // 由 drain_timeout_sec 换算
 	// SessionWindow 会话恢复环形缓冲容量（KB），服务端侧必须实现才能配合客户端恢复。
 	SessionWindow int `json:"-"`
+
+	// DialTarget 自定义上游拨号函数（库嵌入用）。nil 时使用默认
+	// net.Dialer{Timeout: 10s} 直连目标。外部程序可借此把隧道流量统一
+	// 引到自己的服务（net.Pipe 内存服务、unix socket、按目标 ACL 过滤等）。
+	// target 地址来自客户端 X-Target 头（LocalOnly=true 时仅允许回环地址）。
+	DialTarget func(ctx context.Context, network, addr string) (net.Conn, error) `json:"-"`
+	// API-only hooks. CLI construction maps its token and direct-address policy
+	// to these callbacks before creating a Server.
+	Authenticator      Authenticator   `json:"-"`
+	TargetDialer       TargetDialer    `json:"-"`
+	TLSConfig          *tls.Config     `json:"-"`
+	ServerContext      context.Context `json:"-"`
+	SessionIdleTimeout time.Duration   `json:"-"`
+
 	// routingPolicy 在启动时编译，供请求热路径做无分配位掩码判断。
 	routingPolicy routingPolicy
 }
 
-type ClientConfig struct {
+// clientConfig 客户端运行时配置。可直接程序化构造（零值字段自动取默认）。
+type clientConfig struct {
 	ListenAddr string `json:"listen"`
 	ServerUrl  string `json:"server"`
 	Path       string `json:"path"`
@@ -273,7 +349,7 @@ type ClientConfig struct {
 	LogLevel   string `json:"log_level"`
 	Token      string `json:"token"`
 
-	// 以下两项为客户端侧的保活与排空参数，语义同 ServerConfig
+	// 以下两项为客户端侧的保活与排空参数，语义同 serverConfig
 	HeartbeatInterval time.Duration `json:"-"`
 	DrainTimeout      time.Duration `json:"-"`
 	// SessionWindow 会话恢复环形缓冲容量（KB）
@@ -284,53 +360,30 @@ type ClientConfig struct {
 	KeepaliveSec int `json:"keepalive_sec"`
 	// RoleBackup 标记当前请求是备用线路（内部透传，由 backupLine 设置）。
 	RoleBackup bool `json:"-"`
-	// ConnectionPolicy 连接管理策略（主备数量/间隔/类型分流）。
-	ConnectionPolicy ConnectionPolicy `json:"-"`
+	// connectionPolicy 连接管理策略（主备数量/间隔/类型分流）。
+	connectionPolicy connectionPolicy   `json:"-"`
+	Credentials      CredentialProvider `json:"-"`
+	TLSConfig        *tls.Config        `json:"-"`
+	LogicalTargets   bool               `json:"-"`
 }
 
-func (c *ClientConfig) IsUDP() bool {
+func (c *clientConfig) IsUDP() bool {
 	netMode := normalizeNetwork(c.Network, networkTCP)
 	return netMode == networkUDP || netMode == networkAll
 }
 
-func (c *ClientConfig) IsTCP() bool {
+func (c *clientConfig) IsTCP() bool {
 	netMode := normalizeNetwork(c.Network, networkTCP)
 	return netMode == networkTCP || netMode == networkAll
 }
 
-func initLogger(levelStr string) {
-	var level zapcore.Level
-	switch strings.ToLower(levelStr) {
-	case "debug":
-		level = zapcore.DebugLevel
-	case "info":
-		level = zapcore.InfoLevel
-	case "warn":
-		level = zapcore.WarnLevel
-	case "error":
-		level = zapcore.ErrorLevel
-	default:
-		level = zapcore.InfoLevel
-	}
-
-	encoderConfig := zap.NewProductionEncoderConfig()
-	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-
-	core := zapcore.NewCore(
-		zapcore.NewConsoleEncoder(encoderConfig),
-		zapcore.AddSync(os.Stdout),
-		level,
-	)
-	zlog = zap.New(core).Sugar()
-}
-
-func loadConfigFile(path string) (*Config, error) {
+// loadConfigFile 从 JSON 文件加载配置（含 H2TUNNEL_* 环境变量覆盖与校验）。
+func loadConfigFile(path string) (*fileConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var cfg Config
+	var cfg fileConfig
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cfg); err != nil {
@@ -346,170 +399,6 @@ func loadConfigFile(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
-}
-
-func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "-c" || os.Args[1] == "--config" || strings.HasPrefix(os.Args[1], "-c=") || strings.HasPrefix(os.Args[1], "--config=")) {
-		confPath := "config.json"
-		if strings.Contains(os.Args[1], "=") {
-			confPath = strings.SplitN(os.Args[1], "=", 2)[1]
-		} else if len(os.Args) > 2 {
-			confPath = os.Args[2]
-		}
-		runFromConfig(confPath)
-		return
-	}
-
-	if len(os.Args) < 2 {
-		if _, err := os.Stat("config.json"); err == nil {
-			runFromConfig("config.json")
-			return
-		}
-		printUsage()
-		os.Exit(1)
-	}
-
-	switch os.Args[1] {
-	case "server":
-		runServer(os.Args[2:])
-	case "client":
-		runClient(os.Args[2:])
-	case "gen-uri":
-		runGenURI(os.Args[2:])
-	case "gen-systemd":
-		runGenSystemd(os.Args[2:])
-	case "version", "-v", "--version":
-		fmt.Printf("h2tunnel version %s\n", Version)
-	case "help", "-h", "--help":
-		printUsage()
-	default:
-		fmt.Printf("Unknown subcommand: %s\n", os.Args[1])
-		printUsage()
-		os.Exit(1)
-	}
-}
-
-func runGenURI(args []string) {
-	fs := flag.NewFlagSet("gen-uri", flag.ExitOnError)
-	cfgPath := fs.String("c", "", "Path to configuration file")
-	host := fs.String("host", "", "Server public IP or domain")
-	port := fs.String("port", "", "Server listen port")
-	path := fs.String("path", "", "Proxy path")
-	transport := fs.String("transport", "", "Transport (h2, h3, wt, masque, grpc)")
-	target := fs.String("target", "", "Forward target")
-	token := fs.String("token", "", "Token")
-	sni := fs.String("sni", "", "SNI disguise")
-	remark := fs.String("name", "", "Node remark name")
-	insecure := fs.Bool("insecure", true, "Skip TLS verify")
-	pin := fs.String("pin", "", "Share PIN (6 digits). Empty = auto-generate a random PIN")
-	_ = fs.Parse(args)
-
-	// 配置优先于内置默认，但命令行 flag 可覆盖配置中的任意字段
-	if *cfgPath != "" {
-		fileCfg, err := loadConfigFile(*cfgPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load config file %s: %v\n", *cfgPath, err)
-			os.Exit(1)
-		}
-		// 优先从 client 配置的 server URL 反解出公网 host/port
-		if *host == "" && fileCfg.Server != "" {
-			if u, err := url.Parse(fileCfg.Server); err == nil && u.Host != "" {
-				*host = u.Hostname()
-				if u.Port() != "" {
-					*port = u.Port()
-				}
-			}
-		}
-		if *port == "" && fileCfg.Listen != "" {
-			if _, p, err := net.SplitHostPort(fileCfg.Listen); err == nil {
-				*port = p
-			}
-		}
-		if *path == "" && fileCfg.Path != "" {
-			*path = fileCfg.Path
-		}
-		if *target == "" && fileCfg.Target != "" {
-			*target = fileCfg.Target
-		}
-		if *token == "" && fileCfg.Token != "" {
-			*token = fileCfg.Token
-		}
-		if *sni == "" && fileCfg.SNI != "" {
-			*sni = fileCfg.SNI
-		}
-		if *transport == "" && fileCfg.Transport != "" {
-			*transport = fileCfg.Transport
-		}
-	}
-
-	// 内置默认兜底
-	if *host == "" {
-		*host = "your-server-ip"
-	}
-	if *port == "" {
-		*port = "8443"
-	}
-	if *path == "" {
-		*path = "/tunnel"
-	}
-	if *transport == "" {
-		*transport = "h2"
-	}
-	*transport = canonicalTransport(*transport)
-	if !validTransport(*transport, false) {
-		fmt.Fprintf(os.Stderr, "Invalid transport %q\n", *transport)
-		os.Exit(1)
-	}
-	if *target == "" {
-		*target = "127.0.0.1:22"
-	}
-	if *remark == "" {
-		*remark = "H2Tunnel Node"
-	}
-
-	uri := GenerateH2TunnelURI(*transport, *host, *port, *path, *target, *token, *sni, *remark, *pin, *insecure)
-	fmt.Printf("=== 📱 h2tunnel Sharing URI ===\n\n%s\n", uri)
-	PrintTerminalQR(uri)
-}
-
-// loadConfigFromArgs parses only -c/--config and returns the merged Config.
-// The per-parameter command-line flags have been removed; the configuration
-// file and H2TUNNEL_* environment variables are the only configuration inputs.
-// When no file is given, the build*Config helpers apply secure defaults.
-func loadConfigFromArgs(args []string, mode string) *Config {
-	fs := flag.NewFlagSet("config", flag.ExitOnError)
-	c := fs.String("c", "", "Path to configuration file")
-	conf := fs.String("config", "", "Path to configuration file")
-	_ = fs.Parse(args)
-
-	cp := *c
-	if cp == "" {
-		cp = *conf
-	}
-	cfg := &Config{}
-	if cp != "" {
-		fileCfg, err := loadConfigFile(cp)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to load config file %s: %v\n", cp, err)
-			os.Exit(1)
-		}
-		if fileCfg.Mode != mode {
-			fmt.Fprintf(os.Stderr, "Config mode %q does not match %s subcommand\n", fileCfg.Mode, mode)
-			os.Exit(1)
-		}
-		cfg = fileCfg
-	} else {
-		cfg.Mode = mode
-		if err := applyEnvOverrides(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid environment configuration: %v\n", err)
-			os.Exit(1)
-		}
-		if err := validateConfig(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid configuration: %v\n", err)
-			os.Exit(1)
-		}
-	}
-	return cfg
 }
 
 // resolveHeartbeat 把秒级配置换算为心跳间隔。
@@ -562,7 +451,8 @@ func resolveHandshakeAckMs(ms int) int {
 	return ms
 }
 
-func buildServerConfig(cfg *Config) ServerConfig {
+// buildServerConfig 由文件配置构建服务端运行时配置（应用默认值）。
+func buildServerConfigChecked(cfg *fileConfig) (serverConfig, error) {
 	listen := cfg.Listen
 	if listen == "" {
 		listen = ":8443"
@@ -575,13 +465,13 @@ func buildServerConfig(cfg *Config) ServerConfig {
 	netMode := normalizeNetwork(cfg.Network, networkAll)
 	transport, err := normalizeTransportList(cfg.Transport)
 	if err != nil {
-		zlog.Fatalf("[Server] ❌ %v", err)
+		return serverConfig{}, err
 	}
 	if transport == "" {
 		transport = transportH2
 	}
 
-	return ServerConfig{
+	return serverConfig{
 		ListenAddr:    listen,
 		TLSCert:       cfg.Cert,
 		TLSKey:        cfg.Key,
@@ -594,10 +484,19 @@ func buildServerConfig(cfg *Config) ServerConfig {
 		ExpectedToken: cfg.Token,
 		DrainTimeout:  resolveDrainTimeout(cfg.DrainTimeoutSec),
 		SessionWindow: resolveSessionWindow(cfg.SessionWindowKB),
-	}
+	}, nil
 }
 
-func buildClientConfig(cfg *Config) ClientConfig {
+func buildServerConfig(cfg *fileConfig) serverConfig {
+	result, err := buildServerConfigChecked(cfg)
+	if err != nil {
+		panic(err)
+	}
+	return result
+}
+
+// buildClientConfig 由文件配置构建客户端运行时配置（应用默认值与连接策略）。
+func buildClientConfigChecked(cfg *fileConfig) (clientConfig, error) {
 	listen := cfg.Listen
 	if listen == "" {
 		listen = "127.0.0.1:2222"
@@ -608,7 +507,7 @@ func buildClientConfig(cfg *Config) ClientConfig {
 	}
 	transport, err := resolveClientEndpointTransport(cfg, server)
 	if err != nil {
-		zlog.Fatalf("[Client] ❌ %s", err)
+		return clientConfig{}, err
 	}
 	path := normalizeTunnelPath(cfg.Path)
 	target := cfg.Target
@@ -621,15 +520,21 @@ func buildClientConfig(cfg *Config) ClientConfig {
 	}
 	netMode := normalizeNetwork(cfg.Network, networkTCP)
 	if !validNetwork(netMode) {
-		zlog.Fatalf("[Client] ❌ unsupported network %q", cfg.Network)
+		return clientConfig{}, fmt.Errorf("unsupported network %q", cfg.Network)
 	}
 	primaryNetworks := []string{netMode}
 	backupCount := defaultBackupCount
 	if cfg.BackupCount != nil {
 		if *cfg.BackupCount < 0 {
-			zlog.Fatalf("[Client] ❌ backup_count must be >= 0")
+			return clientConfig{}, fmt.Errorf("backup_count must be >= 0")
 		}
 		backupCount = *cfg.BackupCount
+	}
+	if cfg.StandbyCount != nil {
+		if *cfg.StandbyCount < 0 {
+			return clientConfig{}, fmt.Errorf("standby_connections must be >= 0")
+		}
+		backupCount = *cfg.StandbyCount
 	}
 	policy := resolveConnectionPolicy(
 		cfg.PrimaryCount, backupCount,
@@ -637,7 +542,7 @@ func buildClientConfig(cfg *Config) ClientConfig {
 		cfg.EstablishIntervalSec, defaultBackupMissedAck, primaryNetworks,
 	)
 
-	return ClientConfig{
+	return clientConfig{
 		ListenAddr:        listen,
 		ServerUrl:         server,
 		Path:              path,
@@ -654,34 +559,14 @@ func buildClientConfig(cfg *Config) ClientConfig {
 		SessionWindow:     resolveSessionWindow(cfg.SessionWindowKB),
 		HandshakeAckMs:    resolveHandshakeAckMs(cfg.HandshakeAckMs),
 		KeepaliveSec:      resolveKeepaliveSec(cfg.KeepaliveSec),
-		ConnectionPolicy:  policy,
-	}
+		connectionPolicy:  policy,
+	}, nil
 }
 
-func runFromConfig(path string) {
-	cfg, err := loadConfigFile(path)
+func buildClientConfig(cfg *fileConfig) clientConfig {
+	result, err := buildClientConfigChecked(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read config file %s: %v\n", path, err)
-		os.Exit(1)
+		panic(err)
 	}
-	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
-	case "client":
-		startClientDirect(buildClientConfig(cfg))
-	case "", "server":
-		startServerDirect(buildServerConfig(cfg))
-	default:
-		fmt.Fprintf(os.Stderr, "Invalid mode %q: expected server or client\n", cfg.Mode)
-		os.Exit(1)
-	}
-}
-
-func printUsage() {
-	fmt.Println("Usage: h2tunnel <command> [options] or h2tunnel -c config.json")
-	fmt.Println("\nCommands:")
-	fmt.Println("  server       Start h2tunnel multiplexing proxy server")
-	fmt.Println("  client       Start h2tunnel proxy client")
-	fmt.Println("  gen-uri      Generate Stun client sharing URI link & QR Code")
-	fmt.Println("  gen-systemd  Generate Linux systemd service unit")
-	fmt.Println("  version      Show version information")
-	fmt.Println("  help         Show help message")
+	return result
 }

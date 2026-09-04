@@ -1,9 +1,10 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -42,12 +43,13 @@ const (
 //	           甚至有害（会重发已发出的包），因此只做「保持 targetConn
 //	           socket 存活 + 跨流重建」，不做重放。
 //
-// kind 在 prepareResumeSession 拨号前由 GetXNetwork 决定并写入。
+// kind 在 prepareResumeSession 拨号前由 getXNetwork 决定并写入。
 type tunnelSession struct {
 	id        string
 	createdAt time.Time
 	lastSeen  time.Time // 最后一次活跃（用于超时回收）
 	datagram  bool      // true = UDP 数据报模式（无 seq 重放）
+	binding   sessionBinding
 
 	mu              sync.Mutex
 	targetConn      net.Conn
@@ -129,11 +131,11 @@ func (s *tunnelSession) clearActiveWriter(w *resumeSessionWriter) {
 
 // replayDownlink 从 fromSeq 起将已写入 ring 但未到达客户端的字节
 // 补发到当前活跃 writer。不再 Append ring（避免重复）。
-// 若 ring 窗口已被覆盖（fromSeq < windowStart），返回 ErrGap。
+// 若 ring 窗口已被覆盖（fromSeq < windowStart），返回 errGap。
 //
 // ⚠️ 并发约束：重放期间必须持有 s.mu。downlinkPump 的 writeDownlink 同样需要
 // s.mu 才能写 activeWriter；持锁期间 pump 的实时下行写被阻塞，保证「重放帧」
-// 与「实时下行帧」不会并发写入同一条流（否则帧交叠 + seq 乱序，客户端判 ErrGap
+// 与「实时下行帧」不会并发写入同一条流（否则帧交叠 + seq 乱序，客户端判 errGap
 // 直接断流）。锁内 downlinkSent 被冻结，重放完成后 pump 的实时帧从 target 处
 // 无缝续传，既不缺口也不重复。
 // 写失败时由 writeDownlink 和调用方的 defer 清理 activeWriter；writer 不会
@@ -155,8 +157,8 @@ func (s *tunnelSession) replayDownlink(w *resumeSessionWriter, fromSeq uint64) e
 			}
 			seq += uint64(n)
 		}
-		if errors.Is(err, ErrGap) {
-			return ErrGap
+		if errors.Is(err, errGap) {
+			return errGap
 		}
 		if err != nil {
 			return err
@@ -199,7 +201,7 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 		data = data[skip:]
 	case seq > expected:
 		// 客户端跳了 seq：缺口不可恢复
-		return ErrResumeBadSeq
+		return errResumeBadSeq
 	}
 	if _, err := s.targetConn.Write(data); err != nil {
 		return err
@@ -209,15 +211,25 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 	return nil
 }
 
-// sessionTable 全局会话表
+// sessionTable 服务端会话表（实例级，挂在 Server 上；库嵌入时多个
+// Server 互不共享）。
 type sessionTable struct {
-	mu       sync.Mutex
-	sessions map[string]*tunnelSession
+	mu          sync.Mutex
+	sessions    map[string]*tunnelSession
+	idleTimeout time.Duration
 }
 
-var globalSessionTable = &sessionTable{sessions: make(map[string]*tunnelSession)}
+type sessionBinding struct {
+	network     string
+	target      string
+	principalID string
+}
 
-var ErrSessionIDRequired = errors.New("resume session id is required")
+func (b sessionBinding) matches(other sessionBinding) bool {
+	return b.network == other.network && b.target == other.target && b.principalID == other.principalID
+}
+
+var errSessionIDRequired = errors.New("resume session id is required")
 
 func newSessionID() string {
 	var b [16]byte
@@ -229,8 +241,12 @@ func newSessionID() string {
 // dialTarget 是拨号函数（测试时可注入）。
 // datagram/frameW/frameR 仅在新建会话时使用（datagram 为 true 时设置数据面封装）。
 func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error), sizeKB int, datagram bool, frameW func(io.Writer, []byte) error, frameR func(io.Reader, []byte) (int, error)) (*tunnelSession, bool, error) {
+	return t.getOrCreateBound(id, sessionBinding{}, dialTarget, sizeKB, datagram, frameW, frameR)
+}
+
+func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialTarget func() (net.Conn, error), sizeKB int, datagram bool, frameW func(io.Writer, []byte) error, frameR func(io.Reader, []byte) (int, error)) (*tunnelSession, bool, error) {
 	if strings.TrimSpace(id) == "" {
-		return nil, false, ErrSessionIDRequired
+		return nil, false, errSessionIDRequired
 	}
 
 	// Do not hold the table lock while dialing: a slow/unreachable target must
@@ -238,7 +254,11 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 	t.mu.Lock()
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
+		bindingMatches := existing.binding.matches(binding)
 		alive := !existing.closed && existing.targetConn != nil
+		if !bindingMatches {
+			return nil, false, fmt.Errorf("%w: resume session identity changed", ErrForbidden)
+		}
 		if alive {
 			existing.lastSeen = time.Now()
 		}
@@ -261,6 +281,7 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 		lastSeen:     time.Now(),
 		targetConn:   tconn,
 		datagram:     datagram,
+		binding:      binding,
 		frameW:       frameW,
 		frameR:       frameR,
 		downlinkRing: newRingBuffer(sizeKB),
@@ -271,7 +292,11 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 	t.mu.Lock()
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
+		bindingMatches := existing.binding.matches(binding)
 		alive := !existing.closed && existing.targetConn != nil
+		if !bindingMatches {
+			return nil, false, fmt.Errorf("%w: resume session identity changed", ErrForbidden)
+		}
 		if alive {
 			existing.lastSeen = time.Now()
 		}
@@ -301,13 +326,17 @@ func (t *sessionTable) remove(id string) {
 func (t *sessionTable) reapIdle() {
 	t.mu.Lock()
 	now := time.Now()
+	idleTimeout := t.idleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = sessionIdleTimeout
+	}
 	var toRemove []string
 	for id, s := range t.sessions {
 		s.mu.Lock()
 		idle := now.Sub(s.lastSeen)
 		dead := s.closed || s.targetConn == nil
 		s.mu.Unlock()
-		if dead || idle > sessionIdleTimeout {
+		if dead || idle > idleTimeout {
 			toRemove = append(toRemove, id)
 		}
 	}
@@ -505,7 +534,7 @@ func (w *resumeSessionWriter) close() {
 // 调用方负责后续：① 响应头写 X-Resume-Uplink ② 进入帧循环读上行 ③ 通知下行泵绑定活跃 writer
 func (t *sessionTable) prepareResumeSession(r *http.Request, dialTarget func() (net.Conn, error), sessionWindowKB int) (*tunnelSession, bool, error) {
 	id := r.Header.Get("X-Session-ID")
-	network := GetXNetwork(r)
+	network := getXNetwork(r)
 	datagram := network == "udp"
 	var frameW func(io.Writer, []byte) error
 	var frameR func(io.Reader, []byte) (int, error)
@@ -518,7 +547,9 @@ func (t *sessionTable) prepareResumeSession(r *http.Request, dialTarget func() (
 			frameR = readUDPPacket
 		}
 	}
-	return t.getOrCreate(id, dialTarget, sessionWindowKB, datagram, frameW, frameR)
+	state := requestState(r)
+	binding := sessionBinding{network: network, target: getXTarget(r), principalID: state.principal.ID}
+	return t.getOrCreateBound(id, binding, dialTarget, sessionWindowKB, datagram, frameW, frameR)
 }
 
 // parseResumeDownlink 从请求头解析客户端已收到的下行字节数
@@ -534,17 +565,26 @@ func parseResumeDownlink(r *http.Request) uint64 {
 	return n
 }
 
-// startSessionReaper 启动后台回收器（只启动一次）
-var reaperOnce sync.Once
+// runReaper 实例级会话回收器（Server 启动时调用，停止由关闭 stopCh 控制）。
+func (t *sessionTable) runReaper(stopCh <-chan struct{}) {
+	tick := time.NewTicker(sessionCleanupTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-tick.C:
+			t.reapIdle()
+		}
+	}
+}
 
-func startSessionReaper() {
-	reaperOnce.Do(func() {
-		go func() {
-			t := time.NewTicker(sessionCleanupTick)
-			defer t.Stop()
-			for range t.C {
-				globalSessionTable.reapIdle()
-			}
-		}()
-	})
+// closeAll 关闭表中所有会话（Server.Close/Shutdown 时调用）。
+func (t *sessionTable) closeAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, s := range t.sessions {
+		s.close()
+	}
+	t.sessions = make(map[string]*tunnelSession)
 }

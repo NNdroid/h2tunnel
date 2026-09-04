@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/rand"
@@ -22,8 +22,8 @@ func setupBenchmarkEnv() (serverURL, targetAddr, testToken string) {
 	serverURL = "https://" + serverAddr
 	testToken = "bench-token"
 
-	// 启动服务端 (config-only: 直接构造 ServerConfig)
-	go startServerDirect(ServerConfig{
+	// 启动服务端 (config-only: 直接构造 serverConfig)
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -64,10 +64,10 @@ func BenchmarkH2TunnelAllProtocols(b *testing.B) {
 		{"MASQUE_UDP", "30010", true, []string{"-udp", "-masque"}},
 	}
 
-	// 提前启动所有的客户端进行预热 (协议开关映射到 ClientConfig 字段)
+	// 提前启动所有的客户端进行预热 (协议开关映射到 clientConfig 字段)
 	for _, tc := range cases {
 		clientListen := "127.0.0.1:" + tc.clientPort
-		cc := ClientConfig{
+		cc := clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",

@@ -1,6 +1,7 @@
-package main
+package h2tunnel
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
@@ -80,8 +81,8 @@ func fastRand(max int) int {
 	return mrand.Intn(max)
 }
 
-// NormalizeTargetAddr 标准化目标地址（支持 IP:Port 与 Domain:Port）
-func NormalizeTargetAddr(addr, defaultPort string) string {
+// normalizeTargetAddr 标准化目标地址（支持 IP:Port 与 Domain:Port）
+func normalizeTargetAddr(addr, defaultPort string) string {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return ""
@@ -100,8 +101,8 @@ func NormalizeTargetAddr(addr, defaultPort string) string {
 	return addr
 }
 
-// IsValidTargetAddr 校验目标地址（支持 IPv4 / IPv6 / 域名 + 端口）
-func IsValidTargetAddr(addr string) bool {
+// isValidTargetAddr 校验目标地址（支持 IPv4 / IPv6 / 域名 + 端口）
+func isValidTargetAddr(addr string) bool {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil || host == "" {
 		return false
@@ -113,7 +114,7 @@ func IsValidTargetAddr(addr string) bool {
 	return true
 }
 
-func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
+func checkTargetIsAvailable(target string, cfg serverConfig) bool {
 	if target == "" {
 		return false
 	}
@@ -134,7 +135,7 @@ func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
 	return true
 }
 
-func GetDefaultQUICConfig() *quic.Config {
+func getDefaultQUICConfig() *quic.Config {
 	return &quic.Config{
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true,
@@ -150,7 +151,7 @@ func GetDefaultQUICConfig() *quic.Config {
 	}
 }
 
-func GetXNetwork(r *http.Request) string {
+func getXNetwork(r *http.Request) string {
 	network := r.Header.Get("X-Network")
 	if network != "udp" {
 		network = "tcp"
@@ -158,16 +159,16 @@ func GetXNetwork(r *http.Request) string {
 	return network
 }
 
-func GetXTarget(r *http.Request) string {
+func getXTarget(r *http.Request) string {
 	target := r.Header.Get("X-Target")
 	return target
 }
 
-func GetXDst(r *http.Request) (string, string) {
-	network := GetXNetwork(r)
-	target := GetXTarget(r)
+func getXDst(r *http.Request) (string, string) {
+	network := getXNetwork(r)
+	target := getXTarget(r)
 
-	if target == "" || !IsValidTargetAddr(target) { // 当目标为空或非法时，使用默认值
+	if target == "" || !isValidTargetAddr(target) { // 当目标为空或非法时，使用默认值
 		switch network {
 		case "udp":
 			target = "127.0.0.1:53" // DNS
@@ -179,15 +180,22 @@ func GetXDst(r *http.Request) (string, string) {
 	return network, target
 }
 
-func SetXNetwork(h http.Header, network string) {
+func getRequestDestination(r *http.Request, cfg serverConfig) (string, string) {
+	if cfg.TargetDialer != nil {
+		return getXNetwork(r), strings.TrimSpace(getXTarget(r))
+	}
+	return getXDst(r)
+}
+
+func setXNetwork(h http.Header, network string) {
 	h.Set("X-Network", network)
 }
 
-func SetXTarget(h http.Header, target string) {
+func setXTarget(h http.Header, target string) {
 	h.Set("X-Target", target)
 }
 
-func SetXDst(h http.Header, cfg ClientConfig) (string, string) {
+func setXDst(h http.Header, cfg clientConfig) (string, string) {
 	network := "tcp"
 	if normalizeNetwork(cfg.Network, networkTCP) == networkUDP {
 		network = "udp"
@@ -196,27 +204,41 @@ func SetXDst(h http.Header, cfg ClientConfig) (string, string) {
 	if network == "udp" {
 		defaultPort = "53"
 	}
+	if cfg.LogicalTargets {
+		target := strings.TrimSpace(cfg.TargetAddr)
+		setXNetwork(h, network)
+		setXTarget(h, target)
+		return network, target
+	}
 
-	target := NormalizeTargetAddr(cfg.TargetAddr, defaultPort)
-	if !IsValidTargetAddr(target) {
+	target := normalizeTargetAddr(cfg.TargetAddr, defaultPort)
+	if !isValidTargetAddr(target) {
 		if network == "udp" {
 			target = "127.0.0.1:53"
 		} else {
 			target = "127.0.0.1:22"
 		}
 	}
-	SetXNetwork(h, network)
-	SetXTarget(h, target)
+	setXNetwork(h, network)
+	setXTarget(h, target)
 	return network, target
 }
 
-func SetXAuth(h http.Header, cfg ClientConfig) {
+func setXAuth(h http.Header, cfg clientConfig) {
 	if cfg.Token == "" {
 		return
 	}
 	// 自定义头与标准 Authorization 均可穿过常见 CDN / 反代。
 	h.Set("X-Auth-Token", cfg.Token)
 	h.Set("Authorization", "Bearer "+cfg.Token)
+}
+
+func applyClientCredentials(ctx context.Context, h http.Header, cfg clientConfig) error {
+	if cfg.Credentials != nil {
+		return cfg.Credentials(ctx, h)
+	}
+	setXAuth(h, cfg)
+	return nil
 }
 
 // setTunnelRequestHeaders 设置隧道请求侧的反缓冲头，与 server 端的
@@ -314,7 +336,7 @@ func parseMasqueTarget(protocol, reqPath string) (string, error) {
 	}
 
 	target := net.JoinHostPort(host, port)
-	if !IsValidTargetAddr(target) {
+	if !isValidTargetAddr(target) {
 		return "", fmt.Errorf("invalid parsed masque target: %s", target)
 	}
 	zlog.Debugf("[Protocol] 🎯 MASQUE URI 解析成功 -> 解析出目标: %s", target)

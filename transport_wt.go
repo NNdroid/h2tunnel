@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"context"
@@ -21,7 +21,7 @@ import (
 // WebTransport（WT）传输层 adapter
 //
 // WT 已从「独立会话模型」收编进 resume/2 引擎：每条业务隧道拥有自己的
-// WTSessionManager（headers 携带该隧道 X-Session-ID + resume A 层协商头），
+// wtSessionManager（headers 携带该隧道 X-Session-ID + resume A 层协商头），
 // 服务端把每个业务 stream 派发到 v2 会话表（prepareResumeSession），
 // 与 h2/grpc/masque 同级：ring buffer 上行重放 + 服务端 targetConn 保留 +
 // A/B 握手。断线（stream 断）后用同一 session id 重开新流续传。
@@ -30,19 +30,20 @@ import (
 // 数据面 HANDSHAKE 帧 payload 透传，使服务端能从正确位置补发下行缺口。
 // =========================================
 
-type WTSessionManager struct {
+type wtSessionManager struct {
 	dialer  *webtransport.Dialer
 	reqUrl  string
 	headers http.Header
 	mu      sync.Mutex
 	primary *webtransport.Session
 	backup  *webtransport.Session
+	ctx     context.Context
 }
 
 // GetSession 返回当前可用 session：主健康则主，否则备用顶上；
-// 命中后异步触发备用预热（与 L3 ConnectionManager 的主备/错相思路一致：
+// 命中后异步触发备用预热（与 L3 connectionManager 的主备/错相思路一致：
 // 任意时刻至少两条可用 session 且状态不同，CDN 或 NAT 强杀不致两者同死）。
-func (m *WTSessionManager) GetSession(ctx context.Context) (*webtransport.Session, error) {
+func (m *wtSessionManager) GetSession(ctx context.Context) (*webtransport.Session, error) {
 	// 快路径：主健康
 	m.mu.Lock()
 	if m.primary != nil && m.primary.Context().Err() == nil {
@@ -73,8 +74,12 @@ func (m *WTSessionManager) GetSession(ctx context.Context) (*webtransport.Sessio
 	return m.dialAndInstall(ctx)
 }
 
-func (m *WTSessionManager) warmupBackup() {
-	session, err := m.dialSession(context.Background())
+func (m *wtSessionManager) warmupBackup() {
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session, err := m.dialSession(ctx)
 	if err != nil {
 		zlog.Debugf("[WT Manager] 备用 session 预热失败: %v", err)
 		return
@@ -88,7 +93,7 @@ func (m *WTSessionManager) warmupBackup() {
 	zlog.Debugf("[WT Manager] 🔥 备用 session 已预热")
 }
 
-func (m *WTSessionManager) dialAndInstall(ctx context.Context) (*webtransport.Session, error) {
+func (m *wtSessionManager) dialAndInstall(ctx context.Context) (*webtransport.Session, error) {
 	zlog.Debugf("[WT Manager] Initiating WebTransport handshake...")
 	start := time.Now()
 	session, err := m.dialSession(ctx)
@@ -104,24 +109,37 @@ func (m *WTSessionManager) dialAndInstall(ctx context.Context) (*webtransport.Se
 	return session, nil
 }
 
-func (m *WTSessionManager) dialSession(ctx context.Context) (*webtransport.Session, error) {
+func (m *wtSessionManager) dialSession(ctx context.Context) (*webtransport.Session, error) {
 	_, session, err := m.dialer.Dial(ctx, m.reqUrl, m.headers)
 	return session, err
 }
 
-// newWTManagerForTunnel 为单条业务隧道构建独立的 WTSessionManager。
+// newWTManagerForTunnel 为单条业务隧道构建独立的 wtSessionManager。
 // 每条隧道拥有自己的 WT session（headers 携带该隧道的 X-Session-ID 与 resume
 // A 层协商头），使服务端能按 session id 区分多隧道并各自续传——这是 WT 接入
 // resume/2 会话表的前提（一个 WT session 对应一个逻辑会话）。
-func newWTManagerForTunnel(cfg ClientConfig, reqUrl, sessionID string) *WTSessionManager {
-	tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure, NextProtos: []string{http3.NextProtoH3}}
+func newWTManagerForTunnel(cfg clientConfig, reqUrl, sessionID string) *wtSessionManager {
+	mgr, _ := newWTManagerForTunnelContext(context.Background(), cfg, reqUrl, sessionID)
+	return mgr
+}
+
+func newWTManagerForTunnelContext(ctx context.Context, cfg clientConfig, reqUrl, sessionID string) (*wtSessionManager, error) {
+	var tlsConfig *tls.Config
+	if cfg.TLSConfig != nil {
+		tlsConfig = cfg.TLSConfig.Clone()
+	} else {
+		tlsConfig = &tls.Config{InsecureSkipVerify: cfg.Insecure}
+	}
+	tlsConfig.NextProtos = []string{http3.NextProtoH3}
 	if cfg.ServerName != "" {
 		tlsConfig.ServerName = cfg.ServerName
 	}
 	headers := make(http.Header)
+	if err := applyClientCredentials(ctx, headers, cfg); err != nil {
+		return nil, err
+	}
 	headers.Set("Protocol", "webtransport")
-	SetXDst(headers, cfg)
-	SetXAuth(headers, cfg)
+	setXDst(headers, cfg)
 	// resume/2 A 层协商头（X-Resume-Downlink 为 per-stream 值，经数据面 HANDSHAKE
 	// 帧 payload 透传，不在此设置）。
 	headers.Set("X-Tunnel-Proto", resumeFrameTypeResume)
@@ -132,14 +150,15 @@ func newWTManagerForTunnel(cfg ClientConfig, reqUrl, sessionID string) *WTSessio
 	if cfg.RoleBackup {
 		headers.Set("X-Resume-Role", "backup")
 	}
-	return &WTSessionManager{
+	return &wtSessionManager{
 		dialer: &webtransport.Dialer{
 			TLSClientConfig: tlsConfig,
-			QUICConfig:      GetDefaultQUICConfig(),
+			QUICConfig:      getDefaultQUICConfig(),
 		},
 		reqUrl:  reqUrl,
 		headers: headers,
-	}
+		ctx:     ctx,
+	}, nil
 }
 
 // ---> 客户端 TCP: WebTransport（resume/2 接入）
@@ -147,20 +166,44 @@ func newWTManagerForTunnel(cfg ClientConfig, reqUrl, sessionID string) *WTSessio
 // 与 h2/grpc/masque 同级：ring buffer 上行重放 + 服务端 targetConn 保留 +
 // A/B 握手。clientDownlink（本地已收下行字节）经数据面 HANDSHAKE 帧 payload 透传，
 // 使服务端能从正确位置补发下行缺口。
-func executeResumeWT(localConn net.Conn, cfg ClientConfig, wtManager *WTSessionManager, sessionID string) {
+func executeResumeWT(localConn net.Conn, cfg clientConfig, wtManager *wtSessionManager, sessionID string) {
+	_ = executeResumeWTWithManagerContext(context.Background(), localConn, cfg, wtManager, sessionID, nil)
+}
+
+func executeResumeWTContext(ctx context.Context, localConn net.Conn, cfg clientConfig, reqURL, sessionID string, ready chan<- error) error {
+	wtManager, err := newWTManagerForTunnelContext(ctx, cfg, reqURL, sessionID)
+	if err != nil {
+		if ready != nil {
+			ready <- err
+		}
+		return err
+	}
+	return executeResumeWTWithManagerContext(ctx, localConn, cfg, wtManager, sessionID, ready)
+}
+
+func executeResumeWTWithManagerContext(ctx context.Context, localConn net.Conn, cfg clientConfig, wtManager *wtSessionManager, sessionID string, ready chan<- error) error {
 	defer localConn.Close()
+	readyOnce := sync.Once{}
+	notifyReady := func(err error) {
+		if ready != nil {
+			readyOnce.Do(func() { ready <- err })
+		}
+	}
 	ringBuf := newResumeClientRingBuf(cfg.SessionWindow)
 	var serverUplink uint64
 	var clientDownlink uint64
 
 	for attempt := 1; attempt <= resumeMaxAttempts; attempt++ {
-		ok, err := runResumeWTTry(sessionID, &serverUplink, &clientDownlink, localConn, ringBuf, cfg, wtManager)
+		ok, err := runResumeWTTryContext(ctx, sessionID, &serverUplink, &clientDownlink, localConn, ringBuf, cfg, wtManager, func() { notifyReady(nil) })
 		if ok {
-			return // 正常结束（EOF/对端 END）
+			return nil // 正常结束（EOF/对端 END）
 		}
 		if err != nil {
+			if isPermanentTunnelError(err) || ctx.Err() != nil {
+				notifyReady(err)
+				return err
+			}
 			zlog.Warnf("[Resume/WT] ❌ 会话不可恢复: %v", err)
-			return
 		}
 		// stream 断：同 session id 重开新流续传（backoff 后）。
 		delay := time.Duration(attempt) * 200 * time.Millisecond
@@ -168,16 +211,30 @@ func executeResumeWT(localConn net.Conn, cfg ClientConfig, wtManager *WTSessionM
 			delay = resumeBackoffMax
 		}
 		zlog.Infof("[Resume/WT] 🔁 第 %d 次重开 WT 流（同 session 续传），等待 %v", attempt, delay)
-		time.Sleep(delay)
+		select {
+		case <-ctx.Done():
+			notifyReady(ctx.Err())
+			return ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 	zlog.Warnf("[Resume/WT] 超过最大重试次数 (%d)，会话终止", resumeMaxAttempts)
+	err := errors.New("h2tunnel: WebTransport resume attempts exhausted")
+	notifyReady(err)
+	return err
 }
 
 // runResumeWTTry 单条 WT 流的完整生命周期：建流 → B 层握手（携带 clientDownlink）
 // → 上行重放/实时 + 下行收帧。返回 (normalEnd, err) 语义同 runResumeAttempt。
 func runResumeWTTry(sessionID string, serverUplink, clientDownlink *uint64,
-	localConn net.Conn, ringBuf *resumeClientRingBuf, cfg ClientConfig,
-	wtManager *WTSessionManager) (bool, error) {
+	localConn net.Conn, ringBuf *resumeClientRingBuf, cfg clientConfig,
+	wtManager *wtSessionManager) (bool, error) {
+	return runResumeWTTryContext(context.Background(), sessionID, serverUplink, clientDownlink, localConn, ringBuf, cfg, wtManager, nil)
+}
+
+func runResumeWTTryContext(ctx context.Context, sessionID string, serverUplink, clientDownlink *uint64,
+	localConn net.Conn, ringBuf *resumeClientRingBuf, cfg clientConfig,
+	wtManager *wtSessionManager, onReady func()) (bool, error) {
 
 	// 本 attempt 结束时打断可能阻塞在 localConn.Read 的发送协程，避免旧 sendLoop
 	// 与下一 attempt 的 sendLoop 并发读同一条连接（见 resumeSendLoop 的 done 参数）。
@@ -188,16 +245,15 @@ func runResumeWTTry(sessionID string, serverUplink, clientDownlink *uint64,
 	}()
 	_ = localConn.SetReadDeadline(time.Time{})
 
-	ctx := context.Background()
 	session, err := wtManager.GetSession(ctx)
 	if err != nil || session == nil {
 		zlog.Warnf("[Resume/WT] ❌ 无法获取 WT Session: %v", err)
-		return false, nil
+		return false, err
 	}
 	stream, err := session.OpenStreamSync(ctx)
 	if err != nil || stream == nil {
 		zlog.Warnf("[Resume/WT] ❌ WT Stream 打开失败: %v", err)
-		return false, nil
+		return false, err
 	}
 	defer stream.Close()
 
@@ -205,19 +261,22 @@ func runResumeWTTry(sessionID string, serverUplink, clientDownlink *uint64,
 	payload := strconv.FormatUint(*clientDownlink, 10)
 	if err := writeFrame(stream, resumeFrameHandshake, 0, []byte(payload), 0); err != nil {
 		zlog.Warnf("[Resume/WT] ❌ 写 HANDSHAKE 控制帧失败: %v", err)
-		return false, nil
+		return false, err
 	}
 	hsBuf := make([]byte, 64*1024)
 	typ, _, _, err := readFrame(stream, hsBuf)
 	if err != nil {
 		zlog.Warnf("[Resume/WT] ❌ 读 HANDSHAKE-ACK 失败: %v", err)
-		return false, nil
+		return false, err
 	}
 	if typ != resumeFrameHandshakeAck {
 		zlog.Warnf("[Resume/WT] ❌ 期望 HANDSHAKE-ACK，收到帧 0x%02x", typ)
-		return false, nil
+		return false, errors.New("h2tunnel: invalid WebTransport handshake response")
 	}
 	zlog.Infof("[Resume/WT] ✅ B 层握手确认 (clientDownlink=%d)", *clientDownlink)
+	if onReady != nil {
+		onReady()
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -248,7 +307,7 @@ func resumeRecvLoopWT(stream io.Reader, localConn net.Conn, clientDownlink *uint
 	expected := *clientDownlink // 下行坐标系跨流连续：重连流首帧 seq 必须等于上次已收字节数
 	for {
 		typ, seq, n, err := readFrame(stream, payloadBuf)
-		if errors.Is(err, ErrResumeEndFrame) {
+		if errors.Is(err, errResumeEndFrame) {
 			if tc, ok := localConn.(*net.TCPConn); ok {
 				_ = tc.CloseWrite()
 			}
@@ -269,7 +328,7 @@ func resumeRecvLoopWT(stream io.Reader, localConn net.Conn, clientDownlink *uint
 		if seq != expected {
 			zlog.Warnf("[Resume/WT] 下行 seq 不连续: 期望 %d, 收到 %d", expected, seq)
 			*clientDownlink = expected
-			return ErrGap
+			return errGap
 		}
 		if _, wErr := localConn.Write(payloadBuf[:n]); wErr != nil {
 			*clientDownlink = expected
@@ -281,7 +340,7 @@ func resumeRecvLoopWT(stream io.Reader, localConn net.Conn, clientDownlink *uint
 }
 
 // ---> 客户端 UDP: Stream (H2/WT) —— 支持会话恢复
-func runStreamUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager, wtManager *WTSessionManager) {
+func runStreamUDPClient(reqUrl string, cfg clientConfig, mgr *connectionManager, wtManager *wtSessionManager) {
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
@@ -316,7 +375,7 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager,
 			zlog.Infof("[S-UDP] 🟢 发现新 UDP 客户端: %s", clientAddr.String())
 			// resume/2 恒启用：每个 clientAddr 一个逻辑会话，HTTP 流断线
 			// 自动用同 session id 重建，服务端保持 UDP socket。
-			// （WT 走自身 WTSessionManager 会话模型，不适用此数据面。）
+			// （WT 走自身 wtSessionManager 会话模型，不适用此数据面。）
 			if !cfg.usesWT() {
 				udpSess := connectResumeUDP(newClientSessionID(), cfg, reqUrl, pickClient(mgr, "udp"), localConn, clientAddr)
 				if udpSess == nil {
@@ -343,7 +402,7 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager,
 				done := make(chan struct{})
 				defer close(done)
 
-				// WT-UDP：每个 UDP 客户端一个独立 WTSessionManager（headers 带该会话
+				// WT-UDP：每个 UDP 客户端一个独立 wtSessionManager（headers 带该会话
 				// X-Session-ID + resume/2 头），使服务端能保持对应 UDP socket 并跨流重建。
 				wtMgr := newWTManagerForTunnel(cfg, reqUrl, newClientSessionID())
 				session, err := wtMgr.GetSession(context.Background())
@@ -435,9 +494,9 @@ func runStreamUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager,
 }
 
 // ---> 服务端 WT：把每条业务 stream 派发到 resume/2 会话表（断线续传）
-func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg ServerConfig, wtServer *webtransport.Server) {
-	network, target := GetXDst(r)
-	if target == "" || !checkTargetIsAvailable(target, cfg) {
+func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg serverConfig, wtServer *webtransport.Server, sessions *sessionTable) {
+	network, target := getRequestDestination(r, cfg)
+	if !targetAllowedByRuntime(cfg, target) {
 		zlog.Warnf("[%s] 🚫 Access denied for target address: %s", sessionID, target)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
@@ -454,7 +513,7 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 	}
 	if strings.TrimSpace(r.Header.Get("X-Session-ID")) == "" {
 		w.Header().Set("X-Resume-Error", resumeErrInvalidParams.String())
-		http.Error(w, ErrSessionIDRequired.Error(), http.StatusBadRequest)
+		http.Error(w, errSessionIDRequired.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -514,9 +573,9 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 			}
 
 			dialTarget := func() (net.Conn, error) {
-				return net.DialTimeout(network, target, 10*time.Second)
+				return dialTargetForRequest(r, cfg, network, target)
 			}
-			sess, isNew, err := globalSessionTable.prepareResumeSession(r, dialTarget, cfg.SessionWindow)
+			sess, isNew, err := sessions.prepareResumeSession(r, dialTarget, cfg.SessionWindow)
 			if err != nil {
 				zlog.Errorf("[%s] ❌ WT Resume 拨号失败: %v", sID, err)
 				s.CancelWrite(1)

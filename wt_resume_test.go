@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 // WT 接入 resume/2 的断线续传验证。
 //
@@ -116,7 +116,7 @@ func readDataFrames(t *testing.T, stream io.Reader, baseSeq uint64, expectBytes 
 	var out []byte
 	for len(out) < expectBytes {
 		seq, n, err := readResumeFrame(stream, buf)
-		if errors.Is(err, ErrResumeEndFrame) {
+		if errors.Is(err, errResumeEndFrame) {
 			return out
 		}
 		if err != nil {
@@ -153,7 +153,7 @@ func TestWTResumeReconnect(t *testing.T) {
 		t.Fatalf("fake target: %v", err)
 	}
 
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -169,7 +169,7 @@ func TestWTResumeReconnect(t *testing.T) {
 
 	dialer := &webtransport.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{http3.NextProtoH3}},
-		QUICConfig:      GetDefaultQUICConfig(),
+		QUICConfig:      getDefaultQUICConfig(),
 	}
 	sessionID := "wt-resume-sess-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 

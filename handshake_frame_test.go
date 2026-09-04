@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"bytes"
@@ -55,7 +55,7 @@ func TestFrameV2Types(t *testing.T) {
 				t.Fatalf("encode: %v", err)
 			}
 			typ, _, n, err := readFrame(&buf, payload)
-			if err != nil && !errors.Is(err, ErrResumeEndFrame) {
+			if err != nil && !errors.Is(err, errResumeEndFrame) {
 				t.Fatalf("decode: %v", err)
 			}
 			if typ != tc.typ {
@@ -85,7 +85,7 @@ func TestFrameV2BadSeqRead(t *testing.T) {
 	}
 	payload := make([]byte, 1024)
 	_, _, err := readResumeFrame(&buf, payload)
-	if !errors.Is(err, ErrResumeEndFrame) {
-		t.Fatalf("readResumeFrame on END: got %v, want ErrResumeEndFrame", err)
+	if !errors.Is(err, errResumeEndFrame) {
+		t.Fatalf("readResumeFrame on END: got %v, want errResumeEndFrame", err)
 	}
 }

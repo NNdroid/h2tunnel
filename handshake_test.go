@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"strings"

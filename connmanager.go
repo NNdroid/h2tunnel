@@ -1,6 +1,9 @@
-package main
+package h2tunnel
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -42,8 +45,8 @@ const (
 	pickClientTimeout = 10 * time.Second
 )
 
-// ConnectionPolicy 连接管理策略（主备数量/间隔/类型分流）。
-type ConnectionPolicy struct {
+// connectionPolicy 连接管理策略（主备数量/间隔/类型分流）。
+type connectionPolicy struct {
 	PrimaryCount         int
 	BackupCount          int
 	PrimaryDialInterval  time.Duration
@@ -90,8 +93,8 @@ func normalizePrimaryNetworks(networks []string) []string {
 	return out
 }
 
-// resolveConnectionPolicy 从 Config 派生连接管理策略（含默认值兜底）。
-func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, networks []string) ConnectionPolicy {
+// resolveConnectionPolicy 从 fileConfig 派生连接管理策略（含默认值兜底）。
+func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, networks []string) connectionPolicy {
 	if pc <= 0 {
 		pc = defaultPrimaryCount
 	}
@@ -109,7 +112,7 @@ func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, networks [
 	if pc > 1 && pc > len(primaryNetworks) {
 		pc = len(primaryNetworks)
 	}
-	return ConnectionPolicy{
+	return connectionPolicy{
 		PrimaryCount:         pc,
 		BackupCount:          bc,
 		PrimaryDialInterval:  resolveDial(pdSec, primaryDialDefault),
@@ -120,10 +123,10 @@ func resolveConnectionPolicy(pc, bc, pdSec, bdSec, esSec, missed int, networks [
 	}
 }
 
-// normalizePolicy 归一策略：全零值（未显式配置，如直接构造 ClientConfig 的测试/程序化调用）
+// normalizePolicy 归一策略：全零值（未显式配置，如直接构造 clientConfig 的测试/程序化调用）
 // 时套用默认 1 主 + 1 备 + 主拨号30s + 备拨号15s + 建立间隔100s + 失效阈值3 + tcp/udp 网络序列。
 // 已部分配置则仅对 0/非法项兜底，不覆盖显式值。
-func normalizePolicy(p ConnectionPolicy) ConnectionPolicy {
+func normalizePolicy(p connectionPolicy) connectionPolicy {
 	allZero := p.PrimaryCount == 0 && p.BackupCount == 0 &&
 		p.PrimaryDialInterval == 0 && p.BackupDialInterval == 0 &&
 		p.EstablishInterval == 0 && p.BackoffMaxMissedAcks == 0 && len(p.PrimaryNetworks) == 0
@@ -159,7 +162,7 @@ func normalizePolicy(p ConnectionPolicy) ConnectionPolicy {
 // primaryTypes 计算需要维护主连接的业务类型集合。
 //   - PrimaryCount<=1 → 单条默认类型 "default"（不启用分流）。
 //   - PrimaryCount>1  → 取已启用网络的前 N 项作为类型集合（启用类型分流）。
-func (p ConnectionPolicy) primaryTypes() []string {
+func (p connectionPolicy) primaryTypes() []string {
 	if p.PrimaryCount <= 1 {
 		return []string{"default"}
 	}
@@ -171,10 +174,10 @@ func (p ConnectionPolicy) primaryTypes() []string {
 	return networks[:count]
 }
 
-// ConnectionManager 主/备连接管理器。
-type ConnectionManager struct {
-	policy        ConnectionPolicy
-	cfg           ClientConfig
+// connectionManager 主/备连接管理器。
+type connectionManager struct {
+	policy        connectionPolicy
+	cfg           clientConfig
 	reqUrl        string
 	httpClient    *http.Client        // 共享默认客户端（探活线路回退）
 	clientFactory func() *http.Client // 每线路专属客户端工厂（接入真实数据路径时设置）
@@ -193,10 +196,10 @@ type ConnectionManager struct {
 	startedAt          time.Time
 }
 
-// NewConnectionManager 创建连接管理器。sessPrefix 用于生成每条的独立 session id。
-func NewConnectionManager(policy ConnectionPolicy, cfg ClientConfig, reqUrl string, httpClient *http.Client, sessPrefix string) *ConnectionManager {
+// newConnectionManager 创建连接管理器。sessPrefix 用于生成每条的独立 session id。
+func newConnectionManager(policy connectionPolicy, cfg clientConfig, reqUrl string, httpClient *http.Client, sessPrefix string) *connectionManager {
 	policy = normalizePolicy(policy)
-	return &ConnectionManager{
+	return &connectionManager{
 		policy:       policy,
 		cfg:          cfg,
 		reqUrl:       reqUrl,
@@ -212,7 +215,7 @@ func NewConnectionManager(policy ConnectionPolicy, cfg ClientConfig, reqUrl stri
 // SetClientFactory 设置每线路专属 http.Client 的工厂。
 // 接入真实数据路径时调用：每条主/备线路拥有独立传输/连接池，
 // 业务隧道经 PickClient 取当前活跃主线路的客户端（主断 → 备升级即切换）。
-func (m *ConnectionManager) SetClientFactory(factory func() *http.Client) {
+func (m *connectionManager) SetClientFactory(factory func() *http.Client) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clientFactory = factory
@@ -225,40 +228,102 @@ func (m *ConnectionManager) SetClientFactory(factory func() *http.Client) {
 //
 // 若该主线路尚未建立成功（仍在握手），阻塞等待其变为 backupAlive；
 // 超过 pickClientTimeout 仍无可用主线路则返回 nil（业务隧道应优雅失败）。
-func (m *ConnectionManager) PickClient(typ string) *http.Client {
+func (m *connectionManager) PickClient(typ string) *http.Client {
+	ctx, cancel := context.WithTimeout(context.Background(), pickClientTimeout)
+	defer cancel()
+	client, _ := m.WaitClient(ctx, typ)
+	return client
+}
+
+func (m *connectionManager) WaitClient(ctx context.Context, typ string) (*http.Client, error) {
 	// 单主（未分流）时，任何类型都落到 "default" 主线路
 	lookup := typ
 	if len(m.primaryKinds) <= 1 {
 		lookup = "default"
 	}
-	deadline := time.Now().Add(pickClientTimeout)
 	for {
 		m.mu.Lock()
 		if m.closed {
 			m.mu.Unlock()
-			return nil
+			return nil, net.ErrClosed
 		}
-		if bl, ok := m.primaries[lookup]; ok && bl.State() == backupAlive {
-			if c := bl.Client(); c != nil {
+		if bl, ok := m.primaries[lookup]; ok {
+			state := bl.State()
+			if state == backupAlive {
+				if c := bl.Client(); c != nil {
+					m.mu.Unlock()
+					return c, nil
+				}
+			}
+			if state == backupFailed {
+				err := bl.Err()
 				m.mu.Unlock()
-				return c
+				if err == nil {
+					err = errors.New("h2tunnel: transport readiness handshake failed")
+				}
+				return nil, err
 			}
 		}
 		m.mu.Unlock()
-		if time.Now().After(deadline) {
-			zlog.Warnf("[ConnMgr] 等待 %s 主线路 %v 超时，返回 nil", lookup, pickClientTimeout)
-			return nil
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(connManagerTick):
 		}
-		time.Sleep(connManagerTick)
+	}
+}
+
+func (m *connectionManager) WaitAnyClient(ctx context.Context) (*http.Client, error) {
+	for {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		failed := 0
+		var firstErr error
+		for _, kind := range m.primaryKinds {
+			line := m.primaries[kind]
+			if line == nil {
+				continue
+			}
+			switch line.State() {
+			case backupAlive:
+				client := line.Client()
+				m.mu.Unlock()
+				if client == nil {
+					return nil, errors.New("h2tunnel: ready transport has no HTTP client")
+				}
+				return client, nil
+			case backupFailed:
+				failed++
+				if firstErr == nil {
+					firstErr = line.Err()
+				}
+			}
+		}
+		allFailed := failed == len(m.primaryKinds)
+		m.mu.Unlock()
+		if allFailed {
+			if firstErr == nil {
+				firstErr = errors.New("h2tunnel: all transport readiness checks failed")
+			}
+			return nil, firstErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(connManagerTick):
+		}
 	}
 }
 
 // Policy 返回当前策略。
-func (m *ConnectionManager) Policy() ConnectionPolicy { return m.policy }
+func (m *connectionManager) Policy() connectionPolicy { return m.policy }
 
 // Start 启动连接管理：先拨主（primary_count 条，类型分流），
 // 等 establish_interval 后再拨备（backup_count 条），并启动监控循环。
-func (m *ConnectionManager) Start() {
+func (m *connectionManager) Start() {
 	m.mu.Lock()
 	m.startedAt = time.Now()
 	m.mu.Unlock()
@@ -278,7 +343,7 @@ func (m *ConnectionManager) Start() {
 
 // dialPrimaryLocked 为指定类型拨一条主连接（遵循主拨号间隔节流）。
 // 调用方须持有 m.mu。
-func (m *ConnectionManager) dialPrimaryLocked(typ string) {
+func (m *connectionManager) dialPrimaryLocked(typ string) {
 	key := "primary:" + typ
 	if m.lastDial[key].After(time.Now().Add(-m.policy.PrimaryDialInterval)) {
 		return // 未到主拨号间隔
@@ -293,7 +358,7 @@ func (m *ConnectionManager) dialPrimaryLocked(typ string) {
 
 // dialBackupLocked 拨一条备用连接（遵循备拨号间隔节流）。
 // 调用方须持有 m.mu。
-func (m *ConnectionManager) dialBackupLocked() bool {
+func (m *connectionManager) dialBackupLocked() bool {
 	if m.lastDial["backup"].After(time.Now().Add(-m.policy.BackupDialInterval)) {
 		return false // 未到备拨号间隔
 	}
@@ -310,19 +375,23 @@ func (m *ConnectionManager) dialBackupLocked() bool {
 // newLane 创建并启动一条 keepalive 探活线路。
 // 若设置了 clientFactory，则每条线路拥有独立 http.Client（独立传输/连接池），
 // 使主备线路在传输层彼此隔离——主断后备用（含其预热的传输池）可秒级接管业务。
-func (m *ConnectionManager) newLane(netType string) *backupLine {
+func (m *connectionManager) newLane(netType string) *backupLine {
 	sessID := m.sessPrefix + "-" + netType + "-" + newClientSessionID()
 	var lineClient *http.Client
 	if m.clientFactory != nil {
 		lineClient = m.clientFactory()
 	}
-	bl := newManagedLine(sessID, roleBackup, netType, m.cfg, m.reqUrl, m.httpClient, lineClient, m.policy.BackoffMaxMissedAcks)
+	laneCfg := m.cfg
+	if netType == networkTCP || netType == networkUDP {
+		laneCfg.Network = netType
+	}
+	bl := newManagedLine(sessID, roleBackup, netType, laneCfg, m.reqUrl, m.httpClient, lineClient, m.policy.BackoffMaxMissedAcks)
 	go bl.Start()
 	return bl
 }
 
 // establishBackupsAfterDelay 在 establish_interval 到期后拨入备用（错相）。
-func (m *ConnectionManager) establishBackupsAfterDelay() {
+func (m *connectionManager) establishBackupsAfterDelay() {
 	select {
 	case <-m.closeCh:
 		return
@@ -343,7 +412,7 @@ func (m *ConnectionManager) establishBackupsAfterDelay() {
 //   - 主线路失效 → 用存活备用升级补位 → 补一条新备
 //   - 备用失效 → 移除 → 补位
 //   - 主/备数量不足 → 补足（受拨号间隔节流）
-func (m *ConnectionManager) monitor() {
+func (m *connectionManager) monitor() {
 	t := time.NewTicker(connManagerTick)
 	defer t.Stop()
 	for {
@@ -357,7 +426,7 @@ func (m *ConnectionManager) monitor() {
 }
 
 // reconcile 做一次主/备数量与状态对账。
-func (m *ConnectionManager) reconcile() {
+func (m *connectionManager) reconcile() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -422,7 +491,7 @@ func (m *ConnectionManager) reconcile() {
 }
 
 // indexOfAliveBackup 返回一个 state==backupAlive 的备用下标；无则 -1。
-func (m *ConnectionManager) indexOfAliveBackup() int {
+func (m *connectionManager) indexOfAliveBackup() int {
 	for i, bl := range m.backups {
 		if bl.State() == backupAlive {
 			return i
@@ -432,21 +501,21 @@ func (m *ConnectionManager) indexOfAliveBackup() int {
 }
 
 // PrimaryCount 返回当前主连接数。
-func (m *ConnectionManager) PrimaryCount() int {
+func (m *connectionManager) PrimaryCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.primaries)
 }
 
 // BackupCount 返回当前备用连接数。
-func (m *ConnectionManager) BackupCount() int {
+func (m *connectionManager) BackupCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.backups)
 }
 
 // PrimaryTypes 返回当前主连接覆盖的类型集合。
-func (m *ConnectionManager) PrimaryTypes() []string {
+func (m *connectionManager) PrimaryTypes() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]string, 0, len(m.primaries))
@@ -457,7 +526,7 @@ func (m *ConnectionManager) PrimaryTypes() []string {
 }
 
 // PrimaryState 返回指定类型主连接的状态；不存在返回 backupIdle。
-func (m *ConnectionManager) PrimaryState(typ string) backupLineState {
+func (m *connectionManager) PrimaryState(typ string) backupLineState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if bl, ok := m.primaries[typ]; ok {
@@ -468,7 +537,7 @@ func (m *ConnectionManager) PrimaryState(typ string) backupLineState {
 
 // FailPrimary 模拟某类型主连接阵亡（供测试/运维触发切换）。
 // 会立即关闭该主连接，触发 monitor 的升级+补位。
-func (m *ConnectionManager) FailPrimary(typ string) {
+func (m *connectionManager) FailPrimary(typ string) {
 	m.mu.Lock()
 	if bl, ok := m.primaries[typ]; ok {
 		bl.close()
@@ -478,7 +547,7 @@ func (m *ConnectionManager) FailPrimary(typ string) {
 }
 
 // Close 停止连接管理器，关闭所有线路。
-func (m *ConnectionManager) Close() {
+func (m *connectionManager) Close() {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()

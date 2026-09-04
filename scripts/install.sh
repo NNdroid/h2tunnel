@@ -59,9 +59,9 @@ install_binary() {
   elif [ -f "./${APP_NAME}" ]; then
     echo -e "${CYAN}--> Using local binary...${PLAIN}"
     cp "./${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
-  elif command -v go >/dev/null 2>&1 && [ -f "./main.go" ]; then
+  elif command -v go >/dev/null 2>&1 && [ -f "./go.mod" ] && [ -d "./cmd/h2tunnel" ]; then
     echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
-    CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" .
+    CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" ./cmd/h2tunnel
   else
     echo -e "${CYAN}--> Downloading latest release binary (${goarch})...${PLAIN}"
     local download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${APP_NAME}_linux_${goarch}"

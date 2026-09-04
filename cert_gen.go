@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/ecdsa"
@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// GenerateSelfSignedCert 生成自签名 TLS 证书（供本隧道工具自签场景使用）
-func GenerateSelfSignedCert(customDomain string) (tls.Certificate, string, error) {
+// generateSelfSignedCert 生成自签名 TLS 证书（供本隧道工具自签场景使用）
+func generateSelfSignedCert(customDomain string) (tls.Certificate, string, error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, "", fmt.Errorf("failed to generate ECDSA private key: %w", err)

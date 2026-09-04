@@ -1,11 +1,10 @@
-package main
+package h2tunnel
 
 import (
 	"errors"
 	"net"
 	"net/http"
 	"strconv"
-	"time"
 )
 
 // =========================================
@@ -26,7 +25,7 @@ import (
 //  6. 主线路：补发下行缺口 → 进入帧循环读上行
 //
 // =========================================
-func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg ServerConfig) {
+func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg serverConfig, sessions *sessionTable) {
 	// 版本是硬约束：非 resume/2 直接拒绝，无降级目标（v1 已移除）。
 	if r.Header.Get("X-Tunnel-Proto") != resumeFrameTypeResume {
 		w.Header().Set("X-Resume-Error", resumeErrVersionUnsupported.String())
@@ -34,7 +33,7 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 		return
 	}
 
-	network, target := GetXDst(r)
+	network, target := getRequestDestination(r, cfg)
 	datagram := network == "udp"
 	isBackup := r.Header.Get("X-Resume-Role") == "backup"
 
@@ -94,24 +93,24 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 	}
 
 	// ===== 主线路：校验目标 + 建立/恢复业务会话 =====
-	if target == "" || !checkTargetIsAvailable(target, cfg) {
+	if !targetAllowedByRuntime(cfg, target) {
 		zlog.Warnf("[%s] 🚫 Resume target rejected: %s", sessionID, target)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
 	dialTarget := func() (net.Conn, error) {
-		return net.DialTimeout(network, target, 10*time.Second)
+		return dialTargetForRequest(r, cfg, network, target)
 	}
-	sess, isNew, err := globalSessionTable.prepareResumeSession(r, dialTarget, cfg.SessionWindow)
+	sess, isNew, err := sessions.prepareResumeSession(r, dialTarget, cfg.SessionWindow)
 	if err != nil {
-		if errors.Is(err, ErrSessionIDRequired) {
+		if errors.Is(err, errSessionIDRequired) {
 			w.Header().Set("X-Resume-Error", resumeErrInvalidParams.String())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		zlog.Errorf("[%s] ❌ Resume 拨号失败: %v", sessionID, err)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		writeTargetError(w, err)
 		return
 	}
 	if isNew {

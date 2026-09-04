@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"strconv"
@@ -187,7 +187,7 @@ func negotiateVersion(clientMax, serverMax int) int {
 }
 
 // clientCapabilities 客户端声明的能力集（由 cfg 派生）。
-func clientCapabilities(cfg ClientConfig) resumeCaps {
+func clientCapabilities(cfg clientConfig) resumeCaps {
 	return resumeCaps{
 		datagram:   cfg.IsUDP(),
 		backupLine: true,
@@ -195,7 +195,7 @@ func clientCapabilities(cfg ClientConfig) resumeCaps {
 }
 
 // clientParams 客户端请求的握手参数（由 cfg 派生，未配置用默认）。
-func clientParams(cfg ClientConfig) resumeParams {
+func clientParams(cfg clientConfig) resumeParams {
 	return resumeParams{
 		windowKB:       resolveSessionWindow(cfg.SessionWindow),
 		handshakeAckMs: resolveHandshakeAckMs(cfg.HandshakeAckMs),

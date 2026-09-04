@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/tls"
@@ -28,10 +28,10 @@ import (
 //   G. establish_interval 错相生效（备在间隔后才建立）
 //   H. 鉴权失败 → 备用不接管
 //   I. 版本不匹配 → 426 拒绝
-//   J. ConnectionPolicy 默认值校验
+//   J. connectionPolicy 默认值校验
 //   K. 边界：primary_count/backup_count=0 回退默认
 //
-// 运行：go test -run 'ConnManager|ConnectionPolicy' -v ./...
+// 运行：go test -run 'ConnManager|connectionPolicy' -v ./...
 // =========================================
 
 // 端口基址：独立于 backup_test(27000)、e2e_test(20000/22000)。
@@ -51,7 +51,7 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 	serverPort := connMgrPortBase + 443 + seq*2
 	startEchoServer(fmt.Sprintf("127.0.0.1:%d", echoPort))
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -68,8 +68,8 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 }
 
 // connMgrClient 构造标准 resume 客户端配置。
-func connMgrClient(serverURL, echoAddr, token string, network string) ClientConfig {
-	return ClientConfig{
+func connMgrClient(serverURL, echoAddr, token string, network string) clientConfig {
+	return clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,
@@ -105,7 +105,7 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 	serverAddr := "127.0.0.1:29543"
 	serverURL := "https://" + serverAddr
 	token := "matrix-token"
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -178,12 +178,12 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 // 连接管理器测试环境
 // =========================================
 
-// startConnManagerEnv 启动一个带 ConnectionManager 的测试环境。
+// startConnManagerEnv 启动一个带 connectionManager 的测试环境。
 // 返回 manager 与 serverURL；manager 需 t.Cleanup 关闭。
-func startConnManagerEnv(t *testing.T, seq int, policy ConnectionPolicy) (*ConnectionManager, string, string) {
+func startConnManagerEnv(t *testing.T, seq int, policy connectionPolicy) (*connectionManager, string, string) {
 	serverURL, echoAddr := connManagerHTTPServer(t, seq, "connmgr-token")
 	cfg := connMgrClient(serverURL, echoAddr, "connmgr-token", "tcp")
-	m := NewConnectionManager(policy, cfg, serverURL+"/tunnel", connMgrHTTPClient(), fmt.Sprintf("CM%d", seq))
+	m := newConnectionManager(policy, cfg, serverURL+"/tunnel", connMgrHTTPClient(), fmt.Sprintf("CM%d", seq))
 	t.Cleanup(m.Close)
 	return m, serverURL, echoAddr
 }
@@ -219,7 +219,9 @@ func TestConnManagerPrimaryBackupCounts(t *testing.T) {
 // =========================================
 
 func TestConnManagerTypeSharding(t *testing.T) {
-	policy := resolveConnectionPolicy(2, 1, 0, 0, 1, 2, nil) // 主2备1，网络={tcp,udp}
+	// 测试环境使用 1 秒备用重拨节流；若共享 CI 主机在首次握手时短暂抖动，
+	// 仍能验证最终的 2 主 1 备状态，而不必等待生产默认的 15 秒。
+	policy := resolveConnectionPolicy(2, 1, 0, 1, 1, 2, nil) // 主2备1，网络={tcp,udp}
 	m, _, _ := startConnManagerEnv(t, 2, policy)
 	m.Start()
 
@@ -297,9 +299,9 @@ func TestConnManagerBackupKeepaliveFailure(t *testing.T) {
 
 func TestConnManagerDialIntervalThrottle(t *testing.T) {
 	// 主拨号间隔 2s：触发主失败后，补主不得早于该间隔（防风暴重拨）。
-	// 注意：直接构造 ConnectionPolicy，令 BackupCount=0，避免备用升级绕过主拨号节流。
+	// 注意：直接构造 connectionPolicy，令 BackupCount=0，避免备用升级绕过主拨号节流。
 	interval := 2 * time.Second
-	policy := ConnectionPolicy{
+	policy := connectionPolicy{
 		PrimaryCount:         1,
 		BackupCount:          0,
 		PrimaryDialInterval:  interval,
@@ -426,7 +428,7 @@ func TestConnManagerVersionUnsupported(t *testing.T) {
 }
 
 // =========================================
-// J. ConnectionPolicy 默认值
+// J. connectionPolicy 默认值
 // =========================================
 
 func TestConnectionPolicyDefaults(t *testing.T) {
@@ -446,7 +448,7 @@ func TestConnectionPolicyDefaults(t *testing.T) {
 	if got := p.PrimaryNetworks; len(got) != 2 || got[0] != networkTCP || got[1] != networkUDP {
 		t.Fatalf("默认分流网络错误: %v", got)
 	}
-	t.Logf("✅ ConnectionPolicy 默认值全部正确")
+	t.Logf("✅ connectionPolicy 默认值全部正确")
 }
 
 // =========================================

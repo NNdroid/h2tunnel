@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"testing"
@@ -24,7 +24,7 @@ func TestClientTransportValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveClientTransport(&Config{Transport: tc.value})
+			got, err := resolveClientTransport(&fileConfig{Transport: tc.value})
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("resolveClientTransport(%q) error = %v, wantErr %v", tc.value, err, tc.wantErr)
 			}

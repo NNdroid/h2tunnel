@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+          - goos: linux
+            goarch: 386
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="v1.1.$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags "-s -w -X github.com/NNdroid/h2tunnel.buildVersion=${{ steps.ver.outputs.version }}" \
+            -o "h2tunnel_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext || '' }}" ./cmd/h2tunnel
+
+      - name: Show version
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: ./h2tunnel_linux_amd64 version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2tunnel_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: h2tunnel_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext || '' }}
+          if-no-files-found: error
+
+  # 手动触发时：只汇总一份二进制到 Artifacts，不发布 Release
+  upload-manual:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload single artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2tunnel-manual-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
+  # 打 tag 时：把所有二进制挂到 GitHub Release
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Release and Upload Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            Automated release for tag ${{ github.ref_name }}
+
+            Build version: ${{ github.ref_name }}
+
+            二进制文件直接下载即可，无需解压。
+          files: dist/*
+          generate_release_notes: true

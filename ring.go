@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"errors"
@@ -13,7 +13,7 @@ import (
 // 关键特性：
 //   - 全局 64-bit seq 坐标系，窗口 [windowStartSeq, windowStartSeq+length)
 //   - 写满时按环形覆盖最旧（覆盖即窗口滚动 + windowStartSeq++）
-//   - 读端按 seq 取，若 seq < windowStartSeq 则返回 ErrGap（缺口已不可恢复）
+//   - 读端按 seq 取，若 seq < windowStartSeq 则返回 errGap（缺口已不可恢复）
 //   - 支持并发写、并发读；Append 不阻塞（环形覆盖语义下总有空间）
 //
 // 设计动机：SSH 这种长连接流式协议，断线时不能丢会话。
@@ -22,7 +22,7 @@ import (
 // 会话表能告诉它"早于 X 的数据我丢了"，客户端可选择放弃恢复。
 // =========================================
 
-var ErrGap = errors.New("ringBuffer: requested seq is before current window start (gap unrecoverable)")
+var errGap = errors.New("ringBuffer: requested seq is before current window start (gap unrecoverable)")
 
 type ringBuffer struct {
 	mu             sync.Mutex
@@ -100,14 +100,14 @@ func (rb *ringBuffer) Append(p []byte) {
 }
 
 // ReadAt 从全局 seq 处开始读取最多 len(p) 字节。返回实际读取字节数。
-// 若 seq < windowStartSeq 则窗口外（已被覆盖），返回 ErrGap。
+// 若 seq < windowStartSeq 则窗口外（已被覆盖），返回 errGap。
 func (rb *ringBuffer) ReadAt(seq uint64, p []byte) (int, error) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
 	windowEnd := rb.windowStartSeq + uint64(rb.length)
 	if seq < rb.windowStartSeq {
-		return 0, ErrGap
+		return 0, errGap
 	}
 	if seq >= windowEnd {
 		return 0, nil

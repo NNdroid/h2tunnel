@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"context"
@@ -37,7 +37,7 @@ const (
 // 下行由读循环解出写回本地 UDP socket。流断后重建，会话不中断。
 type udpSession struct {
 	sessionID  string
-	cfg        ClientConfig
+	cfg        clientConfig
 	reqUrl     string
 	httpClient *http.Client
 	localConn  *net.UDPConn
@@ -50,12 +50,17 @@ type udpSession struct {
 	// upstream 上行队列：本地 UDP 收包协程放入，流写协程消费。
 	upstream chan []byte
 	// done 关闭时通知当前流的读写循环退出（会话结束）。
-	done     chan struct{}
-	doneOnce sync.Once
+	done      chan struct{}
+	doneOnce  sync.Once
+	ctx       context.Context
+	deliver   func([]byte) error
+	ready     chan<- error
+	readyOnce sync.Once
+	onDone    func(error)
 }
 
 // newUDPSession 为单个 UDP clientAddr 建立逻辑会话并启动断线续传循环。
-func newUDPSession(sessionID string, cfg ClientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
+func newUDPSession(sessionID string, cfg clientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
 	s := &udpSession{
 		sessionID:  sessionID,
 		cfg:        cfg,
@@ -80,6 +85,13 @@ func (s *udpSession) close() {
 	s.doneOnce.Do(func() { close(s.done) })
 }
 
+func (s *udpSession) notifyReady(err error) {
+	if s.ready == nil {
+		return
+	}
+	s.readyOnce.Do(func() { s.ready <- err })
+}
+
 // enqueue 把本地 UDP 收到的包入上行队列；会话已结束则丢弃。
 func (s *udpSession) enqueue(pkt []byte) {
 	select {
@@ -93,14 +105,30 @@ func (s *udpSession) enqueue(pkt []byte) {
 
 // run 启动会话主循环：持续建流 → 续传，直到本地 socket 关闭或超过最大重试。
 func (s *udpSession) run() {
-	defer s.close()
+	var finalErr error
+	defer func() {
+		s.notifyReady(finalErr)
+		s.close()
+		if s.onDone != nil {
+			s.onDone(finalErr)
+		}
+	}()
 	for attempt := 1; attempt <= udpResumeMaxAttempts; attempt++ {
 		if s.isDone() {
+			if err := s.context().Err(); err != nil {
+				finalErr = err
+			} else {
+				finalErr = net.ErrClosed
+			}
 			return
 		}
 		err := s.runOneStream()
 		if err == nil {
 			return // 正常结束（对端关闭）
+		}
+		finalErr = err
+		if isPermanentTunnelError(err) {
+			return
 		}
 		if s.isDone() {
 			return
@@ -114,6 +142,9 @@ func (s *udpSession) run() {
 		select {
 		case <-s.done:
 			return
+		case <-s.context().Done():
+			finalErr = s.context().Err()
+			return
 		case <-time.After(delay):
 		}
 	}
@@ -124,8 +155,30 @@ func (s *udpSession) isDone() bool {
 	select {
 	case <-s.done:
 		return true
+	case <-s.context().Done():
+		return true
 	default:
 		return false
+	}
+}
+
+func (s *udpSession) context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+func (s *udpSession) enqueueContext(ctx context.Context, pkt []byte) error {
+	select {
+	case <-s.done:
+		return net.ErrClosed
+	case <-s.context().Done():
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.upstream <- pkt:
+		return nil
 	}
 }
 
@@ -133,12 +186,15 @@ func (s *udpSession) isDone() bool {
 // 返回 err 表示流中断（应重拨）。
 func (s *udpSession) runOneStream() error {
 	pr, pw := io.Pipe()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.context())
 	defer cancel()
 
-	req := buildResumeUDPRequest(ctx, pr, s.sessionID, s.reqUrl, s.cfg)
+	req, err := buildResumeUDPRequestChecked(ctx, pr, s.sessionID, s.reqUrl, s.cfg)
+	if err != nil {
+		return err
+	}
 	var resp *http.Response
-	var err error
+	err = nil
 	if rt, ok := s.httpClient.Transport.(http.RoundTripper); ok && s.cfg.usesMasque() {
 		resp, err = rt.RoundTrip(req)
 	} else {
@@ -149,9 +205,10 @@ func (s *udpSession) runOneStream() error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("服务端拒绝: HTTP %d", resp.StatusCode)
+		return &tunnelHTTPError{status: resp.StatusCode}
 	}
 	zlog.Infof("[UDP-Resume:%s] ✅ 隧道就绪", s.sessionID)
+	s.notifyReady(nil)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -159,10 +216,13 @@ func (s *udpSession) runOneStream() error {
 	// 上行：消费 upstream 队列 → frameW 封装 → 写流 body。
 	go func() {
 		defer wg.Done()
+		defer cancel()
 		defer pw.Close()
 		for {
 			select {
 			case <-s.done:
+				return
+			case <-ctx.Done():
 				return
 			case pkt, ok := <-s.upstream:
 				if !ok {
@@ -179,6 +239,7 @@ func (s *udpSession) runOneStream() error {
 	// 下行：读流 body → frameR 解包 → 写回本地 UDP socket。
 	go func() {
 		defer wg.Done()
+		defer cancel()
 		bufPtr := udpBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer udpBufPool.Put(bufPtr)
@@ -188,7 +249,15 @@ func (s *udpSession) runOneStream() error {
 				zlog.Debugf("[UDP-Resume:%s] 下行读结束: %v", s.sessionID, rErr)
 				return
 			}
-			if _, wErr := s.localConn.WriteToUDP(buf[:n], s.clientAddr); wErr != nil {
+			var wErr error
+			if s.deliver != nil {
+				wErr = s.deliver(buf[:n])
+			} else if s.localConn != nil {
+				_, wErr = s.localConn.WriteToUDP(buf[:n], s.clientAddr)
+			} else {
+				wErr = errors.New("udp resume session has no delivery target")
+			}
+			if wErr != nil {
 				zlog.Debugf("[UDP-Resume:%s] 本地 UDP 写失败: %v", s.sessionID, wErr)
 				return
 			}
@@ -204,7 +273,12 @@ func (s *udpSession) runOneStream() error {
 //   - h2/h3/grpc：POST cfg.Path，X-Network=udp，X-Target=<target>
 //
 // 帧数据面：masque 用 capsule，其余用 datagram packet（不含 seq）。
-func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl string, cfg ClientConfig) *http.Request {
+func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl string, cfg clientConfig) *http.Request {
+	req, _ := buildResumeUDPRequestChecked(ctx, body, sessID, reqUrl, cfg)
+	return req
+}
+
+func buildResumeUDPRequestChecked(ctx context.Context, body io.Reader, sessID, reqUrl string, cfg clientConfig) (*http.Request, error) {
 	var method, reqURL string
 	if cfg.usesMasque() {
 		method = http.MethodConnect
@@ -220,7 +294,13 @@ func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl s
 		reqURL = reqUrl
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, method, reqURL, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyClientCredentials(ctx, req.Header, cfg); err != nil {
+		return nil, err
+	}
 	req.Header.Set("X-Tunnel-Proto", resumeFrameTypeResume)
 	req.Header.Set("X-Session-ID", sessID)
 	// ===== resume/2 握手头：版本 / 能力 / 参数（datagram 也走 A 层协商）=====
@@ -230,12 +310,11 @@ func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl s
 	if cfg.RoleBackup {
 		req.Header.Set("X-Resume-Role", "backup")
 	}
-	SetXNetwork(req.Header, "udp")
-	SetXTarget(req.Header, cfg.TargetAddr)
+	setXNetwork(req.Header, "udp")
+	setXTarget(req.Header, cfg.TargetAddr)
 	if cfg.CustomHost != "" {
 		req.Host = cfg.CustomHost
 	}
-	SetXAuth(req.Header, cfg)
 	setTunnelRequestHeaders(req.Header)
 
 	if cfg.usesMasque() {
@@ -248,7 +327,7 @@ func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl s
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
 	}
-	return req
+	return req, nil
 }
 
 // clientUDPResumeSession 管理器：一个 UDP 会话对应一个活跃 HTTP 流。
@@ -257,7 +336,7 @@ func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl s
 // connectResumeUDP 建立一个新的 UDP resume 会话，返回其实例与入队函数。
 // sessionID 需在调用方生成（newClientSessionID）。httpClient 为空时返回 nil
 // （无可用主线路，调用方应优雅丢弃该 UDP 会话）。
-func connectResumeUDP(sessionID string, cfg ClientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
+func connectResumeUDP(sessionID string, cfg clientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
 	if httpClient == nil {
 		zlog.Warnf("[UDP-Resume:%s] 无可用主线路客户端，放弃 UDP 会话", sessionID)
 		return nil

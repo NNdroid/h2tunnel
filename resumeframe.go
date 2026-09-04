@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"encoding/binary"
@@ -84,8 +84,8 @@ const (
 	resumeMaxDataLen uint32 = 16 * 1024 * 1024
 )
 
-var ErrResumeEndFrame = errors.New("resume: END frame received")
-var ErrResumeBadSeq = errors.New("resume: out-of-order seq")
+var errResumeEndFrame = errors.New("resume: END frame received")
+var errResumeBadSeq = errors.New("resume: out-of-order seq")
 
 func isResumeFrameType(typ byte) bool {
 	switch typ {
@@ -219,7 +219,7 @@ func writeResumeErrorFrame(w io.Writer, code resumeErrorCode) error {
 }
 
 // readFrame 读一帧，返回帧类型、seq、data 拷贝（写入 payloadBuf）。
-// 填充已在函数内丢弃。返回 ErrResumeEndFrame 表示 END 控制帧。
+// 填充已在函数内丢弃。返回 errResumeEndFrame 表示 END 控制帧。
 func readFrame(r io.Reader, payloadBuf []byte) (typ byte, seq uint64, n int, err error) {
 	var hdr [resumeHeaderLen]byte
 	if _, err = io.ReadFull(r, hdr[:]); err != nil {
@@ -241,7 +241,7 @@ func readFrame(r io.Reader, payloadBuf []byte) (typ byte, seq uint64, n int, err
 		if dataLen != 0 || padLen != 0 {
 			return 0, 0, 0, errors.New("resume END frame must not carry data or padding")
 		}
-		return typ, seq, 0, ErrResumeEndFrame
+		return typ, seq, 0, errResumeEndFrame
 	}
 	if dataLen > resumeMaxDataLen {
 		return 0, 0, 0, fmt.Errorf("resume frame data too large: %d", dataLen)
@@ -289,7 +289,7 @@ func (b *resumeClientRingBuf) Append(data []byte) { b.rb.Append(data) }
 func (b *resumeClientRingBuf) WindowEnd() uint64 { return b.rb.WindowEnd() }
 
 // ReplayFrom 从给定 seq 起读出所有数据，写入 w。
-// 返回写入总字节数与遇到的错误（ErrGap 表示缺口不可恢复）。
+// 返回写入总字节数与遇到的错误（errGap 表示缺口不可恢复）。
 func (b *resumeClientRingBuf) ReplayFrom(seq uint64, w io.Writer) (int64, error) {
 	tmp := make([]byte, 8192)
 	var total int64
@@ -302,8 +302,8 @@ func (b *resumeClientRingBuf) ReplayFrom(seq uint64, w io.Writer) (int64, error)
 			seq += uint64(n)
 			total += int64(n)
 		}
-		if errors.Is(err, ErrGap) {
-			return total, ErrGap
+		if errors.Is(err, errGap) {
+			return total, errGap
 		}
 		if err != nil || n == 0 {
 			return total, nil

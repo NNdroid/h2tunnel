@@ -12,7 +12,6 @@
   "insecure": false,
   "heartbeat_sec": 25,
   "session_window_kb": 256,
-  "primary_count": 1,
-  "backup_count": 1,
+  "standby_connections": 1,
   "log_level": "info"
 }

@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"errors"
@@ -22,13 +22,21 @@ import (
 // =========================================
 
 // ---> 服务端 MASQUE-TCP
-func handleMasqueTCPServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg ServerConfig) {
-	target, err := parseMasqueTarget("tcp", r.URL.Path)
-	if err != nil {
-		_, target = GetXDst(r)
+func handleMasqueTCPServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg serverConfig, sessions *sessionTable) {
+	// Authenticated h2tunnel clients carry the original (possibly logical)
+	// target in X-Target. The MASQUE URI remains standards-shaped for proxies,
+	// but must not rewrite an application service name such as "ssh" to
+	// "ssh:22" before it reaches the policy dialer.
+	target := strings.TrimSpace(getXTarget(r))
+	if target == "" {
+		var err error
+		target, err = parseMasqueTarget("tcp", r.URL.Path)
+		if err != nil {
+			_, target = getXDst(r)
+		}
 	}
 
-	if target == "" || !checkTargetIsAvailable(target, cfg) {
+	if !targetAllowedByRuntime(cfg, target) {
 		zlog.Warnf("[%s] 🚫 Access denied for target address: %s", sessionID, target)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
@@ -38,7 +46,7 @@ func handleMasqueTCPServer(w http.ResponseWriter, r *http.Request, sessionID str
 	// （X-Tunnel-Proto: resume/2 + X-Session-ID）。v1 Padding 路径已移除。
 	if r.Header.Get("X-Tunnel-Proto") == resumeFrameTypeResume {
 		zlog.Debugf("[%s] -> Dispatching MASQUE-TCP to RESUME handler", sessionID)
-		handleH2StreamResumeServer(w, r, sessionID, cfg)
+		handleH2StreamResumeServer(w, r, sessionID, cfg, sessions)
 		return
 	}
 	zlog.Warnf("[%s] ❌ MASQUE-TCP 未携带 resume/2 头，拒绝（v1 已移除）", sessionID)
@@ -47,9 +55,16 @@ func handleMasqueTCPServer(w http.ResponseWriter, r *http.Request, sessionID str
 }
 
 // ---> 服务端 MASQUE-UDP
-func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg ServerConfig) {
+func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg serverConfig, sessions *sessionTable) {
 	sessionID := fmt.Sprintf("MUDP-%s-%d", r.RemoteAddr, time.Now().UnixNano()%1000)
 	zlog.Debugf("[%s] === New MASQUE-UDP request ===", sessionID)
+	var authErr error
+	r, authErr = authenticateServerRequest(r, cfg, TransportMASQUE)
+	if authErr != nil {
+		zlog.Warnf("[%s] ❌ Authentication failed", sessionID)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	// 1. 严格网络类型分流校验 (是否允许 UDP)
 	policy := cfg.effectiveRoutingPolicy()
@@ -66,14 +81,12 @@ func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg ServerConfig) {
 		return
 	}
 
-	if !checkAuth(r, cfg.ExpectedToken) {
-		zlog.Warnf("[%s] ❌ Authentication failed", sessionID)
-		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
-		return
+	target := strings.TrimSpace(getXTarget(r))
+	var err error
+	if target == "" {
+		target, err = parseMasqueTarget("udp", r.URL.Path)
 	}
-
-	target, err := parseMasqueTarget("udp", r.URL.Path)
-	if err != nil || target == "" || !checkTargetIsAvailable(target, cfg) {
+	if err != nil || !targetAllowedByRuntime(cfg, target) {
 		zlog.Warnf("[%s] 🚫 MASQUE-UDP target rejected or parse failed: %s", sessionID, r.URL.Path)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
@@ -85,7 +98,7 @@ func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg ServerConfig) {
 		r.Header.Set("X-Network", "udp")
 		r.Header.Set("X-Target", target)
 		zlog.Debugf("[%s] -> Dispatching MASQUE-UDP to RESUME handler (target=%s)", sessionID, target)
-		handleH2StreamResumeServer(w, r, sessionID, cfg)
+		handleH2StreamResumeServer(w, r, sessionID, cfg, sessions)
 		return
 	}
 	zlog.Warnf("[%s] ❌ MASQUE-UDP 未携带 resume/2 头，拒绝（v1 已移除）", sessionID)
@@ -94,7 +107,7 @@ func handleMasqueUDP(w http.ResponseWriter, r *http.Request, cfg ServerConfig) {
 }
 
 // ---> 客户端 UDP: MASQUE —— 支持会话恢复
-func runMasqueUDPClient(cfg ClientConfig, mgr *ConnectionManager) {
+func runMasqueUDPClient(cfg clientConfig, mgr *connectionManager) {
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {

@@ -1,7 +1,8 @@
-package main
+package h2tunnel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -64,7 +65,7 @@ func (r managedRole) String() string {
 }
 
 // backupLine 单条备用线路执行器。
-// 同时也是 ConnectionManager 中「主/备线路」的通用探活执行器：
+// 同时也是 connectionManager 中「主/备线路」的通用探活执行器：
 //   - role=backup   → 独立 session id(<主>+b) + X-Resume-Role: backup，只 KEEPALIVE 保活
 //   - role=primary  → 使用自身 session id + X-Resume-Role 空，建流后 KEEPALIVE 保活探活
 //
@@ -75,7 +76,7 @@ type backupLine struct {
 	backupID   string
 	role       managedRole
 	netType    string // "tcp" / "udp"（类型分流维度）
-	cfg        ClientConfig
+	cfg        clientConfig
 	reqUrl     string
 	httpClient *http.Client // 共享默认客户端（后备）
 	client     *http.Client // 本线路专属客户端（独立传输/连接池，接入真实数据路径时使用）
@@ -89,14 +90,15 @@ type backupLine struct {
 	closeCh       chan struct{}
 	closeOnce     sync.Once
 	ctxCancel     context.CancelFunc // 握手请求上下文取消函数（close 时调用，终止 keepalive 流）
-	keepaliveNs   int64              // 心跳周期纳秒
-	handshakeMs   int                // 握手超时毫秒
+	lastErr       error
+	keepaliveNs   int64 // 心跳周期纳秒
+	handshakeMs   int   // 握手超时毫秒
 }
 
 // newManagedLine 创建通用线路执行器（主或备）。
 // role 决定 session id 后缀与 X-Resume-Role 头；netType 用于类型分流标识。
 // client 为线路专属 http.Client（独立传输/连接池）；为空则回退用共享 httpClient。
-func newManagedLine(id string, role managedRole, netType string, cfg ClientConfig, reqUrl string, httpClient, client *http.Client, maxMissedAcks int) *backupLine {
+func newManagedLine(id string, role managedRole, netType string, cfg clientConfig, reqUrl string, httpClient, client *http.Client, maxMissedAcks int) *backupLine {
 	bl := &backupLine{
 		primaryID:     id,
 		role:          role,
@@ -142,6 +144,13 @@ func (b *backupLine) close() {
 		if b.ctxCancel != nil {
 			b.ctxCancel()
 		}
+		if b.client != nil && b.client.Transport != nil {
+			if closer, ok := b.client.Transport.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			} else if closer, ok := b.client.Transport.(interface{ CloseIdleConnections() }); ok {
+				closer.CloseIdleConnections()
+			}
+		}
 	})
 }
 
@@ -149,6 +158,18 @@ func (b *backupLine) setState(s backupLineState) {
 	b.mu.Lock()
 	b.state = s
 	b.mu.Unlock()
+}
+
+func (b *backupLine) setError(err error) {
+	b.mu.Lock()
+	b.lastErr = err
+	b.mu.Unlock()
+}
+
+func (b *backupLine) Err() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastErr
 }
 
 // Alive 返回备用是否已确认存活（可接管）。
@@ -205,7 +226,12 @@ func (b *backupLine) doHandshake() bool {
 
 	cfg := b.cfg
 	cfg.RoleBackup = b.role == roleBackup
-	req := buildResumeRequest(ctx, pr, b.backupID, new(uint64), newResumeClientRingBuf(256), b.reqUrl, cfg)
+	req, reqErr := buildResumeRequestChecked(ctx, pr, b.backupID, new(uint64), newResumeClientRingBuf(256), b.reqUrl, cfg)
+	if reqErr != nil {
+		b.setError(reqErr)
+		zlog.Warnf("[Backup:%s] 备用凭据构建失败: %v", b.backupID, reqErr)
+		return false
+	}
 
 	var resp *http.Response
 	var err error
@@ -216,15 +242,18 @@ func (b *backupLine) doHandshake() bool {
 		resp, err = client.Do(req)
 	}
 	if err != nil {
+		b.setError(err)
 		zlog.Warnf("[Backup:%s] 备用握手建流失败: %v", b.backupID, err)
 		return false
 	}
 	if resp.StatusCode != http.StatusOK {
+		b.setError(&tunnelHTTPError{status: resp.StatusCode})
 		zlog.Warnf("[Backup:%s] 备用握手被拒: HTTP %d", b.backupID, resp.StatusCode)
 		resp.Body.Close()
 		return false
 	}
 	if resp.Header.Get("X-Resume-Ack") != "ok" {
+		b.setError(errors.New("h2tunnel: transport readiness handshake was not acknowledged"))
 		zlog.Warnf("[Backup:%s] 备用握手未确认: %s", b.backupID, resp.Header.Get("X-Resume-Error"))
 		resp.Body.Close()
 		return false
@@ -331,6 +360,6 @@ func (b *backupLine) listenKeepaliveAck(ackCh chan struct{}) {
 
 // isDatagramCap 判断该客户端传输是否为 datagram（UDP）模式。
 // UDP 备用不做 B 层握手（服务端对 datagram 跳过），仅 A 层。
-func isDatagramCap(cfg ClientConfig) bool {
+func isDatagramCap(cfg clientConfig) bool {
 	return cfg.IsUDP() && !cfg.usesWT()
 }

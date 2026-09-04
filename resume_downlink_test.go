@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"bytes"
@@ -13,9 +13,9 @@ import (
 // TestBuildResumeRequestDownlink 守卫生成请求时 X-Resume-Downlink 必须反映
 // 「本地已收下行字节(clientDownlink)」，而非上行环游标(ringBuf.WindowEnd())。
 // 回归：此前 h2 路径误用 ringBuf.WindowEnd()(上行坐标) 作为下行水位，导致断线重连
-// 后服务端按错误起点重放，客户端首帧 seq 不匹配 → ErrGap → 续传失败。
+// 后服务端按错误起点重放，客户端首帧 seq 不匹配 → errGap → 续传失败。
 func TestBuildResumeRequestDownlink(t *testing.T) {
-	base := ClientConfig{
+	base := clientConfig{
 		ServerUrl:     "https://cdn.example.com",
 		Path:          "/tunnel",
 		TargetAddr:    "db.internal:5432",
@@ -84,7 +84,7 @@ func TestResumeRecvLoopDownlinkWatermark(t *testing.T) {
 				}
 				// 真实客户端里：流正常以 END 帧结束 → err=nil；流被关闭(无 END) →
 				// err=io.EOF，调用方据此重连。两种都属「无缺口、水位正确推进」。
-				// 真正要守卫的是：重连流首帧 seq=clientDownlink 不得被判为 ErrGap。
+				// 真正要守卫的是：重连流首帧 seq=clientDownlink 不得被判为 errGap。
 				if recvErr != nil && !errorsIs(recvErr, io.EOF) {
 					t.Fatalf("%s: 期望正常结束或 EOF(重连路径)，实际 err=%v", name, recvErr)
 				}
@@ -105,8 +105,8 @@ func TestResumeRecvLoopDownlinkWatermark(t *testing.T) {
 	runCase("首流从0起算", 0, []uint64{0, 100, 200}, 300, nil)
 	// 重连流：从 500 起，收 500,600,700，已收 800。
 	runCase("重连流从clientDownlink起算", 500, []uint64{500, 600, 700}, 800, nil)
-	// 缺口：期望 0 但首帧为 500 → ErrGap，clientDownlink 不动。
-	runCase("缺口判定ErrGap", 0, []uint64{500, 600, 700}, 0, ErrGap)
+	// 缺口：期望 0 但首帧为 500 → errGap，clientDownlink 不动。
+	runCase("缺口判定ErrGap", 0, []uint64{500, 600, 700}, 0, errGap)
 }
 
 // errorsIs 小封装，避免在测试文件引入 errors 导入歧义。

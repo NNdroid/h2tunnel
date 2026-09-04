@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/rand"
@@ -104,8 +104,8 @@ func TestH2TunnelAllModes(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "secret-e2e-token"
 
-	// 2. 启动隧道服务端 (config-only: 直接构造 ServerConfig，避免依赖已移除的 CLI flag)
-	go startServerDirect(ServerConfig{
+	// 2. 启动隧道服务端 (config-only: 直接构造 serverConfig，避免依赖已移除的 CLI flag)
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -149,8 +149,8 @@ func TestH2TunnelAllModes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clientListen := "127.0.0.1:" + tc.clientPort
 
-			// 启动对应的客户端 (config-only: 协议开关从 tc.args 映射到 ClientConfig 字段)
-			cc := ClientConfig{
+			// 启动对应的客户端 (config-only: 协议开关从 tc.args 映射到 clientConfig 字段)
+			cc := clientConfig{
 				ListenAddr: clientListen,
 				ServerUrl:  serverURL,
 				Path:       "/tunnel",
@@ -268,7 +268,7 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 	}()
 
 	// 启动 H2Tunnel 服务端
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -281,7 +281,7 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	clientListen := "127.0.0.1:21001"
-	go startClientDirect(ClientConfig{
+	go startClientDirect(clientConfig{
 		ListenAddr: clientListen,
 		ServerUrl:  serverURL,
 		Path:       "/tunnel",
@@ -346,7 +346,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 	testToken := "demux-token"
 
 	// 启动严格模式服务端：仅允许 gRPC 且仅允许 TCP
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -362,7 +362,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 	// 测试用例 1: 客户端未开启 gRPC 发起 H2 POST 请求 -> 应被服务端严格分流拦截 (403)
 	t.Run("Reject_Non_gRPC_When_Server_Requires_gRPC", func(t *testing.T) {
 		clientListen := "127.0.0.1:22001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -398,7 +398,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 	// 测试用例 2: 客户端开启 gRPC 发起请求 -> 应顺利通过
 	t.Run("Accept_gRPC_When_Server_Requires_gRPC", func(t *testing.T) {
 		clientListen := "127.0.0.1:22002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -437,7 +437,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 	// 测试用例 3: 客户端尝试发送 UDP 数据 -> 应被服务端限制 Network="tcp" 拦截
 	t.Run("Reject_UDP_When_Server_Requires_TCP_Only", func(t *testing.T) {
 		clientListen := "127.0.0.1:22003"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",

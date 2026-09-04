@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import "sync"
 
@@ -19,9 +19,9 @@ var (
 	}
 )
 
-// UDPData 用于在 UDP Client 中高效地将携带缓冲池指针的数据投递到 channel
+// udpData 用于在 UDP Client 中高效地将携带缓冲池指针的数据投递到 channel
 // 以实现真正的 Zero-Allocation
-type UDPData struct {
+type udpData struct {
 	BufPtr *[]byte
 	Data   []byte
 }

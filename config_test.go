@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"fmt"
@@ -13,7 +13,7 @@ import (
 func TestH2Tunnel_JSONConfigParsing(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// 1. Test Server Config Parsing
+	// 1. Test Server fileConfig Parsing
 	serverJSON := `{
 		"mode": "server",
 		"listen": ":18443",
@@ -40,7 +40,7 @@ func TestH2Tunnel_JSONConfigParsing(t *testing.T) {
 		t.Fatalf("parsed token mismatch: got %q", sCfg.Token)
 	}
 
-	// 2. Test Client Config Parsing with Transport Enum
+	// 2. Test Client fileConfig Parsing with Transport Enum
 	clientJSON := `{
 		"mode": "client",
 		"listen": "127.0.0.1:3333",
@@ -105,7 +105,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	dummyLn.Close()
 	serverListen := fmt.Sprintf("127.0.0.1:%d", h2Port)
 
-	// 3. Create Server JSON Config (Cleartext H2C)
+	// 3. Create Server JSON fileConfig (Cleartext H2C)
 	token := "json_test_token_h2"
 	serverConf := fmt.Sprintf(`{
 		"mode": "server",
@@ -120,7 +120,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 		t.Fatalf("write server_e2e.json failed: %v", err)
 	}
 
-	// 4. Start Server from loaded Config
+	// 4. Start Server from loaded fileConfig
 	sCfg, err := loadConfigFile(serverConfPath)
 	if err != nil {
 		t.Fatalf("load server_e2e.json failed: %v", err)
@@ -137,7 +137,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 	clientDummy.Close()
 	clientListen := fmt.Sprintf("127.0.0.1:%d", clientPort)
 
-	// 6. Create Client JSON Config
+	// 6. Create Client JSON fileConfig
 	clientConf := fmt.Sprintf(`{
 		"mode": "client",
 		"listen": "%s",
@@ -152,7 +152,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 		t.Fatalf("write client_e2e.json failed: %v", err)
 	}
 
-	// 7. Start Client from loaded Config
+	// 7. Start Client from loaded fileConfig
 	cCfg, err := loadConfigFile(clientConfPath)
 	if err != nil {
 		t.Fatalf("load client_e2e.json failed: %v", err)
@@ -181,5 +181,5 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 		t.Fatalf("echo mismatch: got %q, want %q", string(resp), string(testData))
 	}
 
-	t.Logf("✅ Live E2E H2Tunnel via JSON Config PASSED!")
+	t.Logf("✅ Live E2E H2Tunnel via JSON fileConfig PASSED!")
 }

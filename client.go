@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"context"
@@ -23,10 +23,6 @@ import (
 	"github.com/quic-go/webtransport-go"
 	"golang.org/x/net/http2"
 )
-
-func runClient(args []string) {
-	startClientDirect(buildClientConfig(loadConfigFromArgs(args, "client")))
-}
 
 // clientListenerRegistry 记录客户端持有的全部监听器（TCP listener 与 UDP
 // socket），供优雅下线时统一关闭。关闭后 Accept / ReadFromUDP 返回
@@ -55,7 +51,7 @@ func closeAllClientListeners() {
 // 然后给存量隧道一个排空窗口；窗口内再次收到信号则立即退出。
 // 这是 README 所承诺的 Graceful Connection Draining 的客户端侧实现
 // （此前版本只写了文档没有实现，systemd restart 会硬断所有隧道）。
-func installSignalHandler(cfg ClientConfig) {
+func installSignalHandler(cfg clientConfig) {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -79,18 +75,18 @@ func installSignalHandler(cfg ClientConfig) {
 	}()
 }
 
-func startClientDirect(cfg ClientConfig) {
+func startClientDirect(cfg clientConfig) {
 	initLogger(cfg.LogLevel)
 	defer zlog.Sync()
-	zlog.Infof("[Client] 🚀 Starting h2tunnel client v%s...", Version)
+	zlog.Infof("[Client] 🚀 Starting h2tunnel client v%s...", Version())
 
 	installSignalHandler(cfg)
 
 	reqUrl := strings.TrimRight(cfg.ServerUrl, "/") + cfg.Path
 	isHTTPS := strings.HasPrefix(reqUrl, "https://")
 
-	var mgr *ConnectionManager // L3 连接管理（非 WT 传输：h2/h3/grpc/masque 的主备/分流）
-	var wtManager *WTSessionManager
+	var mgr *connectionManager // L3 连接管理（非 WT 传输：h2/h3/grpc/masque 的主备/分流）
+	var wtManager *wtSessionManager
 
 	if cfg.usesWT() {
 		// WT 使用独立的 WebTransport 会话模型（自身有主/备 session 预热），不走 http.Client。
@@ -100,19 +96,19 @@ func startClientDirect(cfg ClientConfig) {
 		}
 		headers := make(http.Header)
 		headers.Set("Protocol", "webtransport")
-		SetXDst(headers, cfg)
-		SetXAuth(headers, cfg)
-		wtManager = &WTSessionManager{
+		setXDst(headers, cfg)
+		setXAuth(headers, cfg)
+		wtManager = &wtSessionManager{
 			dialer: &webtransport.Dialer{
 				TLSClientConfig: tlsConfig,
-				QUICConfig:      GetDefaultQUICConfig(),
+				QUICConfig:      getDefaultQUICConfig(),
 			},
 			reqUrl:  reqUrl,
 			headers: headers,
 		}
 		zlog.Debugf("[Client] Initialized WebTransport Dialer")
 	} else {
-		// 非 WT：resume/2 是唯一数据面，L3 ConnectionManager 管理主/备连接。
+		// 非 WT：resume/2 是唯一数据面，L3 connectionManager 管理主/备连接。
 		// 每条主/备线路拥有独立 http.Client（独立传输/连接池，传输层彼此隔离）。
 		// 业务隧道经 mgr.PickClient(typ) 取当前活跃主线路的客户端；
 		// 主线路阵亡 → 备用（含其预热传输池）升级为主 → 业务隧道立即切到备用传输。
@@ -121,10 +117,10 @@ func startClientDirect(cfg ClientConfig) {
 				zlog.Fatalf("[Client] ❌ HTTP/3 and MASQUE require HTTPS")
 			}
 		}
-		// 策略归一：直接构造（如测试）时 ConnectionPolicy 可能为全零值，
+		// 策略归一：直接构造（如测试）时 connectionPolicy 可能为全零值，
 		// 用默认 1 主 + 1 备 + 建立间隔 100s 兜底。
-		policy := normalizePolicy(cfg.ConnectionPolicy)
-		mgr = NewConnectionManager(policy, cfg, reqUrl, nil, "CM")
+		policy := normalizePolicy(cfg.connectionPolicy)
+		mgr = newConnectionManager(policy, cfg, reqUrl, nil, "CM")
 		mgr.SetClientFactory(func() *http.Client {
 			if cfg.usesMasque() || cfg.usesH3() {
 				// h3 / masque（均走 QUIC）用独立 http3.Transport（见 transport_h3.go）。
@@ -180,7 +176,7 @@ func startClientDirect(cfg ClientConfig) {
 	}
 }
 
-func runUDPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager, wtManager *WTSessionManager) {
+func runUDPClient(reqUrl string, cfg clientConfig, mgr *connectionManager, wtManager *wtSessionManager) {
 	if cfg.usesMasque() {
 		runMasqueUDPClient(cfg, mgr)
 	} else {
@@ -198,7 +194,7 @@ func newClientSessionID() string {
 
 // pickClient 经 L3 连接管理取当前活跃主线路的 http.Client。
 // typ 为业务类型（"tcp"/"udp"，类型分流维度）。mgr 为 nil（如 WT 专属路径）时返回 nil。
-func pickClient(mgr *ConnectionManager, typ string) *http.Client {
+func pickClient(mgr *connectionManager, typ string) *http.Client {
 	if mgr == nil {
 		return nil
 	}
@@ -206,7 +202,7 @@ func pickClient(mgr *ConnectionManager, typ string) *http.Client {
 }
 
 // runTCPClient 启动本地 TCP 监听，将每个入站连接隧穿到远端目标。
-func runTCPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager, wtManager *WTSessionManager) {
+func runTCPClient(reqUrl string, cfg clientConfig, mgr *connectionManager, wtManager *wtSessionManager) {
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		zlog.Fatalf("[Client] ❌ Failed to listen on local TCP: %v", err)
@@ -232,7 +228,7 @@ func runTCPClient(reqUrl string, cfg ClientConfig, mgr *ConnectionManager, wtMan
 		zlog.Infof("[%s] 🟢 New client connection from %s", sessionID, localConn.RemoteAddr())
 
 		if cfg.usesWT() {
-			// WT 接入 resume/2：每条隧道独立 WTSessionManager（headers 带该隧道
+			// WT 接入 resume/2：每条隧道独立 wtSessionManager（headers 带该隧道
 			// X-Session-ID），executeResumeWT 在 stream 断后同 session id 重开新流续传。
 			wtMgr := newWTManagerForTunnel(cfg, reqUrl, sessionID)
 			go executeResumeWT(localConn, cfg, wtMgr, sessionID)
