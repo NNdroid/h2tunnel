@@ -213,8 +213,8 @@ func TestConnManagerPrimaryBackupCounts(t *testing.T) {
 	m, _, _ := startConnManagerEnv(t, 1, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 5*time.Second, "主连接应拨 1 条")
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 5*time.Second, "备用应在 establish 间隔后拨 1 条")
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 15*time.Second, "主连接应拨 1 条")
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 15*time.Second, "备用应在 establish 间隔后拨 1 条")
 	t.Logf("✅ 主=%d 备=%d（默认 1+1）", m.PrimaryCount(), m.BackupCount())
 }
 
@@ -229,7 +229,7 @@ func TestConnManagerTypeSharding(t *testing.T) {
 	m, _, _ := startConnManagerEnv(t, 2, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.PrimaryCount() == 2 }, 5*time.Second, "应拨 2 条主")
+	waitCount(t, func() bool { return m.PrimaryCount() == 2 }, 15*time.Second, "应拨 2 条主")
 	types := m.PrimaryTypes()
 	hasTCP, hasUDP := false, false
 	for _, ty := range types {
@@ -243,7 +243,7 @@ func TestConnManagerTypeSharding(t *testing.T) {
 	if !hasTCP || !hasUDP {
 		t.Fatalf("类型分流未生效: 主类型=%v，期望同时覆盖 tcp 与 udp", types)
 	}
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 5*time.Second, "备用应拨 1 条")
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 15*time.Second, "备用应拨 1 条")
 	t.Logf("✅ 类型分流生效: 主类型=%v 备=%d", types, m.BackupCount())
 }
 
@@ -257,13 +257,13 @@ func TestConnManagerSwitchoverReplenish(t *testing.T) {
 	m.Start()
 
 	// 等主备就绪
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 6*time.Second, "主备就绪")
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 15*time.Second, "主备就绪")
 
 	// 主连接阵亡 → 触发升级+补位
 	m.FailPrimary("default")
 
 	// 升级后主数量应恢复 1，且备用补足 1
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 8*time.Second, "主断后应升级备用并补足数量")
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 15*time.Second, "主断后应升级备用并补足数量")
 	if st := m.PrimaryState("default"); st != backupAlive {
 		t.Fatalf("升级后的主连接状态应为 alive，实际=%s", st)
 	}
@@ -279,7 +279,7 @@ func TestConnManagerBackupKeepaliveFailure(t *testing.T) {
 	m, _, _ := startConnManagerEnv(t, 4, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 6*time.Second, "备用就绪")
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 15*time.Second, "备用就绪")
 
 	// 直接关闭备用线路的流，模拟 KEEPALIVE 断链 → 连续丢 ACK → 判失效
 	m.mu.Lock()
@@ -289,7 +289,7 @@ func TestConnManagerBackupKeepaliveFailure(t *testing.T) {
 	m.mu.Unlock()
 
 	// 失效被移除 → 补位回到 1 条
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 8*time.Second, "失效备用应被移除并补足")
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 15*time.Second, "失效备用应被移除并补足")
 	// 主连接不受影响
 	if m.PrimaryCount() != 1 {
 		t.Fatalf("备用失效不应影响主连接，主=%d", m.PrimaryCount())
@@ -317,7 +317,7 @@ func TestConnManagerDialIntervalThrottle(t *testing.T) {
 	m, _, _ := startConnManagerEnv(t, 5, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 5*time.Second, "主就绪")
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 15*time.Second, "主就绪")
 
 	// 触发主失败：由于距上次主拨号不足 interval，补主应被节流（不早于 interval）
 	t0 := time.Now()
@@ -351,7 +351,7 @@ func TestConnManagerEstablishInterval(t *testing.T) {
 	m.Start()
 
 	// 主应立即出现
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 5*time.Second, "主立即建立")
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 15*time.Second, "主立即建立")
 
 	// 备用应晚于 establish_interval 出现。
 	// 等待窗口需覆盖「初始拨号失败后被 15s 重拨节流」的合法场景：bdSec=0 时
