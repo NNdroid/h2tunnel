@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,16 +24,74 @@ var buildVersion = "1.1.0"
 func Version() string { return buildVersion }
 
 // zlog 是库内共享的日志器，默认 Nop（库嵌入时不打扰宿主程序的 stdout）。
-// CLI 通过 setLogLevel 初始化；库用户可用 setLogger / setLogLevel 注入。
-var zlog *zap.SugaredLogger = zap.NewNop().Sugar()
+// 指针永远不变，setLogger/setLogLevel 只替换底层 zapcore.Core（读写由
+// swapCore 的 RWMutex 保护）—— 服务端/客户端 goroutine 在任何时刻读 zlog
+// 都不会与 logger 重新初始化发生数据竞争。
+var zlog = newSwappableLogger()
+
+// rootSwapCore 是 zlog 根 logger 内部的 swapCore，供 setLogger /
+// setLogLevel 换核（指针不变，只换内核 → 无数据竞争）。
+var rootSwapCore = &swapCore{mu: new(sync.RWMutex), core: zapcore.NewNopCore()}
+
+func newSwappableLogger() *zap.SugaredLogger {
+	return zap.New(rootSwapCore).Sugar()
+}
+
+// swapCore 实现 zapcore.Core，内部持锁委托给可替换的真 core。
+type swapCore struct {
+	mu   *sync.RWMutex
+	core zapcore.Core
+}
+
+func (c *swapCore) swap(core zapcore.Core) {
+	c.mu.Lock()
+	c.core = core
+	c.mu.Unlock()
+}
+
+func (c *swapCore) Enabled(lvl zapcore.Level) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.core.Enabled(lvl)
+}
+
+// With 返回的派生 core 持有 With 时刻的快照：之后的 setLogLevel/setLogger
+// 换核不会影响已派生的 logger（当前代码未使用 zlog.With，纯防御实现）。
+func (c *swapCore) With(fields []zapcore.Field) zapcore.Core {
+	c.mu.RLock()
+	inner := c.core.With(fields)
+	c.mu.RUnlock()
+	return &swapCore{mu: c.mu, core: inner}
+}
+
+func (c *swapCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	c.mu.RLock()
+	core := c.core
+	c.mu.RUnlock()
+	return core.Check(ent, ce)
+}
+
+func (c *swapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
+	c.mu.RLock()
+	core := c.core
+	c.mu.RUnlock()
+	return core.Write(ent, fields)
+}
+
+func (c *swapCore) Sync() error {
+	c.mu.RLock()
+	core := c.core
+	c.mu.RUnlock()
+	return core.Sync()
+}
 
 // setLogger 注入自定义日志器（库嵌入推荐方式）。传 nil 恢复为静默。
 func setLogger(l *zap.SugaredLogger) {
 	if l == nil {
-		zlog = zap.NewNop().Sugar()
+		swapRootCore(zapcore.NewNopCore())
 		return
 	}
-	zlog = l
+	swapRootCore(l.Desugar().Core())
 }
 
 // setLogLevel 按级别构建控制台日志器并设为默认（CLI 使用）。
@@ -60,7 +119,12 @@ func setLogLevel(levelStr string) {
 		zapcore.AddSync(os.Stdout),
 		level,
 	)
-	zlog = zap.New(core).Sugar()
+	swapRootCore(core)
+}
+
+// swapRootCore 替换根 logger 的内核（swapCore 的锁保证与日志写入互斥）。
+func swapRootCore(core zapcore.Core) {
+	rootSwapCore.swap(core)
 }
 
 func initLogger(levelStr string) { setLogLevel(levelStr) }
@@ -365,6 +429,8 @@ type clientConfig struct {
 	Credentials      CredentialProvider `json:"-"`
 	TLSConfig        *tls.Config        `json:"-"`
 	LogicalTargets   bool               `json:"-"`
+	Dialer           ClientDialer       `json:"-"`
+	QUICDialer       QUICDialer         `json:"-"`
 }
 
 func (c *clientConfig) IsUDP() bool {

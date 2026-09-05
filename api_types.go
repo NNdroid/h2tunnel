@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	quic "github.com/quic-go/quic-go"
 )
 
 // Transport identifies the HTTP transport carrying a tunnel stream.
@@ -68,6 +70,12 @@ type DialRequest struct {
 // UDP it must return a connected datagram net.Conn (normally *net.UDPConn).
 type TargetDialer func(context.Context, DialRequest) (net.Conn, error)
 
+// ClientDialer and QUICDialer let embedding applications control the
+// underlying sockets (for example interface binding or Android VPN protect).
+// Nil values keep the standard library / quic-go dialers.
+type ClientDialer func(context.Context, string, string) (net.Conn, error)
+type QUICDialer func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error)
+
 // Service describes one target in a static logical-service registry.
 type Service struct {
 	Network Network
@@ -86,6 +94,8 @@ type ClientOptions struct {
 	Credentials CredentialProvider
 	Tuning      ClientTuning
 	Logger      *slog.Logger
+	Dialer      ClientDialer
+	QUICDialer  QUICDialer
 }
 
 // ClientTuning contains the small set of knobs that materially affect CDN

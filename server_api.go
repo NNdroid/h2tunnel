@@ -38,6 +38,7 @@ type Server struct {
 	closing   bool
 	closed    bool
 	listeners Listeners
+	httpConns map[net.Conn]struct{}
 }
 
 // NewServer validates options and creates a server without opening sockets or
@@ -101,6 +102,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		ctx:        ctx,
 		cancel:     cancel,
 		reaperStop: make(chan struct{}),
+		httpConns:  make(map[net.Conn]struct{}),
 	}
 	s.sessions = &sessionTable{
 		sessions:    make(map[string]*tunnelSession),
@@ -121,6 +123,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       time.Hour,
+		ConnState:         s.trackHTTPConnection,
 	}
 	if cfg.TLSConfig != nil {
 		s.httpServer.TLSConfig = cfg.TLSConfig.Clone()
@@ -235,7 +238,8 @@ func (s *Server) Serve(listeners Listeners) error {
 	s.serving = false
 	wasClosing := s.closing || s.closed
 	s.mu.Unlock()
-	if wasClosing || errors.Is(first.err, http.ErrServerClosed) || errors.Is(first.err, net.ErrClosed) {
+	if wasClosing || first.err == nil ||
+		errors.Is(first.err, http.ErrServerClosed) || errors.Is(first.err, net.ErrClosed) {
 		if !wasClosing {
 			s.finishClose()
 		}
@@ -308,6 +312,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	if err := s.closeTrackedHTTPConnections(); err != nil {
+		errs = append(errs, err)
+	}
 	if ctx.Err() != nil {
 		return errors.Join(append(errs, ctx.Err())...)
 	}
@@ -336,6 +343,9 @@ func (s *Server) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if err := s.closeTrackedHTTPConnections(); err != nil {
+		errs = append(errs, err)
+	}
 	s.finishClose()
 	return errors.Join(errs...)
 }
@@ -362,6 +372,50 @@ func (s *Server) closeListenersOnly() error {
 			errs = append(errs, err)
 		}
 	}
+	if err := s.closeTrackedHTTPConnections(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// h2c.NewHandler hijacks the accepted TCP connection before handing it to
+// http2.Server. net/http deliberately stops tracking hijacked connections, so
+// http.Server.Shutdown and Close cannot terminate them. Keep ownership here so
+// the embeddable Server lifecycle also covers h2c tunnels.
+func (s *Server) trackHTTPConnection(conn net.Conn, state http.ConnState) {
+	closeNow := false
+	s.mu.Lock()
+	switch state {
+	case http.StateClosed:
+		delete(s.httpConns, conn)
+	default:
+		if s.closing || s.closed {
+			closeNow = true
+		} else {
+			s.httpConns[conn] = struct{}{}
+		}
+	}
+	s.mu.Unlock()
+	if closeNow {
+		_ = conn.Close()
+	}
+}
+
+func (s *Server) closeTrackedHTTPConnections() error {
+	s.mu.Lock()
+	connections := make([]net.Conn, 0, len(s.httpConns))
+	for conn := range s.httpConns {
+		connections = append(connections, conn)
+		delete(s.httpConns, conn)
+	}
+	s.mu.Unlock()
+
+	var errs []error
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -374,6 +428,16 @@ func (s *Server) ensureRunning() bool {
 	s.mu.Unlock()
 	s.startOnce.Do(func() { go s.sessions.runReaper(s.reaperStop) })
 	return true
+}
+
+// Listeners 返回当前 Serve 所绑定的监听器。未调用 Serve 时两个成员为 nil；
+// QUIC 成员在端口 0 场景下可通过其 LocalAddr() 读到实际端口（WT-only 服务端
+// 没有 TCP listener，这是唯一的端口发现途径）。返回的是内部引用，仅供读取
+// 地址，调用方不应关闭监听器（所有权归 Serve）。
+func (s *Server) Listeners() Listeners {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listeners
 }
 
 func (s *Server) requiredListeners() (tcp, quic bool) {

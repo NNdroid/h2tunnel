@@ -63,7 +63,7 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 	return "https://" + serverAddr, fmt.Sprintf("127.0.0.1:%d", echoPort)
 }
 
@@ -117,7 +117,7 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	cases := []struct {
 		name      string
@@ -141,7 +141,11 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 			cc.ListenAddr = fmt.Sprintf("127.0.0.1:%d", tc.port)
 			cc.Transport = tc.transport
 			go startClientDirect(cc)
-			time.Sleep(1 * time.Second)
+			if tc.network == "udp" {
+				waitUDPReady(t, cc.ListenAddr, 30*time.Second)
+			} else {
+				waitTCPOrTLSReady(t, cc.ListenAddr, 30*time.Second)
+			}
 
 			// 全双工回显验证：本地 → 隧道 → echo target → 隧道 → 本地
 			var conn net.Conn

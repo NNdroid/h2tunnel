@@ -126,7 +126,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 		t.Fatalf("load server_e2e.json failed: %v", err)
 	}
 	go startServerDirect(buildServerConfig(sCfg))
-	time.Sleep(100 * time.Millisecond)
+	waitPortReady(serverListen, 30*time.Second)
 
 	// 5. Find free port for Client Listen
 	clientDummy, err := net.Listen("tcp", "127.0.0.1:0")
@@ -158,7 +158,7 @@ func TestH2Tunnel_LiveE2E_FromJSONConfig(t *testing.T) {
 		t.Fatalf("load client_e2e.json failed: %v", err)
 	}
 	go startClientDirect(buildClientConfig(cCfg))
-	time.Sleep(150 * time.Millisecond)
+	waitPortReady(clientListen, 30*time.Second)
 
 	// 8. Connect to Client Listener & Test Echo
 	conn, err := net.Dial("tcp", clientListen)

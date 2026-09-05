@@ -25,13 +25,26 @@ jobs:
           cache: true
 
       - name: Vet
+        shell: bash
         run: go vet ./...
 
       - name: Build
+        shell: bash
         run: go build -v ./...
 
-      - name: Test
+      - name: Test (race)
+        # quic-go 官方不支持在 Windows 上启用 Go race detector：原生崩溃
+        # （Exception 0xc0000005 / unknown pc，见 quic-go README 的
+        # race detector 限制一节）。race 检测由 linux/macos 覆盖全部纯
+        # Go 代码；Windows 只跑功能测试。
+        if: runner.os != 'Windows'
+        shell: bash
         run: go test -v -timeout 15m -race -coverprofile=coverage.out ./...
+
+      - name: Test (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: go test -v -timeout 15m ./...
 
       - name: Upload coverage (Linux only)
         if: matrix.os == 'ubuntu-latest'

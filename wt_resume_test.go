@@ -165,7 +165,9 @@ func TestWTResumeReconnect(t *testing.T) {
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	// WT-only 服务端不开 TCP listener（requiredListeners 对 wt 只返回 QUIC），
+	// 且 fakeChunkedTarget 不回显 —— 这里只验证 QUIC 端口已绑定。
+	waitUDPBound(t, serverAddr, 30*time.Second)
 
 	dialer := &webtransport.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{http3.NextProtoH3}},

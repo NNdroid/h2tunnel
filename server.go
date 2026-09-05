@@ -120,6 +120,8 @@ func writeTargetError(w http.ResponseWriter, err error) {
 	}
 }
 
+// startServerDirect 是 legacy 兼容入口（旧 CLI 形态，含信号处理与 os.Exit）；
+// 库用户请改用 NewServer + Serve。仅供包内白盒测试与旧调用方使用。
 func startServerDirect(cfg serverConfig) {
 	initLogger(cfg.LogLevel)
 	defer zlog.Sync()

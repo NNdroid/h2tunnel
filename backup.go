@@ -140,9 +140,10 @@ func (b *backupLine) close() {
 			_ = b.respBody.Close()
 			b.respBody = nil
 		}
+		ctxCancel := b.ctxCancel
 		b.mu.Unlock()
-		if b.ctxCancel != nil {
-			b.ctxCancel()
+		if ctxCancel != nil {
+			ctxCancel()
 		}
 		if b.client != nil && b.client.Transport != nil {
 			if closer, ok := b.client.Transport.(interface{ Close() error }); ok {
@@ -222,7 +223,9 @@ func (b *backupLine) Start() {
 func (b *backupLine) doHandshake() bool {
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
+	b.mu.Lock()
 	b.ctxCancel = cancel
+	b.mu.Unlock()
 
 	cfg := b.cfg
 	cfg.RoleBackup = b.role == roleBackup

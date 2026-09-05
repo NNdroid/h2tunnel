@@ -111,7 +111,9 @@ func runMasqueUDPClient(cfg clientConfig, mgr *connectionManager) {
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
-		zlog.Fatalf("[M-UDP] ❌ 监听失败: %v", err)
+		// 只退出本转发循环，不杀进程（legacy 路径无向调用方传错的通道）。
+		zlog.Errorf("[M-UDP] ❌ 监听失败: %v", err)
+		return
 	}
 	defer localConn.Close()
 	registerClientListener(localConn)

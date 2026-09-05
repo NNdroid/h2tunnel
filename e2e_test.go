@@ -51,8 +51,91 @@ func generateTestCerts(certFile, keyFile string) error {
 // =========================================
 // 2. 启动 Target 回显服务器 (TCP & UDP)
 // =========================================
-func startEchoServer(addr string) {
-	// TCP Echo
+// waitTCPOrTLSReady 轮询直到 TCP 端口可建立连接（TLS 服务端握手在
+// http.Server 层完成，TCP accept 成功即认为监听就绪）。
+// 替代固定 sleep：慢速 CI runner 上 2s 可能不够，本地又白等。
+func waitTCPOrTLSReady(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("server %s not ready within %v", addr, timeout)
+}
+
+// waitPortReady 轮询等待 TCP 端口可连接；不带 *testing.T（供 benchmark /
+// 无 t 环境使用），超时 panic。
+func waitPortReady(addr string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	panic("port " + addr + " not ready within " + timeout.String())
+}
+
+// waitUDPReady 通过一次真实回显（本地 → 客户端 → 隧道 → echo target →
+// 隧道 → 客户端 → 本地）探测 UDP 客户端就绪。不要用"尝试绑定同端口"来
+// 探测：探测 socket 会与被测客户端的 ListenUDP 竞争，窗口期内对方 bind
+// 失败（legacy 路径甚至会 Fatal 杀掉整个测试进程）。回显探测无竞争，且
+// 顺带验证整条 UDP 链路。前提：客户端的 target 是回显服务（测试均满足）。
+func waitUDPReady(t *testing.T, clientAddr string, timeout time.Duration) {
+	t.Helper()
+	conn, err := net.Dial("udp", clientAddr)
+	if err != nil {
+		t.Fatalf("dial udp client %s: %v", clientAddr, err)
+	}
+	defer conn.Close()
+	msg := []byte("udp-ready-probe")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := conn.Write(msg); err != nil {
+			continue
+		}
+		buf := make([]byte, len(msg))
+		n, err := conn.Read(buf)
+		if err == nil && n == len(msg) && string(buf[:n]) == string(msg) {
+			return
+		}
+	}
+	t.Fatalf("udp client %s not ready within %v", clientAddr, timeout)
+}
+
+// waitUDPBound 非竞争地探测 UDP 端口已被绑定（不建立隧道数据面）。
+// 用于预期服务端拒绝、永远等不到回显的场景（如 network=tcp 门禁测试）。
+// 原理：connected UDP socket 向未监听端口发包会收到 ICMP Port Unreachable，
+// 内核把它变成"下一次"读写的连接拒绝错误 —— 两发之间留出 ICMP 到达时间，
+// 第二发报错即未绑定，第二发成功即已绑定。
+func waitUDPBound(t *testing.T, clientAddr string, timeout time.Duration) {
+	t.Helper()
+	conn, err := net.Dial("udp", clientAddr)
+	if err != nil {
+		t.Fatalf("dial udp client %s: %v", clientAddr, err)
+	}
+	defer conn.Close()
+	probe := []byte("udp-bound-probe")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, _ = conn.Write(probe)
+		time.Sleep(30 * time.Millisecond)
+		if _, wErr := conn.Write(probe); wErr == nil {
+			return
+		}
+	}
+	t.Fatalf("udp client %s not bound within %v", clientAddr, timeout)
+}
+
+func startEchoServer(addr string) { // TCP Echo
 	go func() {
 		l, err := net.Listen("tcp", addr)
 		if err != nil {
@@ -116,8 +199,8 @@ func TestH2TunnelAllModes(t *testing.T) {
 		LogLevel:      "error", // 减少测试时的日志刷屏，想看详细过程可以改为 debug
 	})
 
-	// 给服务端一点时间启动
-	time.Sleep(2 * time.Second)
+	// 给服务端一点时间启动（轮询等待，替代固定 sleep：CI 冷启动慢会 flaky）
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	// 3. 测试用例矩阵
 	type testCase struct {
@@ -174,7 +257,11 @@ func TestH2TunnelAllModes(t *testing.T) {
 				}
 			}
 			go startClientDirect(cc)
-			time.Sleep(1 * time.Second) // 等待客户端监听就绪
+			if tc.isUDP {
+				waitUDPReady(t, clientListen, 30*time.Second)
+			} else {
+				waitTCPOrTLSReady(t, clientListen, 30*time.Second)
+			}
 
 			// 发起真实数据测试
 			testMsg := []byte(fmt.Sprintf("Hello h2tunnel via %s", tc.name))
@@ -278,7 +365,7 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	clientListen := "127.0.0.1:21001"
 	go startClientDirect(clientConfig{
@@ -290,7 +377,7 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 		Token:      testToken,
 		LogLevel:   "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 	conn, err := net.Dial("tcp", clientListen)
 	if err != nil {
@@ -357,7 +444,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	// 测试用例 1: 客户端未开启 gRPC 发起 H2 POST 请求 -> 应被服务端严格分流拦截 (403)
 	t.Run("Reject_Non_gRPC_When_Server_Requires_gRPC", func(t *testing.T) {
@@ -372,7 +459,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
@@ -408,7 +495,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
@@ -448,7 +535,8 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		// 预期服务端拒绝 UDP：等不到回显，这里只验证客户端端口已绑定
+		waitUDPBound(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("udp", clientListen)
 		if err != nil {

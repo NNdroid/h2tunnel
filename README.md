@@ -1,5 +1,7 @@
 # h2tunnel
 
+[![Test](https://github.com/NNdroid/h2tunnel/actions/workflows/test.yml/badge.svg)](https://github.com/NNdroid/h2tunnel/actions/workflows/test.yml)
+
 `h2tunnel` 是一个可嵌入 Go 程序的安全隧道库，同时提供独立命令行程序。它把 TCP 或 UDP 服务封装在 HTTP/2、HTTP/3、WebTransport、MASQUE 或 gRPC 连接中，并提供断线恢复、CDN 友好请求头和有界会话缓冲。
 
 服务端不会默认成为开放代理：包 API 强制要求调用方同时提供 `Authenticator` 和 `TargetDialer`。推荐使用逻辑服务名（例如 `ssh`、`postgres`），不让客户端直接决定任意目标地址。
@@ -12,7 +14,15 @@
 go get github.com/NNdroid/h2tunnel
 ```
 
-构建命令行程序：
+一键安装命令行程序（Linux，含 systemd 服务注册）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NNdroid/h2tunnel/main/scripts/install.sh | sudo bash -s -- install
+```
+
+脚本优先使用本地预编译二进制，其次从源码构建，最后从 GitHub Release 下载与系统架构匹配的裸二进制（无需解压）。
+
+从源码构建命令行程序：
 
 ```bash
 go build -trimpath -o h2tunnel ./cmd/h2tunnel
@@ -51,6 +61,7 @@ func NewServer(ServerOptions) (*Server, error)
 func (*Server) Handler() http.Handler
 func (*Server) Serve(Listeners) error
 func (*Server) ListenAndServe(string) error
+func (*Server) Listeners() Listeners
 func (*Server) Shutdown(context.Context) error
 func (*Server) Close() error
 ```
@@ -64,6 +75,10 @@ func NewStaticServiceDialer(map[string]Service, *net.Dialer) (TargetDialer, erro
 ```
 
 `Client` 可并发使用；每次拨号拥有独立逻辑会话。`Server` 是单生命周期对象，关闭后请创建新实例。`NewClient` 和 `NewServer` 只校验配置，不打开端口，也不启动后台任务。
+
+`Client.Start` 失败时会释放全部传输资源并复位状态，可以直接再次调用 `Start` 重试；成功后再次 `Start` 返回首次结果。`Client.Shutdown` 在 context 超时后返回，但存量隧道会在后台继续排空——需要立即终止时调用 `Close` 强制关闭所有活动连接。
+
+`Server.Listeners()` 返回 `Serve` 实际绑定的监听器，端口 0 场景可通过 `Listeners().QUIC.LocalAddr()` 读到实际端口（WT-only 部署没有 TCP 监听器，这是唯一的端口发现途径）。返回值仅供读取地址，监听器的所有权归 `Serve`。
 
 ## 完整包 API 示例
 
@@ -418,7 +433,7 @@ h2tunnel version
 | `token` | 共用 | 空 | 预共享鉴权令牌；生产环境必须设置 |
 | `transport` | 共用 | 服务端 `h2`；客户端按 URL 推断 | 服务端可逗号分隔或设为 `all`；客户端只能选一个 |
 | `network` | 共用 | `tcp` | `tcp`、`udp` 或 `all` |
-| `tls` | 服务端 | `false` | gRPC 是否启用 TLS；`h2/h3/wt/masque` 自动要求 TLS，`h2c` 强制明文 |
+| `tls` | 服务端 | `false` | 是否启用 TLS；`h2/h3/wt/masque` 自动要求 TLS，`h2c` 强制明文 |
 | `cert` / `key` | 服务端 | 空 | TLS 证书和私钥，必须成对设置 |
 | `local_only` | 服务端 | `false` | 只允许回环目标 |
 | `insecure` | 客户端 | `false` | 跳过证书校验，仅用于受控测试 |
@@ -448,7 +463,7 @@ h2tunnel version
 }
 ```
 
-TLS 的 TCP 协议和 QUIC 协议可共享同一个数字端口。`h2c` 是明文协议，不能在同一监听地址上与 TLS/H3 协议混用。客户端每个进程只选择一个传输。
+TLS 的 TCP 协议和 QUIC 协议可共享同一个数字端口。`h2c` 是明文协议，不能在同一监听地址上与 TLS/H3 协议混用。客户端每个进程只选择一个传输。注意 `h2` 现在是 TLS-only 传输：需要明文源站时使用 `h2c`。
 
 ### 生成辅助配置
 
@@ -482,6 +497,17 @@ go build ./cmd/h2tunnel
 ```bash
 go test -run '^$' -bench '^BenchmarkPublicAPIThroughCDN72KB$' -benchmem .
 ```
+
+## 持续集成与发布
+
+每次 push 会自动在 Ubuntu、Windows、macOS 上运行 `go vet`、`go build` 和 `go test -race`（见 `.github/workflows/test.yml`）。
+
+发布流程（`.github/workflows/release.yml`）：
+
+1. **自动发布**：推送任意 `v*` 格式的 tag 触发，交叉编译 7 个平台的裸二进制（linux amd64/arm64/arm/386、windows amd64、darwin amd64/arm64），直接作为 Release 附件上传，不打包压缩包。
+2. **手动构建**：在 GitHub Actions 页面对 Release workflow 手动触发，产物只汇总到该次运行的 Artifacts（`h2tunnel-manual-<sha>`），不创建 Release。
+
+二进制通过 `-ldflags "-X github.com/NNdroid/h2tunnel.buildVersion=..."` 注入版本号，格式为 `v1.0.yyyyMMdd-<commit短哈希>`，`h2tunnel version` 会输出该值。tag 名本身不参与版本计算，推送后 Release 标题即为计算出的规范版本。
 
 ## 安全说明
 

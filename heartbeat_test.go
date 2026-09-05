@@ -45,7 +45,7 @@ func TestHeartbeatIdleTunnelE2E(t *testing.T) {
 		// 测试专用短心跳：直接构造配置不走 clampHeartbeat，
 		// 300ms 间隔下 1.2s 空闲覆盖 4 个完整心跳周期
 	})
-	time.Sleep(2 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	clientListen := "127.0.0.1:20902"
 	go startClientDirect(clientConfig{
@@ -58,7 +58,7 @@ func TestHeartbeatIdleTunnelE2E(t *testing.T) {
 		LogLevel:          "error",
 		HeartbeatInterval: 300 * time.Millisecond,
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 	conn, err := net.Dial("tcp", clientListen)
 	if err != nil {

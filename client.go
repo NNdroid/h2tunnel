@@ -75,6 +75,9 @@ func installSignalHandler(cfg clientConfig) {
 	}()
 }
 
+// startClientDirect 是 legacy 兼容入口（旧 CLI 形态，绑定本地监听、信号处理
+// 与 os.Exit）；库用户请改用 NewClient + DialContext/DialPacketContext。
+// 仅供包内白盒测试与旧调用方使用。
 func startClientDirect(cfg clientConfig) {
 	initLogger(cfg.LogLevel)
 	defer zlog.Sync()

@@ -38,7 +38,7 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	clientListen := "127.0.0.1:23001"
 	// 启动客户端，明确配置 network="all"
@@ -52,7 +52,7 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 		Token:      testToken,
 		LogLevel:   "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 	// A. 测试 TCP 通道
 	t.Run("TCP_Channel_Over_DualStack", func(t *testing.T) {
@@ -128,7 +128,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	// A. 尝试通过客户端发起 TCP 连接 -> 服务端必须拦截（返回 403）
 	t.Run("Reject_TCP_Traffic", func(t *testing.T) {
@@ -143,7 +143,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
@@ -174,7 +174,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitUDPReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("udp", clientListen)
 		if err != nil {
@@ -223,7 +223,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	// A. 客户端尝试用 gRPC 协议连接 -> 服务端应拦截
 	t.Run("Reject_gRPC_Traffic", func(t *testing.T) {
@@ -238,7 +238,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
@@ -269,7 +269,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
@@ -299,7 +299,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
@@ -349,7 +349,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 		ExpectedToken: testToken,
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	// A. 请求合法本地目标 -> 允许通行
 	t.Run("Allow_Local_Target", func(t *testing.T) {
@@ -363,7 +363,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
@@ -394,7 +394,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {

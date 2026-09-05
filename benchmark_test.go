@@ -34,7 +34,7 @@ func setupBenchmarkEnv() (serverURL, targetAddr, testToken string) {
 		LogLevel:      "fatal", // 压测时关掉服务端日志
 	})
 
-	time.Sleep(2 * time.Second)
+	waitPortReady(serverAddr, 30*time.Second)
 	return serverURL, targetAddr, testToken
 }
 
@@ -92,7 +92,9 @@ func BenchmarkH2TunnelAllProtocols(b *testing.B) {
 		}
 		go startClientDirect(cc)
 	}
-	time.Sleep(2 * time.Second) // 等待所有客户端端口绑定完毕
+	// 等待所有客户端端口绑定完毕（轮询最后一个端口，替代固定 sleep）
+	lastListen := "127.0.0.1:" + cases[len(cases)-1].clientPort
+	waitPortReady(lastListen, 30*time.Second)
 
 	// 每次发送 16KB 的数据块 (既能测出吞吐量，又不会超过 UDP 的安全边界)
 	payloadSize := 16 * 1024

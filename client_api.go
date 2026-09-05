@@ -125,6 +125,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 		Credentials:       options.Credentials,
 		TLSConfig:         tlsConfig,
 		LogicalTargets:    true,
+		Dialer:            options.Dialer,
+		QUICDialer:        options.QUICDialer,
 		TargetAddr:        "__probe__",
 		connectionPolicy: connectionPolicy{
 			PrimaryCount:         2,
@@ -154,6 +156,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 
 // Start initializes and verifies the transport. It is safe to call
 // concurrently and is also invoked lazily by DialContext/DialPacketContext.
+// A failed Start releases all transport resources and returns the error; the
+// Client may be retried (state resets so Start can run again).
 func (c *Client) Start(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed || c.closing {
@@ -188,12 +192,13 @@ func (c *Client) Start(ctx context.Context) error {
 func (c *Client) startTransport() {
 	c.log.Debug("starting tunnel transport", "transport", c.cfg.Transport)
 	var err error
+	var mgr *connectionManager
 	if c.cfg.usesWT() {
 		// WT has no reusable HTTP connection pool. The first business dial does
 		// the authenticated WebTransport handshake and reports target readiness.
 		err = nil
 	} else {
-		mgr := newConnectionManager(c.cfg.connectionPolicy, c.cfg, c.reqURL, nil, "API")
+		mgr = newConnectionManager(c.cfg.connectionPolicy, c.cfg, c.reqURL, nil, "API")
 		mgr.SetClientFactory(c.newHTTPClient)
 		c.mu.Lock()
 		if c.closing || c.closed {
@@ -209,9 +214,22 @@ func (c *Client) startTransport() {
 	}
 	c.mu.Lock()
 	c.startErr = err
-	c.started = true
 	c.starting = false
-	close(c.startDone)
+	done := c.startDone
+	if err != nil && !c.closing && !c.closed {
+		// 失败即复位（单一 goroutine 串行执行，无并发写风险）：释放传输
+		// 资源、换新 startDone，让下一次 Start 从头初始化实现可重试。
+		if mgr != nil {
+			failed := mgr
+			c.mgr = nil
+			go failed.Close()
+		}
+		c.started = false
+		c.startDone = make(chan struct{})
+	} else {
+		c.started = true
+	}
+	close(done)
 	c.mu.Unlock()
 	if err != nil {
 		c.log.Error("tunnel transport failed", "transport", c.cfg.Transport, "error", err)
@@ -229,9 +247,26 @@ func (c *Client) newHTTPClient() *http.Client {
 		if c.tlsConfig != nil {
 			t2.TLSClientConfig = c.tlsConfig.Clone()
 		}
+		if c.cfg.Dialer != nil {
+			t2.DialTLSContext = func(ctx context.Context, network, address string, tlsConfig *tls.Config) (net.Conn, error) {
+				raw, err := c.cfg.Dialer(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(raw, tlsConfig)
+				if err := tlsConn.HandshakeContext(ctx); err != nil {
+					_ = raw.Close()
+					return nil, err
+				}
+				return tlsConn, nil
+			}
+		}
 	} else {
 		t2.AllowHTTP = true
 		t2.DialTLSContext = func(ctx context.Context, network, address string, _ *tls.Config) (net.Conn, error) {
+			if c.cfg.Dialer != nil {
+				return c.cfg.Dialer(ctx, network, address)
+			}
 			var dialer net.Dialer
 			return dialer.DialContext(ctx, network, address)
 		}
@@ -370,6 +405,9 @@ func (c *Client) DialPacketContext(ctx context.Context, network, target string) 
 }
 
 // Shutdown rejects new dials and waits for active tunnels to close naturally.
+// When ctx expires the remaining tunnels keep draining in the background; call
+// Close to force-close them (the internal waiter terminates once Close runs,
+// since Close tears down every active tunnel).
 func (c *Client) Shutdown(ctx context.Context) error {
 	c.log.Debug("draining tunnel client")
 	c.mu.Lock()

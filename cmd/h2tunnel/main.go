@@ -207,7 +207,7 @@ func runClient(cfg *config, logger *slog.Logger) error {
 			return err
 		}
 		closers = append(closers, packetListener)
-		go func() { errCh <- runUDPForwarder(ctx, packetListener, client, cfg.Target) }()
+		go func() { errCh <- runUDPForwarder(ctx, packetListener, client, cfg.Target, logger) }()
 	}
 	select {
 	case <-ctx.Done():
@@ -250,10 +250,20 @@ func runTCPForwarder(ctx context.Context, listener net.Listener, client *h2tunne
 	}
 }
 
-func runUDPForwarder(ctx context.Context, listener net.PacketConn, client *h2tunnel.Client, target string) error {
-	type session struct {
-		conn h2tunnel.PacketConn
-	}
+// udpForwardWriteWait 单包上行写入的限时。虚拟 conn 的上游队列满时 Write
+// 会阻塞，而写入发生在主 ReadFrom 循环里 —— 不限时的话一个不读包的客户端
+// 会拖停所有 UDP 客户端（旧版数据面的已知坑），超时即丢弃该包。
+const udpForwardWriteWait = 100 * time.Millisecond
+
+// udpForwardSession 一个 UDP 客户端地址对应的隧道会话。
+// conn/err 只在 dial goroutine 里写、close(ready) 之后读（happens-before）。
+type udpForwardSession struct {
+	ready chan struct{}
+	conn  h2tunnel.PacketConn
+	err   error
+}
+
+func runUDPForwarder(ctx context.Context, listener net.PacketConn, client *h2tunnel.Client, target string, logger *slog.Logger) error {
 	var sessions sync.Map
 	buffer := make([]byte, 64*1024)
 	for {
@@ -264,22 +274,28 @@ func runUDPForwarder(ctx context.Context, listener net.PacketConn, client *h2tun
 		key := clientAddr.String()
 		value, ok := sessions.Load(key)
 		if !ok {
-			remote, err := client.DialPacketContext(ctx, h2tunnel.NetworkUDP, target)
-			if err != nil {
-				continue
-			}
-			entry := &session{conn: remote}
+			entry := &udpForwardSession{ready: make(chan struct{})}
 			actual, loaded := sessions.LoadOrStore(key, entry)
 			if loaded {
-				_ = remote.Close()
-				entry = actual.(*session)
+				entry = actual.(*udpForwardSession)
 			} else {
-				go func(addr net.Addr, current *session) {
+				// 拨号异步进行：主循环绝不等待隧道建立（握手可达秒级，
+				// 伪造源地址即可反复阻塞主循环）。就绪前的包按 UDP 语义丢弃。
+				go func(addr net.Addr, current *udpForwardSession) {
 					defer sessions.Delete(addr.String())
-					defer current.conn.Close()
+					remote, err := client.DialPacketContext(ctx, h2tunnel.NetworkUDP, target)
+					if err != nil {
+						current.err = err
+						close(current.ready)
+						logger.Warn("udp tunnel dial failed", "client", addr.String(), "error", err)
+						return
+					}
+					current.conn = remote
+					close(current.ready)
+					defer remote.Close()
 					downlink := make([]byte, 64*1024)
 					for {
-						n, err := current.conn.Read(downlink)
+						n, err := remote.Read(downlink)
 						if err != nil {
 							return
 						}
@@ -291,10 +307,27 @@ func runUDPForwarder(ctx context.Context, listener net.PacketConn, client *h2tun
 			}
 			value = entry
 		}
-		packet := append([]byte(nil), buffer[:n]...)
-		if _, err := value.(*session).conn.Write(packet); err != nil {
+		entry := value.(*udpForwardSession)
+		select {
+		case <-entry.ready:
+		default:
+			// 隧道未就绪：丢弃本包，应用层重试即可
+			logger.Debug("udp tunnel not ready, dropping packet", "client", key)
+			continue
+		}
+		if entry.err != nil || entry.conn == nil {
 			sessions.Delete(key)
-			_ = value.(*session).conn.Close()
+			continue
+		}
+		packet := append([]byte(nil), buffer[:n]...)
+		_ = entry.conn.SetWriteDeadline(time.Now().Add(udpForwardWriteWait))
+		if _, err := entry.conn.Write(packet); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+				logger.Warn("udp uplink queue full, dropping packet", "client", key)
+				continue
+			}
+			sessions.Delete(key)
+			_ = entry.conn.Close()
 		}
 	}
 }

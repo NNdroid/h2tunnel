@@ -48,7 +48,7 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 	return "https://" + serverAddr + "|" + fmt.Sprintf("%d", echoPort)
 }
 

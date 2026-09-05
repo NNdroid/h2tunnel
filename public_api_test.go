@@ -61,10 +61,16 @@ func TestPublicAPIH2CEndToEnd(t *testing.T) {
 		}
 	}()
 
+	var clientDialCalls atomic.Int32
 	client, err := h2tunnel.NewClient(h2tunnel.ClientOptions{
 		Endpoint:    "http://" + listener.Addr().String(),
 		Transport:   h2tunnel.TransportH2C,
 		Credentials: credentials,
+		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+			clientDialCalls.Add(1)
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, address)
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -89,6 +95,9 @@ func TestPublicAPIH2CEndToEnd(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+	if clientDialCalls.Load() == 0 {
+		t.Fatal("custom client dialer was not used")
 	}
 }
 

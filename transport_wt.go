@@ -154,6 +154,7 @@ func newWTManagerForTunnelContext(ctx context.Context, cfg clientConfig, reqUrl,
 		dialer: &webtransport.Dialer{
 			TLSClientConfig: tlsConfig,
 			QUICConfig:      getDefaultQUICConfig(),
+			DialAddr:        cfg.QUICDialer,
 		},
 		reqUrl:  reqUrl,
 		headers: headers,
@@ -344,7 +345,9 @@ func runStreamUDPClient(reqUrl string, cfg clientConfig, mgr *connectionManager,
 	localAddr, _ := net.ResolveUDPAddr("udp", cfg.ListenAddr)
 	localConn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
-		zlog.Fatalf("[S-UDP] ❌ 监听失败: %v", err)
+		// 只退出本转发循环，不杀进程（legacy 路径无向调用方传错的通道）。
+		zlog.Errorf("[S-UDP] ❌ 监听失败: %v", err)
+		return
 	}
 	defer localConn.Close()
 	registerClientListener(localConn)
