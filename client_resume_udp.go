@@ -68,7 +68,7 @@ func newUDPSession(sessionID string, cfg clientConfig, reqUrl string, httpClient
 		httpClient: httpClient,
 		localConn:  localConn,
 		clientAddr: clientAddr,
-		upstream:   make(chan []byte, 200),
+		upstream:   make(chan []byte, cfg.datagramQueueSize()),
 		done:       make(chan struct{}),
 	}
 	if cfg.usesMasque() {
@@ -99,7 +99,7 @@ func (s *udpSession) enqueue(pkt []byte) {
 		return
 	case s.upstream <- pkt:
 	default:
-		zlog.Warnf("[UDP-Resume:%s] 上行队列溢出，丢弃来自 %s 的包", s.sessionID, s.clientAddr)
+		lgWarnf(s.cfg.lg(), "[UDP-Resume:%s] 上行队列溢出，丢弃来自 %s 的包", s.sessionID, s.clientAddr)
 	}
 }
 
@@ -137,8 +137,11 @@ func (s *udpSession) run() {
 		if delay > udpResumeBackoffMax {
 			delay = udpResumeBackoffMax
 		}
-		zlog.Infof("[UDP-Resume:%s] 🔁 流断，第 %d 次重拨（同 session 续传），等待 %v: %v",
+		lgInfof(s.cfg.lg(), "[UDP-Resume:%s] 🔁 流断，第 %d 次重拨（同 session 续传），等待 %v: %v",
 			s.sessionID, attempt, delay, err)
+		if s.cfg.stats != nil {
+			s.cfg.stats.ResumeReconnects.Add(1)
+		}
 		select {
 		case <-s.done:
 			return
@@ -148,7 +151,7 @@ func (s *udpSession) run() {
 		case <-time.After(delay):
 		}
 	}
-	zlog.Warnf("[UDP-Resume:%s] 超过最大重试次数 (%d)，会话终止", s.sessionID, udpResumeMaxAttempts)
+	lgWarnf(s.cfg.lg(), "[UDP-Resume:%s] 超过最大重试次数 (%d)，会话终止", s.sessionID, udpResumeMaxAttempts)
 }
 
 func (s *udpSession) isDone() bool {
@@ -205,9 +208,9 @@ func (s *udpSession) runOneStream() error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return &tunnelHTTPError{status: resp.StatusCode}
+		return newTunnelHTTPError(resp.StatusCode)
 	}
-	zlog.Infof("[UDP-Resume:%s] ✅ 隧道就绪", s.sessionID)
+	lgInfof(s.cfg.lg(), "[UDP-Resume:%s] ✅ 隧道就绪", s.sessionID)
 	s.notifyReady(nil)
 
 	var wg sync.WaitGroup
@@ -229,7 +232,7 @@ func (s *udpSession) runOneStream() error {
 					return
 				}
 				if err := s.frameW(pw, pkt); err != nil {
-					zlog.Debugf("[UDP-Resume:%s] 上行写失败: %v", s.sessionID, err)
+					lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] 上行写失败: %v", s.sessionID, err)
 					return
 				}
 			}
@@ -246,7 +249,7 @@ func (s *udpSession) runOneStream() error {
 		for {
 			n, rErr := s.frameR(resp.Body, buf)
 			if rErr != nil {
-				zlog.Debugf("[UDP-Resume:%s] 下行读结束: %v", s.sessionID, rErr)
+				lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] 下行读结束: %v", s.sessionID, rErr)
 				return
 			}
 			var wErr error
@@ -258,7 +261,7 @@ func (s *udpSession) runOneStream() error {
 				wErr = errors.New("udp resume session has no delivery target")
 			}
 			if wErr != nil {
-				zlog.Debugf("[UDP-Resume:%s] 本地 UDP 写失败: %v", s.sessionID, wErr)
+				lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] 本地 UDP 写失败: %v", s.sessionID, wErr)
 				return
 			}
 		}
@@ -287,7 +290,7 @@ func buildResumeUDPRequestChecked(ctx context.Context, body io.Reader, sessID, r
 			host, port = cfg.TargetAddr, "53"
 		}
 		u, _ := url.Parse(reqUrl)
-		u.Path = fmt.Sprintf("/.well-known/masque/udp/%s/%s/", url.PathEscape(host), url.PathEscape(port))
+		u.Path = fmt.Sprintf("%s/udp/%s/%s/", masquePathBase(cfg.Path), url.PathEscape(host), url.PathEscape(port))
 		reqURL = u.String()
 	} else {
 		method = http.MethodPost
@@ -338,7 +341,7 @@ func buildResumeUDPRequestChecked(ctx context.Context, body io.Reader, sessID, r
 // （无可用主线路，调用方应优雅丢弃该 UDP 会话）。
 func connectResumeUDP(sessionID string, cfg clientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
 	if httpClient == nil {
-		zlog.Warnf("[UDP-Resume:%s] 无可用主线路客户端，放弃 UDP 会话", sessionID)
+		lgWarnf(cfg.lg(), "[UDP-Resume:%s] 无可用主线路客户端，放弃 UDP 会话", sessionID)
 		return nil
 	}
 	s := newUDPSession(sessionID, cfg, reqUrl, httpClient, localConn, clientAddr)

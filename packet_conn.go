@@ -24,9 +24,15 @@ type virtualPacketConn struct {
 
 	ctx      context.Context
 	cancel   context.CancelFunc
-	session  *udpSession
 	incoming chan []byte
 	done     chan struct{}
+
+	// 隧道数据面接入口，由 DialPacketContext 按传输注入：
+	//   - h2/h2c/h3/grpc/masque：udpSession（upstream=上行队列，tunnelDone=会话结束）
+	//   - wt：WT 流 datagram 面（见 client_api.go dialPacketWT）
+	upstream   chan<- []byte
+	tunnelDone <-chan struct{}
+	tunnel     io.Closer
 
 	mu            sync.Mutex
 	readDeadline  time.Time
@@ -102,7 +108,7 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		deadline, changed := c.writeState()
 		timer, timeout := deadlineTimer(deadline)
 		select {
-		case c.session.upstream <- packet:
+		case c.upstream <- packet:
 			stopTimer(timer)
 			return len(p), nil
 		case <-changed:
@@ -111,13 +117,32 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		case <-c.done:
 			stopTimer(timer)
 			return 0, c.endError()
-		case <-c.session.done:
+		case <-c.tunnelDone:
 			stopTimer(timer)
 			return 0, net.ErrClosed
 		case <-timeout:
 			return 0, &net.OpError{Op: "write", Net: networkUDP, Addr: c.remote, Err: context.DeadlineExceeded}
 		}
 	}
+}
+
+// attachUDPSession 注入 udpSession 数据面（h2/h2c/h3/grpc/masque）。
+func (c *virtualPacketConn) attachUDPSession(session *udpSession) {
+	c.upstream = session.upstream
+	c.tunnelDone = session.done
+	c.tunnel = closeFunc(session.close)
+}
+
+// closeFunc 把无返回值的关闭函数适配成 io.Closer（幂等性由被包装方保证）。
+type closeFunc func()
+
+func (f closeFunc) Close() error { f(); return nil }
+
+// attachWTTunnel 注入 WebTransport 流数据面。
+func (c *virtualPacketConn) attachWTTunnel(upstream chan<- []byte, tunnelDone <-chan struct{}, tunnel io.Closer) {
+	c.upstream = upstream
+	c.tunnelDone = tunnelDone
+	c.tunnel = tunnel
 }
 
 func (c *virtualPacketConn) Close() error {
@@ -133,8 +158,8 @@ func (c *virtualPacketConn) fail(err error) {
 		if c.cancel != nil {
 			c.cancel()
 		}
-		if c.session != nil {
-			c.session.close()
+		if c.tunnel != nil {
+			_ = c.tunnel.Close()
 		}
 		close(c.done)
 		if c.onClose != nil {

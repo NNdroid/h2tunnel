@@ -7,15 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"time"
 )
 
 var buildVersion = "1.1.0"
@@ -23,111 +21,55 @@ var buildVersion = "1.1.0"
 // Version returns the build version embedded by the release workflow.
 func Version() string { return buildVersion }
 
-// zlog 是库内共享的日志器，默认 Nop（库嵌入时不打扰宿主程序的 stdout）。
-// 指针永远不变，setLogger/setLogLevel 只替换底层 zapcore.Core（读写由
-// swapCore 的 RWMutex 保护）—— 服务端/客户端 goroutine 在任何时刻读 zlog
-// 都不会与 logger 重新初始化发生数据竞争。
-var zlog = newSwappableLogger()
+// discardLogger 是未注入 Logger 时的包级默认：库嵌入时不打扰宿主程序
+// 的 stdout。数据面日志统一走 slog：clientConfig / serverConfig 持有
+// options.Logger 派生的实例日志器（见 lg()），未注入时回落到这里。
+var discardLogger = slog.New(slog.DiscardHandler)
 
-// rootSwapCore 是 zlog 根 logger 内部的 swapCore，供 setLogger /
-// setLogLevel 换核（指针不变，只换内核 → 无数据竞争）。
-var rootSwapCore = &swapCore{mu: new(sync.RWMutex), core: zapcore.NewNopCore()}
-
-func newSwappableLogger() *zap.SugaredLogger {
-	return zap.New(rootSwapCore).Sugar()
+// lg 返回客户端实例日志器（nil 安全）。
+func (c *clientConfig) lg() *slog.Logger {
+	if c.logger != nil {
+		return c.logger
+	}
+	return discardLogger
 }
 
-// swapCore 实现 zapcore.Core，内部持锁委托给可替换的真 core。
-type swapCore struct {
-	mu   *sync.RWMutex
-	core zapcore.Core
+// datagramQueueSize 返回 UDP 上行队列深度（0 → 默认 200）。
+func (c *clientConfig) datagramQueueSize() int {
+	if c.DatagramQueueSize > 0 {
+		return c.DatagramQueueSize
+	}
+	return 200
 }
 
-func (c *swapCore) swap(core zapcore.Core) {
-	c.mu.Lock()
-	c.core = core
-	c.mu.Unlock()
+// lg 返回服务端实例日志器（nil 安全）。
+func (s *serverConfig) lg() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return discardLogger
 }
 
-func (c *swapCore) Enabled(lvl zapcore.Level) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.core.Enabled(lvl)
+// —— 数据面 printf 日志适配：保留既有消息格式，落点是实例 slog ——
+
+func lgDebugf(l *slog.Logger, format string, args ...any) {
+	logfAt(l, slog.LevelDebug, format, args...)
 }
 
-// With 返回的派生 core 持有 With 时刻的快照：之后的 setLogLevel/setLogger
-// 换核不会影响已派生的 logger（当前代码未使用 zlog.With，纯防御实现）。
-func (c *swapCore) With(fields []zapcore.Field) zapcore.Core {
-	c.mu.RLock()
-	inner := c.core.With(fields)
-	c.mu.RUnlock()
-	return &swapCore{mu: c.mu, core: inner}
+func lgInfof(l *slog.Logger, format string, args ...any) { logfAt(l, slog.LevelInfo, format, args...) }
+
+func lgWarnf(l *slog.Logger, format string, args ...any) { logfAt(l, slog.LevelWarn, format, args...) }
+
+func lgErrorf(l *slog.Logger, format string, args ...any) {
+	logfAt(l, slog.LevelError, format, args...)
 }
 
-func (c *swapCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
-	c.mu.RLock()
-	core := c.core
-	c.mu.RUnlock()
-	return core.Check(ent, ce)
-}
-
-func (c *swapCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
-	c.mu.RLock()
-	core := c.core
-	c.mu.RUnlock()
-	return core.Write(ent, fields)
-}
-
-func (c *swapCore) Sync() error {
-	c.mu.RLock()
-	core := c.core
-	c.mu.RUnlock()
-	return core.Sync()
-}
-
-// setLogger 注入自定义日志器（库嵌入推荐方式）。传 nil 恢复为静默。
-func setLogger(l *zap.SugaredLogger) {
+func logfAt(l *slog.Logger, level slog.Level, format string, args ...any) {
 	if l == nil {
-		swapRootCore(zapcore.NewNopCore())
 		return
 	}
-	swapRootCore(l.Desugar().Core())
+	l.Log(context.Background(), level, fmt.Sprintf(format, args...))
 }
-
-// setLogLevel 按级别构建控制台日志器并设为默认（CLI 使用）。
-func setLogLevel(levelStr string) {
-	var level zapcore.Level
-	switch strings.ToLower(levelStr) {
-	case "debug":
-		level = zapcore.DebugLevel
-	case "info":
-		level = zapcore.InfoLevel
-	case "warn":
-		level = zapcore.WarnLevel
-	case "error":
-		level = zapcore.ErrorLevel
-	default:
-		level = zapcore.InfoLevel
-	}
-
-	encoderConfig := zap.NewProductionEncoderConfig()
-	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-
-	core := zapcore.NewCore(
-		zapcore.NewConsoleEncoder(encoderConfig),
-		zapcore.AddSync(os.Stdout),
-		level,
-	)
-	swapRootCore(core)
-}
-
-// swapRootCore 替换根 logger 的内核（swapCore 的锁保证与日志写入互斥）。
-func swapRootCore(core zapcore.Core) {
-	rootSwapCore.swap(core)
-}
-
-func initLogger(levelStr string) { setLogLevel(levelStr) }
 
 type fileConfig struct {
 	Mode      string `json:"mode"`       // "server" or "client"
@@ -367,18 +309,17 @@ func validateConfig(cfg *fileConfig) error {
 
 // serverConfig 服务端运行时配置。可直接程序化构造（零值字段自动取默认）。
 type serverConfig struct {
-	ListenAddr    string        `json:"listen"`
-	TLSCert       string        `json:"cert"`
-	TLSKey        string        `json:"key"`
-	EnableTLS     bool          `json:"tls"`
-	Path          string        `json:"path"`
-	LocalOnly     bool          `json:"local_only"`
-	LogLevel      string        `json:"log_level"`
-	EnableH3      bool          `json:"-"`
-	Transport     string        `json:"transport"`
-	Network       string        `json:"network"` // "all", "tcp", "udp"
-	ExpectedToken string        `json:"token"`
-	DrainTimeout  time.Duration `json:"-"` // 由 drain_timeout_sec 换算
+	ListenAddr   string        `json:"listen"`
+	TLSCert      string        `json:"cert"`
+	TLSKey       string        `json:"key"`
+	EnableTLS    bool          `json:"tls"`
+	Path         string        `json:"path"`
+	LocalOnly    bool          `json:"local_only"`
+	LogLevel     string        `json:"log_level"`
+	EnableH3     bool          `json:"-"`
+	Transport    string        `json:"transport"`
+	Network      string        `json:"network"` // "all", "tcp", "udp"
+	DrainTimeout time.Duration `json:"-"`       // 由 drain_timeout_sec 换算
 	// SessionWindow 会话恢复环形缓冲容量（KB），服务端侧必须实现才能配合客户端恢复。
 	SessionWindow int `json:"-"`
 
@@ -389,6 +330,8 @@ type serverConfig struct {
 	DialTarget func(ctx context.Context, network, addr string) (net.Conn, error) `json:"-"`
 	// API-only hooks. CLI construction maps its token and direct-address policy
 	// to these callbacks before creating a Server.
+	stats              *ServerStats    `json:"-"`
+	logger             *slog.Logger    `json:"-"`
 	Authenticator      Authenticator   `json:"-"`
 	TargetDialer       TargetDialer    `json:"-"`
 	TLSConfig          *tls.Config     `json:"-"`
@@ -426,11 +369,16 @@ type clientConfig struct {
 	RoleBackup bool `json:"-"`
 	// connectionPolicy 连接管理策略（主备数量/间隔/类型分流）。
 	connectionPolicy connectionPolicy   `json:"-"`
+	stats            *ClientStats       `json:"-"`
+	logger           *slog.Logger       `json:"-"`
 	Credentials      CredentialProvider `json:"-"`
 	TLSConfig        *tls.Config        `json:"-"`
 	LogicalTargets   bool               `json:"-"`
 	Dialer           ClientDialer       `json:"-"`
 	QUICDialer       QUICDialer         `json:"-"`
+
+	// DatagramQueueSize UDP 数据报上行队列深度（0 → 默认 200）。
+	DatagramQueueSize int `json:"-"`
 }
 
 func (c *clientConfig) IsUDP() bool {
@@ -547,7 +495,6 @@ func buildServerConfigChecked(cfg *fileConfig) (serverConfig, error) {
 		LogLevel:      logLevel,
 		Transport:     transport,
 		Network:       netMode,
-		ExpectedToken: cfg.Token,
 		DrainTimeout:  resolveDrainTimeout(cfg.DrainTimeoutSec),
 		SessionWindow: resolveSessionWindow(cfg.SessionWindowKB),
 	}, nil

@@ -232,7 +232,7 @@ func (b *backupLine) doHandshake() bool {
 	req, reqErr := buildResumeRequestChecked(ctx, pr, b.backupID, new(uint64), newResumeClientRingBuf(256), b.reqUrl, cfg)
 	if reqErr != nil {
 		b.setError(reqErr)
-		zlog.Warnf("[Backup:%s] 备用凭据构建失败: %v", b.backupID, reqErr)
+		lgWarnf(b.cfg.lg(), "[Backup:%s] 备用凭据构建失败: %v", b.backupID, reqErr)
 		return false
 	}
 
@@ -246,18 +246,18 @@ func (b *backupLine) doHandshake() bool {
 	}
 	if err != nil {
 		b.setError(err)
-		zlog.Warnf("[Backup:%s] 备用握手建流失败: %v", b.backupID, err)
+		lgWarnf(b.cfg.lg(), "[Backup:%s] 备用握手建流失败: %v", b.backupID, err)
 		return false
 	}
 	if resp.StatusCode != http.StatusOK {
-		b.setError(&tunnelHTTPError{status: resp.StatusCode})
-		zlog.Warnf("[Backup:%s] 备用握手被拒: HTTP %d", b.backupID, resp.StatusCode)
+		b.setError(newTunnelHTTPError(resp.StatusCode))
+		lgWarnf(b.cfg.lg(), "[Backup:%s] 备用握手被拒: HTTP %d", b.backupID, resp.StatusCode)
 		resp.Body.Close()
 		return false
 	}
 	if resp.Header.Get("X-Resume-Ack") != "ok" {
 		b.setError(errors.New("h2tunnel: transport readiness handshake was not acknowledged"))
-		zlog.Warnf("[Backup:%s] 备用握手未确认: %s", b.backupID, resp.Header.Get("X-Resume-Error"))
+		lgWarnf(b.cfg.lg(), "[Backup:%s] 备用握手未确认: %s", b.backupID, resp.Header.Get("X-Resume-Error"))
 		resp.Body.Close()
 		return false
 	}
@@ -271,7 +271,7 @@ func (b *backupLine) doHandshake() bool {
 		buf := make([]byte, 64*1024)
 		typ, _, _, err := readFrame(resp.Body, buf)
 		if err != nil || typ != resumeFrameHandshakeAck {
-			zlog.Warnf("[Backup:%s] 备用 B 层握手失败: %v", b.backupID, err)
+			lgWarnf(b.cfg.lg(), "[Backup:%s] 备用 B 层握手失败: %v", b.backupID, err)
 			resp.Body.Close()
 			return false
 		}
@@ -282,7 +282,7 @@ func (b *backupLine) doHandshake() bool {
 	b.pipe = pw
 	b.respBody = resp.Body
 	b.mu.Unlock()
-	zlog.Infof("[Backup:%s] ✅ 备用握手完成，进入 KEEPALIVE 心跳", b.backupID)
+	lgInfof(b.cfg.lg(), "[Backup:%s] ✅ 备用握手完成，进入 KEEPALIVE 心跳", b.backupID)
 	return true
 }
 
@@ -316,7 +316,7 @@ func (b *backupLine) keepaliveLoop() {
 				return
 			}
 			if err := writeFrame(pw, resumeFrameKeepalive, 0, nil, 0); err != nil {
-				zlog.Warnf("[Backup:%s] 发 KEEPALIVE 失败: %v", b.backupID, err)
+				lgWarnf(b.cfg.lg(), "[Backup:%s] 发 KEEPALIVE 失败: %v", b.backupID, err)
 			}
 			// 每发一帧记一次「待确认」；收到 KEEPALIVE-ACK 时清零（见 listenKeepaliveAck）。
 			// 连续 maxMissedAcks 次未确认即判定失效（checkFailure）。
@@ -334,7 +334,7 @@ func (b *backupLine) checkFailure() {
 	defer b.mu.Unlock()
 	if b.missedAcks >= b.maxMissedAcks {
 		b.state = backupFailed
-		zlog.Warnf("[Backup:%s] 连续 %d 次心跳丢失，判定备用失效", b.backupID, b.missedAcks)
+		lgWarnf(b.cfg.lg(), "[Backup:%s] 连续 %d 次心跳丢失，判定备用失效", b.backupID, b.missedAcks)
 	}
 }
 

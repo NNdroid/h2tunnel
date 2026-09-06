@@ -43,7 +43,7 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportH2,
-		ExpectedToken: "backup-token",
+		Authenticator: tokenAuth("backup-token"),
 		LogLevel:      "error",
 		SessionWindow: 256,
 		Network:       "all",

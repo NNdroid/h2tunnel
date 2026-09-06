@@ -35,6 +35,7 @@ type Client struct {
 	startDone chan struct{}
 	startErr  error
 	mgr       *connectionManager
+	stats     stats
 	active    map[*managedConn]struct{}
 	activeWG  sync.WaitGroup
 }
@@ -127,7 +128,10 @@ func NewClient(options ClientOptions) (*Client, error) {
 		LogicalTargets:    true,
 		Dialer:            options.Dialer,
 		QUICDialer:        options.QUICDialer,
-		TargetAddr:        "__probe__",
+		DatagramQueueSize: options.Tuning.DatagramQueueSize,
+		// 探活占位：预热 lane 带 X-Resume-Role=backup（DialKindProbe），
+		// 服务端不会为其拨号 —— 该值只出现在 lane 请求头里。
+		TargetAddr: "__probe__",
 		connectionPolicy: connectionPolicy{
 			PrimaryCount:         2,
 			BackupCount:          options.Tuning.StandbyConnections,
@@ -142,7 +146,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		cfg.Insecure = tlsConfig.InsecureSkipVerify
 		cfg.ServerName = tlsConfig.ServerName
 	}
-	return &Client{
+	ret := &Client{
 		cfg:       cfg,
 		reqURL:    cfg.ServerUrl + cfg.Path,
 		tlsConfig: tlsConfig,
@@ -151,7 +155,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 		cancel:    cancel,
 		startDone: make(chan struct{}),
 		active:    make(map[*managedConn]struct{}),
-	}, nil
+	}
+	cfg.stats = &ret.stats.client
+	return ret, nil
 }
 
 // Start initializes and verifies the transport. It is safe to call
@@ -276,6 +282,14 @@ func (c *Client) newHTTPClient() *http.Client {
 
 // DialContext establishes a TCP tunnel and returns only after the remote
 // target and resume/2 handshake are ready.
+//
+// network accepts "", "tcp", "tcp4", and "tcp6"; the address family only
+// governs the local side of the API contract — the server dials the target
+// with its own TargetDialer and may resolve it differently.
+//
+// Dial errors match the exported sentinels via errors.Is:
+// ErrUnauthenticated (HTTP 407/401, token rejected) and ErrForbidden
+// (HTTP 403, target denied by policy).
 func (c *Client) DialContext(ctx context.Context, network, target string) (net.Conn, error) {
 	switch strings.ToLower(strings.TrimSpace(network)) {
 	case "", "tcp", "tcp4", "tcp6":
@@ -294,6 +308,8 @@ func (c *Client) DialContext(ctx context.Context, network, target string) (net.C
 			return nil, err
 		}
 	}
+	c.stats.client.DialAttempts.Add(1)
+	c.stats.client.ActiveDials.Add(1)
 
 	clientSide, engineSide := net.Pipe()
 	sessionCtx, sessionCancel := context.WithCancel(c.ctx)
@@ -325,6 +341,7 @@ func (c *Client) DialContext(ctx context.Context, network, target string) (net.C
 	select {
 	case err := <-ready:
 		if err != nil {
+			c.stats.client.DialFailures.Add(1)
 			_ = managed.Close()
 			return nil, err
 		}
@@ -350,18 +367,13 @@ func (c *Client) DialPacketContext(ctx context.Context, network, target string) 
 	if target == "" {
 		return nil, errors.New("h2tunnel: target is required")
 	}
-	if c.cfg.usesWT() {
-		return nil, fmt.Errorf("%w: WebTransport UDP API is not supported", ErrUnsupportedTransport)
-	}
 	if err := c.Start(ctx); err != nil {
-		return nil, err
-	}
-	httpClient, err := c.mgr.WaitClient(ctx, networkUDP)
-	if err != nil {
 		return nil, err
 	}
 	sessionCtx, cancel := context.WithCancel(c.ctx)
 	packet := newVirtualPacketConn(target, cancel)
+	c.stats.client.DialAttempts.Add(1)
+	c.stats.client.ActiveDials.Add(1)
 	managed := &managedConn{Conn: packet, cancel: cancel}
 	if err := c.addActive(managed); err != nil {
 		cancel()
@@ -373,23 +385,42 @@ func (c *Client) DialPacketContext(ctx context.Context, network, target string) 
 	dialCfg := c.cfg
 	dialCfg.TargetAddr = target
 	dialCfg.Network = networkUDP
+
+	ready := make(chan error, 1)
+	if c.cfg.usesWT() {
+		// WT 走流上的 datagram 面（writeUDPPacket/readUDPPacket），
+		// 服务端 handleWebTransportServer 的 datagram 路径按 X-Session-ID
+		// 保持 UDP socket。建流即就绪，无 B 层握手。
+		if err := c.dialPacketWT(sessionCtx, dialCfg, packet); err != nil {
+			_ = packet.Close()
+			return nil, err
+		}
+		c.log.Debug("UDP tunnel established (webtransport)", "target", target)
+		return packet, nil
+	}
+
+	httpClient, err := c.mgr.WaitClient(ctx, networkUDP)
+	if err != nil {
+		_ = packet.Close()
+		return nil, err
+	}
 	session := newUDPSession(newClientSessionID(), dialCfg, c.reqURL, httpClient, nil, nil)
 	session.ctx = sessionCtx
 	session.deliver = packet.deliver
+	session.ready = ready
 	session.onDone = func(err error) {
 		if err == nil {
 			err = io.EOF
 		}
 		packet.fail(err)
 	}
-	packet.session = session
-	ready := make(chan error, 1)
-	session.ready = ready
+	packet.attachUDPSession(session)
 	go session.run()
 
 	select {
 	case err := <-ready:
 		if err != nil {
+			c.stats.client.DialFailures.Add(1)
 			_ = packet.Close()
 			return nil, err
 		}
@@ -402,6 +433,67 @@ func (c *Client) DialPacketContext(ctx context.Context, network, target string) 
 		_ = packet.Close()
 		return nil, net.ErrClosed
 	}
+}
+
+// dialPacketWT 通过 WebTransport 流承载 UDP 数据报（datagram 面）。
+// 与 legacy 数据面一致：上行 writeUDPPacket 封帧写流，下行 readUDPPacket
+// 解帧投递；无 seq 重放，流断即会话终止（由 virtualPacketConn.fail 收敛）。
+func (c *Client) dialPacketWT(ctx context.Context, dialCfg clientConfig, packet *virtualPacketConn) error {
+	mgr, err := newWTManagerForTunnelContext(ctx, dialCfg, c.reqURL, newClientSessionID())
+	if err != nil {
+		return err
+	}
+	session, err := mgr.GetSession(ctx)
+	if err != nil {
+		return err
+	}
+	stream, err := session.OpenStreamSync(ctx)
+	if err != nil {
+		return err
+	}
+
+	done := make(chan struct{})
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			_ = stream.Close() // FIN：通知服务端上行结束（服务端会话保留 UDP socket）
+		})
+	}
+	upstream := make(chan []byte, dialCfg.datagramQueueSize())
+	packet.attachWTTunnel(upstream, done, closeFunc(stop))
+
+	// 上行：队列 → WT 流。
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case pkt := <-upstream:
+				if err := writeUDPPacket(stream, pkt); err != nil {
+					packet.fail(err)
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	// 下行：WT 流 → virtualPacketConn。
+	go func() {
+		defer stop()
+		buf := make([]byte, 64*1024)
+		for {
+			n, err := readUDPPacket(stream, buf)
+			if err != nil {
+				return
+			}
+			if err := packet.deliver(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+	return nil
 }
 
 // Shutdown rejects new dials and waits for active tunnels to close naturally.

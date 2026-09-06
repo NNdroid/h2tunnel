@@ -58,7 +58,7 @@ func TestResumeRecvLoopDownlinkWatermark(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				recvErr = resumeRecvLoop(pr, localConn, &clientDownlink)
+				recvErr = resumeRecvLoop(pr, localConn, &clientDownlink, discardLogger, nil)
 			}()
 
 			// 帧写入另起 goroutine，避免 net.Pipe 同步写导致的死锁。

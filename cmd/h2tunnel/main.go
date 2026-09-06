@@ -195,7 +195,7 @@ func runClient(cfg *config, logger *slog.Logger) error {
 			return err
 		}
 		closers = append(closers, listener)
-		go func() { errCh <- runTCPForwarder(ctx, listener, client, cfg.Target) }()
+		go func() { errCh <- runTCPForwarder(ctx, listener, client, cfg.Target, logger) }()
 	}
 	if network == "udp" || network == "all" {
 		packetListener, err := net.ListenPacket("udp", cfg.Listen)
@@ -232,7 +232,7 @@ func runClient(cfg *config, logger *slog.Logger) error {
 	return nil
 }
 
-func runTCPForwarder(ctx context.Context, listener net.Listener, client *h2tunnel.Client, target string) error {
+func runTCPForwarder(ctx context.Context, listener net.Listener, client *h2tunnel.Client, target string, logger *slog.Logger) error {
 	for {
 		local, err := listener.Accept()
 		if err != nil {
@@ -242,6 +242,10 @@ func runTCPForwarder(ctx context.Context, listener net.Listener, client *h2tunne
 			defer local.Close()
 			remote, err := client.DialContext(ctx, h2tunnel.NetworkTCP, target)
 			if err != nil {
+				// 必须让用户看到失败原因：407 鉴权失败 / 403 目标被拒 /
+				// 目标不可达在用户侧的表象都是"连上就断"，没有这行日志
+				// 只能开 debug 翻隧道日志排查。
+				logger.Warn("tunnel dial failed", "client", local.RemoteAddr().String(), "target", target, "error", err)
 				return
 			}
 			defer remote.Close()

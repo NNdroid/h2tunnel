@@ -13,6 +13,8 @@ import (
 	"time"
 
 	quic "github.com/quic-go/quic-go"
+
+	"github.com/NNdroid/h2tunnel/internal/certutil"
 )
 
 // Transport identifies the HTTP transport carrying a tunnel stream.
@@ -58,16 +60,33 @@ type Principal struct {
 // treat request headers as read-only and return a stable, non-empty Principal.ID.
 type Authenticator func(context.Context, *http.Request) (Principal, error)
 
-// DialRequest is passed to the server's policy-aware target dialer.
+// DialRequest is passed to the server.s policy-aware target dialer.
 type DialRequest struct {
 	Network   Network
 	Target    string
 	Transport Transport
 	Principal Principal
+	// Kind 区分拨号原因。DialKindProbe 是探活/预热 lane 的握手：服务端
+	// 不会为其建立真实连接（探活 lane 从不拨号），Target 仅用于授权日志。
+	// 业务隧道恒为 DialKindBusiness。
+	Kind DialKind
 }
+
+// DialKind classifies why the server is dialing a target.
+type DialKind string
+
+const (
+	// DialKindBusiness is a client-initiated tunnel to a real target.
+	DialKindBusiness DialKind = "business"
+	// DialKindProbe is a keep-alive lane handshake; see DialRequest.Kind.
+	DialKindProbe DialKind = "probe"
+)
 
 // TargetDialer authorizes, resolves, and connects one requested target. For
 // UDP it must return a connected datagram net.Conn (normally *net.UDPConn).
+//
+// 探活/预热 lane（DialKindProbe）只会出现在授权日志里，服务端从不为它们
+// 调用 Dialer —— 实现方可以据此跳过 probe 类请求的连接建立。
 type TargetDialer func(context.Context, DialRequest) (net.Conn, error)
 
 // ClientDialer and QUICDialer let embedding applications control the
@@ -106,6 +125,9 @@ type ClientTuning struct {
 	KeepaliveInterval  time.Duration
 	HandshakeTimeout   time.Duration
 	StandbyConnections int
+	// DatagramQueueSize 是 UDP 数据报上行队列深度（默认 200）。队列满时
+	// 写入会阻塞至写超时（CLI 侧丢弃），调大以承载突发，代价是内存。
+	DatagramQueueSize int
 }
 
 // ServerOptions configures an embeddable tunnel server. Authenticator and
@@ -120,6 +142,9 @@ type ServerOptions struct {
 	Dialer        TargetDialer
 	Tuning        ServerTuning
 	Logger        *slog.Logger
+
+	// 为空时使用标准路径 /.well-known/masque/{tcp,udp}/<host>/<port>/；
+	// 设置为 "ccc" 后路径变为 /ccc/.well-known/masque/...（前段自定义，
 }
 
 type ServerTuning struct {
@@ -131,6 +156,23 @@ type ServerTuning struct {
 type Listeners struct {
 	TCP  net.Listener
 	QUIC net.PacketConn
+}
+
+// SelfSignedTLSConfig returns a TLS config carrying a freshly generated
+// self-signed certificate. The certificate is valid for host (default
+// "localhost") and always for 127.0.0.1 / ::1, so clients can verify the
+// connection when dialing loopback with a normal TLS config. Intended for
+// development and protected origin links — use a publicly trusted
+// certificate in production.
+func SelfSignedTLSConfig(host string) (*tls.Config, error) {
+	cert, err := certutil.GenerateSelfSigned(host)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 // PacketConn is a connected datagram tunnel that can be consumed as either a

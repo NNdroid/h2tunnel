@@ -221,8 +221,17 @@ func writeResumeErrorFrame(w io.Writer, code resumeErrorCode) error {
 // readFrame 读一帧，返回帧类型、seq、data 拷贝（写入 payloadBuf）。
 // 填充已在函数内丢弃。返回 errResumeEndFrame 表示 END 控制帧。
 func readFrame(r io.Reader, payloadBuf []byte) (typ byte, seq uint64, n int, err error) {
-	var hdr [resumeHeaderLen]byte
-	if _, err = io.ReadFull(r, hdr[:]); err != nil {
+	// 头优先读进 payloadBuf 前段（随后被数据覆盖）：经 io.Reader 接口
+	// 传入的局部栈缓冲会逃逸到堆，DATA 热路径每帧多一次分配。
+	// payloadBuf 过小（罕见：仅读控制帧的调用方）回落堆分配，保持
+	// 旧契约不收紧。
+	var hdr []byte
+	if len(payloadBuf) >= resumeHeaderLen {
+		hdr = payloadBuf[:resumeHeaderLen]
+	} else {
+		hdr = make([]byte, resumeHeaderLen)
+	}
+	if _, err = io.ReadFull(r, hdr); err != nil {
 		return 0, 0, 0, err
 	}
 	typ = hdr[0]

@@ -195,7 +195,7 @@ func TestH2TunnelAllModes(t *testing.T) {
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportAll,
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error", // 减少测试时的日志刷屏，想看详细过程可以改为 debug
 	})
 
@@ -362,7 +362,7 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportH2,
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
@@ -441,7 +441,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 		Path:          "/tunnel",
 		Transport:     "grpc", // 严格限定必须为 gRPC
 		Network:       "tcp",  // 严格限定只允许 TCP，拒绝 UDP
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)

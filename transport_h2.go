@@ -42,7 +42,7 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 	negotiated := negotiateVersion(clientVersion, 2)
 	if negotiated == 0 {
 		w.Header().Set("X-Resume-Error", resumeErrVersionUnsupported.String())
-		zlog.Warnf("[%s] ❌ 版本协商失败: client=%d server=2", sessionID, clientVersion)
+		lgWarnf(sessions.lg(), "[%s] ❌ 版本协商失败: client=%d server=2", sessionID, clientVersion)
 		http.Error(w, "resume version unsupported", http.StatusUpgradeRequired)
 		return
 	}
@@ -84,17 +84,17 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 
 		// 先完成 B 层握手（证明活性），再只做 KEEPALIVE 存活应答。
 		if !datagram {
-			if !doServerHandshakeAck(r.Body, writer, params.handshakeAckMs, sessionID) {
+			if !doServerHandshakeAck(r.Body, writer, params.handshakeAckMs, sessionID, sessions.lg()) {
 				return
 			}
 		}
-		serveBackupKeepaliveOnly(r.Body, writer, params, sessionID)
+		serveBackupKeepaliveOnly(r.Body, writer, params, sessionID, sessions.lg())
 		return
 	}
 
 	// ===== 主线路：校验目标 + 建立/恢复业务会话 =====
 	if !targetAllowedByRuntime(cfg, target) {
-		zlog.Warnf("[%s] 🚫 Resume target rejected: %s", sessionID, target)
+		lgWarnf(sessions.lg(), "[%s] 🚫 Resume target rejected: %s", sessionID, target)
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
@@ -109,14 +109,21 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		zlog.Errorf("[%s] ❌ Resume 拨号失败: %v", sessionID, err)
+		lgErrorf(sessions.lg(), "[%s] ❌ Resume 拨号失败: %v", sessionID, err)
 		writeTargetError(w, err)
 		return
 	}
+	if cfg.stats != nil {
+		if isNew {
+			cfg.stats.SessionsCreated.Add(1)
+		} else {
+			cfg.stats.SessionsResumed.Add(1)
+		}
+	}
 	if isNew {
-		zlog.Infof("[%s] 🆕 Resume 新会话建立 | Target: %s (%s, %s)", sessionID, target, network, modeLabel(datagram))
+		lgInfof(sessions.lg(), "[%s] 🆕 Resume 新会话建立 | Target: %s (%s, %s)", sessionID, target, network, modeLabel(datagram))
 	} else {
-		zlog.Infof("[%s] 🔄 Resume 恢复已有会话 | Target: %s (%s)", sessionID, target, modeLabel(datagram))
+		lgInfof(sessions.lg(), "[%s] 🔄 Resume 恢复已有会话 | Target: %s (%s)", sessionID, target, modeLabel(datagram))
 	}
 
 	clientDownlink := parseResumeDownlink(r)

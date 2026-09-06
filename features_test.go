@@ -35,7 +35,7 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 		Path:          "/tunnel",
 		Transport:     "all",
 		Network:       "all",
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
@@ -125,7 +125,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 		Path:          "/tunnel",
 		Transport:     "all",
 		Network:       "udp", // 🌟 仅允许 UDP
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
@@ -220,7 +220,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 		Path:          "/tunnel",
 		Transport:     "h2", // 🌟 严格只允许 H2 POST
 		Network:       "tcp",
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
@@ -346,7 +346,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 		Path:          "/tunnel",
 		Transport:     "all",
 		LocalOnly:     true, // 🌟 仅允许 localhost / 127.0.0.1 / ::1
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)

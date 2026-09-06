@@ -253,28 +253,6 @@ func setTunnelRequestHeaders(h http.Header) {
 	h.Set("Cache-Control", "no-store, no-transform")
 }
 
-// checkAuth 校验单一配置 Token；不接受旧头名或多 Token 隐式语法。
-func checkAuth(r *http.Request, expectedToken string) bool {
-	if expectedToken == "" {
-		return true
-	}
-
-	if secureEqual(r.Header.Get("X-Auth-Token"), expectedToken) {
-		return true
-	}
-	const bearerPrefix = "Bearer "
-	authHeader := r.Header.Get("Authorization")
-	if len(authHeader) == len(bearerPrefix)+len(expectedToken) &&
-		strings.EqualFold(authHeader[:len(bearerPrefix)], bearerPrefix) &&
-		secureEqual(authHeader[len(bearerPrefix):], expectedToken) {
-		return true
-	}
-
-	// 鉴权失败时，只记录来源 IP，绝不打印客户端携带的 token（含 Bearer 明文），以防凭据泄露
-	zlog.Warnf("[Protocol] 鉴权拦截: 非法/缺失鉴权 (IP: %s)", clientIP(r))
-	return false
-}
-
 // secureEqual 常量时间字符串比较（长度不等时也要走完，避免长度侧信道）
 func secureEqual(a, b string) bool {
 	if a == "" {
@@ -306,11 +284,22 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// masquePathBase 返回 MASQUE 的路径基座：嵌在隧道 path 之下，复用同一个
+// path 配置（path=/tunnel → /tunnel/.well-known/masque；path=/ →
+// /.well-known/masque）。反代/CDN 只需放行一个前缀，两端自动一致。
+func masquePathBase(tunnelPath string) string {
+	p := strings.TrimRight(strings.TrimSpace(tunnelPath), "/")
+	if p == "" {
+		return "/.well-known/masque"
+	}
+	return p + "/.well-known/masque"
+}
+
 // parseMasqueTarget 遵循 RFC 9298 解析 URI 模板
 func parseMasqueTarget(protocol, reqPath string) (string, error) {
 	protocol = strings.ToLower(protocol)
 	if protocol != "tcp" && protocol != "udp" {
-		zlog.Errorf("[Protocol] URI 解析失败: 不支持的底层协议 '%s'", protocol)
+		lgErrorf(discardLogger, "[Protocol] URI 解析失败: 不支持的底层协议 '%s'", protocol)
 		return "", fmt.Errorf("unsupported protocol: %s", protocol)
 	}
 	cleanPath := strings.Trim(reqPath, "/")
@@ -331,7 +320,7 @@ func parseMasqueTarget(protocol, reqPath string) (string, error) {
 	host, err1 := url.PathUnescape(parts[udpIdx+1])
 	port, err2 := url.PathUnescape(parts[udpIdx+2])
 	if err1 != nil || err2 != nil || host == "" || port == "" {
-		zlog.Errorf("[Protocol] URI Decode 失败: hostErr=%v, portErr=%v", err1, err2)
+		lgErrorf(discardLogger, "[Protocol] URI Decode 失败: hostErr=%v, portErr=%v", err1, err2)
 		return "", fmt.Errorf("failed to unescape host/port")
 	}
 
@@ -339,7 +328,7 @@ func parseMasqueTarget(protocol, reqPath string) (string, error) {
 	if !isValidTargetAddr(target) {
 		return "", fmt.Errorf("invalid parsed masque target: %s", target)
 	}
-	zlog.Debugf("[Protocol] 🎯 MASQUE URI 解析成功 -> 解析出目标: %s", target)
+	lgDebugf(discardLogger, "[Protocol] 🎯 MASQUE URI 解析成功 -> 解析出目标: %s", target)
 	return target, nil
 }
 

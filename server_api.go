@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ type Server struct {
 
 	rootHandler http.Handler
 	httpServer  *http.Server
+	h2srv       *http2.Server
 	wtServer    *webtransport.Server
 
 	ctx        context.Context
@@ -37,9 +39,19 @@ type Server struct {
 	served    bool
 	closing   bool
 	closed    bool
+	stats     stats
 	listeners Listeners
 	httpConns map[net.Conn]struct{}
 }
+
+// h2 接收窗口（服务端上行方向的流控背压）。x/net 默认每流/每连接各 1MB，
+// 是 CDN 高 RTT 链路上行吞吐的主要瓶颈；8MB 单流窗口在 100ms RTT 下允许
+// 约 640Mbps 的在途数据。上限以服务端每会话内存为代价（SessionWindow 的
+// ring 是独立的有界缓冲，不受此影响）。
+const (
+	h2UploadBufferPerStream     = 8 << 20  // 8MB
+	h2UploadBufferPerConnection = 32 << 20 // 32MB
+)
 
 // NewServer validates options and creates a server without opening sockets or
 // starting goroutines.
@@ -85,7 +97,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	}
 	if cfg.EnableH3 && cfg.TLSConfig == nil {
 		cancel()
-		return nil, errors.New("h2tunnel: H3, WebTransport, and MASQUE require ServerOptions.TLSConfig")
+		return nil, errors.New("h2tunnel: H3, WebTransport, and MASQUE require ServerOptions.TLSConfig (see h2tunnel.SelfSignedTLSConfig for development)")
 	}
 	if cfg.TLSConfig != nil && len(cfg.TLSConfig.Certificates) == 0 && cfg.TLSConfig.GetCertificate == nil {
 		cancel()
@@ -106,6 +118,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	}
 	s.sessions = &sessionTable{
 		sessions:    make(map[string]*tunnelSession),
+		logger:      s.log,
 		idleTimeout: cfg.SessionIdleTimeout,
 	}
 	if s.sessions.idleTimeout <= 0 {
@@ -116,8 +129,18 @@ func NewServer(options ServerOptions) (*Server, error) {
 		s.wtServer = newH3WTServer("", s.rootHandler, cfg.TLSConfig)
 	}
 	handler := s.rootHandler
+	// h2 接收窗口（上行方向的流控背压）：x/net 默认每流/每连接各 1MB，
+	// 在途 1MB ÷ 100ms RTT ≈ 80Mbps，是 CDN 高 RTT 链路上行吞吐的主要
+	// 瓶颈。放大窗口让背压留在隧道会话层（ring 有界），而不是让 h2 流控
+	// 先行卡死。客户端下行方向 x/net Transport 默认 4MB/流，无需调整。
+	h2srv := &http2.Server{
+		IdleTimeout:                  time.Hour,
+		MaxUploadBufferPerStream:     h2UploadBufferPerStream,
+		MaxUploadBufferPerConnection: h2UploadBufferPerConnection,
+	}
+	s.h2srv = h2srv
 	if !cfg.EnableTLS {
-		handler = h2c.NewHandler(handler, &http2.Server{IdleTimeout: time.Hour})
+		handler = h2c.NewHandler(handler, h2srv)
 	}
 	s.httpServer = &http.Server{
 		Handler:           handler,
@@ -126,8 +149,19 @@ func NewServer(options ServerOptions) (*Server, error) {
 		ConnState:         s.trackHTTPConnection,
 	}
 	if cfg.TLSConfig != nil {
-		s.httpServer.TLSConfig = cfg.TLSConfig.Clone()
+		tlsConfig := cfg.TLSConfig.Clone()
+		if !slices.Contains(tlsConfig.NextProtos, "h2") {
+			tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h2")
+		}
+		s.httpServer.TLSConfig = tlsConfig
+		// net/http 自动装配的 http2.Server 使用默认 1MB 上行窗口；自定义
+		// 窗口必须显式 ConfigureServer（必须在开始服务之前调用）。
+		if err := http2.ConfigureServer(s.httpServer, h2srv); err != nil {
+			cancel()
+			return nil, fmt.Errorf("h2tunnel: configure HTTP/2 server: %w", err)
+		}
 	}
+	s.cfg.stats = &s.stats.server
 	return s, nil
 }
 
@@ -148,12 +182,15 @@ func (s *Server) buildRootHandler() http.Handler {
 			fullPath = r.URL.Path
 		}
 		if r.Method == http.MethodConnect {
+			// MASQUE 路径基座支持自定义前缀（masquePathBase），空前缀 = 标准
+			// /.well-known/masque；parseMasqueTarget 本身按段扫描，前缀无关。
+			masqueBase := masquePathBase(s.cfg.Path)
 			switch {
-			case strings.HasPrefix(fullPath, "/.well-known/masque/tcp/"):
+			case strings.HasPrefix(fullPath, masqueBase+"/tcp/"):
 				r.URL.Path = fullPath
 				routeTunnelRequest(w, r, s.cfg, s.wtServer, s.sessions)
 				return
-			case strings.HasPrefix(fullPath, "/.well-known/masque/udp/"):
+			case strings.HasPrefix(fullPath, masqueBase+"/udp/"):
 				r.URL.Path = fullPath
 				handleMasqueUDP(w, r, s.cfg, s.sessions)
 				return
@@ -312,6 +349,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	s.closeQUICListener()
 	if err := s.closeTrackedHTTPConnections(); err != nil {
 		errs = append(errs, err)
 	}
@@ -343,11 +381,25 @@ func (s *Server) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	s.closeQUICListener()
 	if err := s.closeTrackedHTTPConnections(); err != nil {
 		errs = append(errs, err)
 	}
 	s.finishClose()
 	return errors.Join(errs...)
+}
+
+// closeQUICListener 关闭 Serve 接收的外部 QUIC PacketConn。
+// quic-go 的 H3.Close/Shutdown 不管理经 Serve(conn) 传入的外部 conn，
+// 不显式关闭的话 Serve 的 QUIC goroutine 永不返回，Shutdown/Close 卡死。
+// net/http 对 TCP listener 有自己的跟踪（Shutdown/Close 会关闭），无需处理。
+func (s *Server) closeQUICListener() {
+	s.mu.Lock()
+	quic := s.listeners.QUIC
+	s.mu.Unlock()
+	if quic != nil {
+		_ = quic.Close()
+	}
 }
 
 func (s *Server) finishClose() {
@@ -372,6 +424,7 @@ func (s *Server) closeListenersOnly() error {
 			errs = append(errs, err)
 		}
 	}
+	s.closeQUICListener()
 	if err := s.closeTrackedHTTPConnections(); err != nil {
 		errs = append(errs, err)
 	}

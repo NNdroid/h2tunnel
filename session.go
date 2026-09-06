@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -47,8 +48,9 @@ const (
 type tunnelSession struct {
 	id        string
 	createdAt time.Time
-	lastSeen  time.Time // 最后一次活跃（用于超时回收）
-	datagram  bool      // true = UDP 数据报模式（无 seq 重放）
+	lastSeen  time.Time    // 最后一次活跃（用于超时回收）
+	datagram  bool         // true = UDP 数据报模式（无 seq 重放）
+	logger    *slog.Logger // 实例日志器（来自 Server options，nil → discard）
 	binding   sessionBinding
 
 	mu              sync.Mutex
@@ -60,6 +62,12 @@ type tunnelSession struct {
 	downlinkRing *ringBuffer
 	activeWriter *resumeSessionWriter // 当前活跃流下行 writer；nil 表示无流
 	closed       bool
+
+	// downlinkMu 串行化下行帧写（重放 vs 实时），保证客户端看到的
+	// 下行 seq 严格连续；frameSentSeq 记录已写出到当前活跃流的终点。
+	// 网络写在此锁下进行，不持 s.mu —— 避免与上行互锁（T2 拆分）。
+	downlinkMu   sync.Mutex
+	frameSentSeq uint64
 
 	// 上行：客户端 → targetConn。按 seq 累计连续接收（缺口不可恢复）。
 	// datagram 模式不使用（UDP 无顺序保证）。
@@ -83,34 +91,80 @@ type tunnelSession struct {
 // 若无活跃流：stream 模式写 ring 等下次续传；datagram 模式直接丢弃该包
 // （客户端断线期间到达的 UDP 包无可恢复意义，重放反而错乱）。
 // 返回写入的字节数。
+//
+// 锁序：s.mu 只做状态决策 / ring 追加 / seq 分配（纯内存操作，持有时间与
+// 网络无关）；网络写在 downlinkMu 下进行 —— 原实现持 s.mu 做网络写，
+// 会把上行 acceptUplinkSeq 一并锁死，全双工高吞吐时两方向互锁。
 func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return 0, net.ErrClosed
 	}
-	s.downlinkSent += uint64(len(data))
-	if s.datagram {
+	writer := s.activeWriter
+	datagram := s.datagram
+	if datagram {
 		// UDP：封装成 wire 帧写活跃流；无流则丢（跨流不重放）。
-		if s.activeWriter == nil {
+		s.downlinkSent += uint64(len(data))
+		s.mu.Unlock()
+		if writer == nil {
 			return len(data), nil
 		}
-		if err := s.frameW(&resumeWriterAdapter{w: s.activeWriter}, data); err != nil {
-			s.activeWriter = nil
+		s.downlinkMu.Lock()
+		err := s.frameW(&resumeWriterAdapter{w: writer}, data)
+		s.downlinkMu.Unlock()
+		if err != nil {
+			s.clearActiveWriter(writer)
 		}
 		return len(data), nil
 	}
+	// stream 模式：先入 ring 再分配 seq —— 保证任何 seq < downlinkSent
+	// 的字节都已在 ring 中（重放读 ring 不踩空）。Append 是纯内存拷贝。
 	s.downlinkRing.Append(data)
-	if s.activeWriter != nil {
-		// 本段的起始 seq = downlinkSent - len(data)（downlinkSent 刚自增）。
-		// 写 resume 帧（客户端 readResumeFrame 按 seq 解析）。
-		seq := s.downlinkSent - uint64(len(data))
-		if _, err := s.activeWriter.writeFrame(seq, data); err != nil {
-			// 流挂了不致命：ring 已写，下次流接上时从下行 seq 续传
-			s.activeWriter = nil
-		}
+	seq := s.downlinkSent
+	s.downlinkSent += uint64(len(data))
+	s.mu.Unlock()
+
+	if writer == nil {
+		return len(data), nil
+	}
+
+	// downlinkMu 串行化「重放 vs 实时」的帧序：重放持锁期间 pump 的
+	// 实时帧在此排队；重放完成后 frameSentSeq 推进到重放终点，与重放
+	// 窗口重叠的排队帧（seq 已分配但未写出的竞态窗口）直接跳过，客户端
+	// 看到的 seq 严格连续。
+	s.downlinkMu.Lock()
+	if seq+uint64(len(data)) <= s.frameSentSeq {
+		s.downlinkMu.Unlock()
+		return len(data), nil
+	}
+	// 本段的起始 seq = seq。写 resume 帧（客户端 readResumeFrame 按 seq 解析）。
+	_, err := writer.writeFrame(seq, data)
+	if err == nil {
+		s.frameSentSeq = seq + uint64(len(data))
+	}
+	s.downlinkMu.Unlock()
+	if err != nil {
+		// 流挂了不致命：ring 已写，下次流接上时从下行 seq 续传
+		s.clearActiveWriter(writer)
 	}
 	return len(data), nil
+}
+
+// lg 返回会话表日志器（nil 安全）。
+func (t *sessionTable) lg() *slog.Logger {
+	if t.logger != nil {
+		return t.logger
+	}
+	return discardLogger
+}
+
+// lg 返回会话实例日志器（nil 安全，回落 discard）。
+func (s *tunnelSession) lg() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return discardLogger
 }
 
 // setActiveWriter 设置当前活跃流的下行 writer
@@ -133,17 +187,17 @@ func (s *tunnelSession) clearActiveWriter(w *resumeSessionWriter) {
 // 补发到当前活跃 writer。不再 Append ring（避免重复）。
 // 若 ring 窗口已被覆盖（fromSeq < windowStart），返回 errGap。
 //
-// ⚠️ 并发约束：重放期间必须持有 s.mu。downlinkPump 的 writeDownlink 同样需要
-// s.mu 才能写 activeWriter；持锁期间 pump 的实时下行写被阻塞，保证「重放帧」
-// 与「实时下行帧」不会并发写入同一条流（否则帧交叠 + seq 乱序，客户端判 errGap
-// 直接断流）。锁内 downlinkSent 被冻结，重放完成后 pump 的实时帧从 target 处
-// 无缝续传，既不缺口也不重复。
-// 写失败时由 writeDownlink 和调用方的 defer 清理 activeWriter；writer 不会
-// 在持有自身锁时反向调用 session，避免与这里的锁顺序发生死锁。
-func (s *tunnelSession) replayDownlink(w *resumeSessionWriter, fromSeq uint64) error {
+// ⚠️ 调用方必须持有 downlinkMu：与 writeDownlink 的实时帧共用该锁保证
+// 客户端看到的下行 seq 严格连续（重放帧与实时帧不交叠）。持锁期间
+// writeDownlink 已分配 seq 的帧在锁外排队，与重放窗口重叠的部分由
+// frameSentSeq 跳过。写失败时由 writeDownlink 和调用方的 defer 清理
+// activeWriter；writer 不会在持有自身锁时反向调用 session。
+func (s *tunnelSession) replayDownlinkLocked(w *resumeSessionWriter, fromSeq uint64) error {
+	// downlinkSent 的写点在 writeDownlink 的 s.mu 段内；重放侧在 downlinkMu
+	// 下运行但不持 s.mu，必须先快照（锁序固定 downlinkMu→s.mu，单向无环）。
 	s.mu.Lock()
 	target := s.downlinkSent
-	defer s.mu.Unlock()
+	s.mu.Unlock()
 	if fromSeq >= target {
 		return nil
 	}
@@ -167,7 +221,25 @@ func (s *tunnelSession) replayDownlink(w *resumeSessionWriter, fromSeq uint64) e
 			break
 		}
 	}
+	if s.frameSentSeq < seq {
+		s.frameSentSeq = seq
+	}
 	return nil
+}
+
+// attachAndReplay 在 downlinkMu 下原子完成「挂载活跃 writer + 下行重放」。
+// 必须原子：若 setActiveWriter 与重放之间 pump 抢到 downlinkMu，实时帧会
+// 插到重放帧之前，客户端立即看到 seq 跳变（ErrGap）。
+// 返回的 error 仅表示重放失败（gap / 写失败）；writer 挂载总是成功。
+func (s *tunnelSession) attachAndReplay(writer *resumeSessionWriter, fromSeq uint64) error {
+	s.downlinkMu.Lock()
+	defer s.downlinkMu.Unlock()
+	s.setActiveWriter(writer)
+	if s.datagram {
+		// datagram 无重放（UDP 无 seq 坐标系）。
+		return nil
+	}
+	return s.replayDownlinkLocked(writer, fromSeq)
 }
 
 // acceptUplinkSeq 接受一个上行帧的 seq+data，校验连续性，
@@ -214,6 +286,7 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 // sessionTable 服务端会话表（实例级，挂在 Server 上；库嵌入时多个
 // Server 互不共享）。
 type sessionTable struct {
+	logger      *slog.Logger
 	mu          sync.Mutex
 	sessions    map[string]*tunnelSession
 	idleTimeout time.Duration
@@ -276,6 +349,7 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 		return nil, false, err
 	}
 	s := &tunnelSession{
+		logger:       t.logger,
 		id:           id,
 		createdAt:    time.Now(),
 		lastSeen:     time.Now(),
@@ -577,6 +651,13 @@ func (t *sessionTable) runReaper(stopCh <-chan struct{}) {
 			t.reapIdle()
 		}
 	}
+}
+
+// len 返回当前活跃会话数（快照）。
+func (t *sessionTable) len() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.sessions)
 }
 
 // closeAll 关闭表中所有会话（Server.Close/Shutdown 时调用）。

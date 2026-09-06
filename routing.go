@@ -137,7 +137,7 @@ func validNetwork(value string) bool {
 func normalizeTunnelPath(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "/tunnel"
+		return "/"
 	}
 	if value[0] != '/' {
 		return "/" + value

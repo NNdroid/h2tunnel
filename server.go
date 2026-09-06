@@ -6,13 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/quic-go/webtransport-go"
@@ -40,11 +38,11 @@ func authenticateServerRequest(r *http.Request, cfg serverConfig, transport Tran
 		err       error
 	)
 	if cfg.Authenticator != nil {
+		// 单一鉴权入口：所有服务端请求（含探活/预热 lane）都经此校验。
 		principal, err = cfg.Authenticator(r.Context(), r)
-	} else if checkAuth(r, cfg.ExpectedToken) {
-		principal = Principal{ID: "legacy-token"}
 	} else {
-		err = ErrUnauthenticated
+		// 白盒测试直接构造 serverConfig 时允许匿名（SDK NewServer 强制非空）。
+		principal = Principal{ID: "anonymous"}
 	}
 	if err != nil {
 		return r, err
@@ -101,11 +99,18 @@ func dialTargetForRequest(r *http.Request, cfg serverConfig, network, target str
 		return dialer.DialContext(dialCtx, network, target)
 	}
 	state := requestState(r)
+	// 探活 lane（X-Resume-Role: backup）永不建立真实连接：Kind 让
+	// TargetDialer 能区分（并防御性拒绝 probe 拨号）。
+	kind := DialKindBusiness
+	if r.Header.Get("X-Resume-Role") == "backup" {
+		kind = DialKindProbe
+	}
 	return cfg.TargetDialer(dialCtx, DialRequest{
 		Network:   Network(network),
 		Target:    target,
 		Transport: state.transport,
 		Principal: state.principal,
+		Kind:      kind,
 	})
 }
 
@@ -120,72 +125,14 @@ func writeTargetError(w http.ResponseWriter, err error) {
 	}
 }
 
-// startServerDirect 是 legacy 兼容入口（旧 CLI 形态，含信号处理与 os.Exit）；
-// 库用户请改用 NewServer + Serve。仅供包内白盒测试与旧调用方使用。
-func startServerDirect(cfg serverConfig) {
-	initLogger(cfg.LogLevel)
-	defer zlog.Sync()
-
-	var err error
-	cfg, err = prepareServerConfig(cfg)
-	if err != nil {
-		zlog.Fatalf("[Server] ❌ invalid routing configuration: %v", err)
-	}
-
-	zlog.Infof("[Server] 🚀 h2tunnel %s starting...", Version())
-	zlog.Infof("[Server] ⚙️ fileConfig -> Listen: %s, Path: %s, Transport: %s, Network: %s, TLS: %v, H3: %v, LocalOnly: %v",
-		cfg.ListenAddr, cfg.Path, cfg.Transport, cfg.Network, cfg.EnableTLS, cfg.EnableH3, cfg.LocalOnly)
-	zlog.Infof("[Server] 🚦 Strict Demux Policy -> Transport: [%s], Network: [%s] (TCP Allowed: %v, UDP Allowed: %v)",
-		cfg.Transport, cfg.Network, isNetworkAllowed("tcp", cfg.Network), isNetworkAllowed("udp", cfg.Network))
-
-	options, err := serverOptionsFromConfig(cfg)
-	if err != nil {
-		zlog.Fatalf("[Server] ❌ failed to prepare server: %v", err)
-	}
-	srv, err := NewServer(options)
-	if err != nil {
-		zlog.Fatalf("[Server] ❌ failed to create server: %v", err)
-	}
-
-	drainTimeout := cfg.DrainTimeout
-	if drainTimeout <= 0 {
-		drainTimeout = drainDefault
-	}
-
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- srv.ListenAndServe(cfg.ListenAddr)
-	}()
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case err := <-serveErr:
-		if err != nil && err != http.ErrServerClosed {
-			zlog.Errorf("[Server] ❌ 监听器异常退出: %v", err)
-			srv.Close()
-			os.Exit(1)
-		}
-	case sig := <-quit:
-		zlog.Infof("[Server] 🛑 收到 %v，停止接收新连接，开始排空存量隧道 (上限 %v)", sig, drainTimeout)
-		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
-		_ = srv.Shutdown(ctx)
-		cancel()
-	}
-	zlog.Infof("[Server] 👋 已安全退出")
-}
-
 func serverOptionsFromConfig(cfg serverConfig) (ServerOptions, error) {
-	auth := Authenticator(func(_ context.Context, _ *http.Request) (Principal, error) {
-		return Principal{ID: "anonymous"}, nil
-	})
-	if strings.TrimSpace(cfg.ExpectedToken) != "" {
-		var err error
-		auth, err = NewTokenAuthenticator(cfg.ExpectedToken)
-		if err != nil {
-			return ServerOptions{}, err
-		}
+	// 鉴权单入口：白盒测试直接构造 serverConfig 时可省略（匿名回退）；
+	// 正式路径由 NewServer 强制非空。
+	auth := cfg.Authenticator
+	if auth == nil {
+		auth = Authenticator(func(_ context.Context, _ *http.Request) (Principal, error) {
+			return Principal{ID: "anonymous"}, nil
+		})
 	}
 	dialer := TargetDialer(func(ctx context.Context, request DialRequest) (net.Conn, error) {
 		legacy := cfg
@@ -251,8 +198,8 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 	_ = http.NewResponseController(w).EnableFullDuplex()
 	sessionID := fmt.Sprintf("SVR-%s-%d", r.RemoteAddr, time.Now().UnixNano()%10000)
 	clientPhysicalAddr := clientIP(r)
-	zlog.Debugf("[%s] === New incoming tunnel request ===", sessionID)
-	zlog.Debugf("[%s] Proto: %s, Method: %s, Path: %s, Client Physical Addr: %s", sessionID, r.Proto, r.Method, r.URL.Path, clientPhysicalAddr)
+	lgDebugf(cfg.lg(), "[%s] === New incoming tunnel request ===", sessionID)
+	lgDebugf(cfg.lg(), "[%s] Proto: %s, Method: %s, Path: %s, Client Physical Addr: %s", sessionID, r.Proto, r.Method, r.URL.Path, clientPhysicalAddr)
 
 	isMasqueTCP := r.Method == http.MethodConnect && r.Header.Get("Protocol") == "connect-tcp"
 	isWT := wtServer != nil && r.Method == http.MethodConnect && r.Header.Get("Protocol") == "webtransport"
@@ -260,7 +207,7 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 	var err error
 	r, err = authenticateServerRequest(r, cfg, transport)
 	if err != nil {
-		zlog.Warnf("[%s] ❌ Authentication failed: Access denied (IP: %s)", sessionID, clientIP(r))
+		lgWarnf(cfg.lg(), "[%s] ❌ Authentication failed: Access denied (IP: %s)", sessionID, clientIP(r))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -272,40 +219,40 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 
 	policy := cfg.effectiveRoutingPolicy()
 	if !policy.allowsNetwork(reqNetwork) {
-		zlog.Warnf("[%s] 🚫 严格分流拦截: 服务端限制 Network='%s'，拒绝 %s 请求 (IP: %s)", sessionID, cfg.Network, strings.ToUpper(reqNetwork), clientIP(r))
+		lgWarnf(cfg.lg(), "[%s] 🚫 严格分流拦截: 服务端限制 Network='%s'，拒绝 %s 请求 (IP: %s)", sessionID, cfg.Network, strings.ToUpper(reqNetwork), clientIP(r))
 		http.Error(w, fmt.Sprintf("%s traffic forbidden by server policy", strings.ToUpper(reqNetwork)), http.StatusForbidden)
 		return
 	}
 
 	if err := checkStrictTransportPolicy(r, policy, cfg.Transport, isWT, isMasqueTCP, false); err != nil {
-		zlog.Warnf("[%s] 🚫 严格分流拦截: %v (IP: %s)", sessionID, err, clientIP(r))
+		lgWarnf(cfg.lg(), "[%s] 🚫 严格分流拦截: %v (IP: %s)", sessionID, err, clientIP(r))
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
 	if isWT {
-		zlog.Debugf("[%s] -> Dispatching to WebTransport handler", sessionID)
+		lgDebugf(cfg.lg(), "[%s] -> Dispatching to WebTransport handler", sessionID)
 		handleWebTransportServer(w, r, sessionID, cfg, wtServer, sessions)
 		return
 	}
 	if isMasqueTCP {
-		zlog.Debugf("[%s] -> Dispatching to MASQUE-TCP handler", sessionID)
+		lgDebugf(cfg.lg(), "[%s] -> Dispatching to MASQUE-TCP handler", sessionID)
 		handleMasqueTCPServer(w, r, sessionID, cfg, sessions)
 		return
 	}
 	if r.Method == http.MethodPost {
 		if r.Header.Get("X-Tunnel-Proto") == resumeFrameTypeResume {
-			zlog.Debugf("[%s] -> Dispatching to H2-Stream RESUME handler", sessionID)
+			lgDebugf(cfg.lg(), "[%s] -> Dispatching to H2-Stream RESUME handler", sessionID)
 			handleH2StreamResumeServer(w, r, sessionID, cfg, sessions)
 			return
 		}
-		zlog.Debugf("[%s] -> 拒绝非 resume/2 的 POST（v1 已移除）", sessionID)
+		lgDebugf(cfg.lg(), "[%s] -> 拒绝非 resume/2 的 POST（v1 已移除）", sessionID)
 		w.Header().Set("X-Resume-Error", resumeErrVersionUnsupported.String())
 		http.Error(w, "resume/2 required", http.StatusUpgradeRequired)
 		return
 	}
 
-	zlog.Warnf("[%s] ❌ Unsupported request method or protocol combination", sessionID)
+	lgWarnf(cfg.lg(), "[%s] ❌ Unsupported request method or protocol combination", sessionID)
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
@@ -313,20 +260,19 @@ func serveResumeDataPlane(sess *tunnelSession, up io.Reader, writer *resumeSessi
 	datagram := sess.datagram
 
 	if !datagram && !handshakeAlreadyDone {
-		if !doServerHandshakeAck(up, writer, params.handshakeAckMs, sessionID) {
+		if !doServerHandshakeAck(up, writer, params.handshakeAckMs, sessionID, sess.lg()) {
 			return
 		}
 	}
 
-	sess.setActiveWriter(writer)
 	defer clearWriter(writer)
 
-	if !datagram {
-		if err := sess.replayDownlink(writer, clientDownlink); err != nil {
-			zlog.Warnf("[%s] ❌ 下行补发失败（可能窗口已被覆盖）: %v", sessionID, err)
-			_ = writer.writeEnd()
-			return
-		}
+	// attachAndReplay 在 downlinkMu 下原子完成挂载 + 重放：保证 pump 的
+	// 实时帧不会插到重放帧之前（帧序保证，见 session.go）。
+	if err := sess.attachAndReplay(writer, clientDownlink); err != nil {
+		lgWarnf(sess.lg(), "[%s] ❌ 下行补发失败（可能窗口已被覆盖）: %v", sessionID, err)
+		_ = writer.writeEnd()
+		return
 	}
 
 	payloadBuf := make([]byte, 64*1024)
@@ -343,12 +289,12 @@ func serveResumeDataPlane(sess *tunnelSession, up io.Reader, writer *resumeSessi
 			typ, seq, n, err = readFrame(up, payloadBuf)
 		}
 		if errors.Is(err, errResumeEndFrame) {
-			zlog.Debugf("[%s] Resume END 帧收到", sessionID)
+			lgDebugf(sess.lg(), "[%s] Resume END 帧收到", sessionID)
 			sess.touch()
 			return
 		}
 		if err != nil {
-			zlog.Debugf("[%s] Resume 上行读结束: %v", sessionID, err)
+			lgDebugf(sess.lg(), "[%s] Resume 上行读结束: %v", sessionID, err)
 			return
 		}
 		if !datagram {
@@ -361,12 +307,12 @@ func serveResumeDataPlane(sess *tunnelSession, up io.Reader, writer *resumeSessi
 				continue
 			case resumeFrameData:
 			default:
-				zlog.Warnf("[%s] Resume 上行收到非业务帧 0x%02x", sessionID, typ)
+				lgWarnf(sess.lg(), "[%s] Resume 上行收到非业务帧 0x%02x", sessionID, typ)
 				return
 			}
 		}
 		if err := sess.acceptUplinkSeq(seq, payloadBuf[:n]); err != nil {
-			zlog.Warnf("[%s] ❌ Resume 上行 seq 错误: %v", sessionID, err)
+			lgWarnf(sess.lg(), "[%s] ❌ Resume 上行 seq 错误: %v", sessionID, err)
 			return
 		}
 	}
@@ -390,7 +336,7 @@ func serverCapabilities(cfg serverConfig) resumeCaps {
 	}
 }
 
-func doServerHandshakeAck(up io.Reader, writer *resumeSessionWriter, timeoutMs int, sessionID string) bool {
+func doServerHandshakeAck(up io.Reader, writer *resumeSessionWriter, timeoutMs int, sessionID string, lg *slog.Logger) bool {
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 3 * time.Second
@@ -409,26 +355,26 @@ func doServerHandshakeAck(up io.Reader, writer *resumeSessionWriter, timeoutMs i
 	select {
 	case res := <-done:
 		if res.err != nil {
-			zlog.Warnf("[%s] ❌ HANDSHAKE 读取失败: %v", sessionID, res.err)
+			lgWarnf(lg, "[%s] ❌ HANDSHAKE 读取失败: %v", sessionID, res.err)
 			return false
 		}
 		if res.typ != resumeFrameHandshake || res.n != 0 {
-			zlog.Warnf("[%s] ❌ 首个帧非 HANDSHAKE（0x%02x），握手失败", sessionID, res.typ)
+			lgWarnf(lg, "[%s] ❌ 首个帧非 HANDSHAKE（0x%02x），握手失败", sessionID, res.typ)
 			return false
 		}
 	case <-time.After(timeout):
-		zlog.Warnf("[%s] ❌ HANDSHAKE 超时 (%v)", sessionID, timeout)
+		lgWarnf(lg, "[%s] ❌ HANDSHAKE 超时 (%v)", sessionID, timeout)
 		return false
 	}
 	if err := writer.writeControl(resumeFrameHandshakeAck, nil); err != nil {
-		zlog.Warnf("[%s] ❌ 写 HANDSHAKE-ACK 失败: %v", sessionID, err)
+		lgWarnf(lg, "[%s] ❌ 写 HANDSHAKE-ACK 失败: %v", sessionID, err)
 		return false
 	}
-	zlog.Debugf("[%s] ✅ B 层握手确认完成 (HANDSHAKE→HANDSHAKE-ACK)", sessionID)
+	lgDebugf(lg, "[%s] ✅ B 层握手确认完成 (HANDSHAKE→HANDSHAKE-ACK)", sessionID)
 	return true
 }
 
-func serveBackupKeepaliveOnly(up io.Reader, writer *resumeSessionWriter, params resumeParams, sessionID string) {
+func serveBackupKeepaliveOnly(up io.Reader, writer *resumeSessionWriter, params resumeParams, sessionID string, lg *slog.Logger) {
 	keepaliveTimeout := time.Duration(params.keepaliveSec) * 3 * time.Second
 	if keepaliveTimeout <= 0 {
 		keepaliveTimeout = 45 * time.Second
@@ -447,7 +393,7 @@ func serveBackupKeepaliveOnly(up io.Reader, writer *resumeSessionWriter, params 
 		select {
 		case res := <-done:
 			if res.err != nil {
-				zlog.Debugf("[%s] 备用线路流结束: %v", sessionID, res.err)
+				lgDebugf(lg, "[%s] 备用线路流结束: %v", sessionID, res.err)
 				return
 			}
 			if res.typ == resumeFrameKeepalive {
@@ -456,7 +402,7 @@ func serveBackupKeepaliveOnly(up io.Reader, writer *resumeSessionWriter, params 
 				}
 			}
 		case <-time.After(keepaliveTimeout):
-			zlog.Warnf("[%s] 备用线路 KEEPALIVE 超时，判定失效", sessionID)
+			lgWarnf(lg, "[%s] 备用线路 KEEPALIVE 超时，判定失效", sessionID)
 			return
 		}
 	}

@@ -237,7 +237,7 @@ func TestMainStreamKeepaliveRoundTrip(t *testing.T) {
 	done := make(chan struct{})
 	sendResult := make(chan error, 1)
 	go func() {
-		sendResult <- resumeSendLoop(upstream, clientConn, newResumeClientRingBuf(1), 0, done, 20*time.Millisecond)
+		sendResult <- resumeSendLoop(upstream, clientConn, newResumeClientRingBuf(1), 0, done, 20*time.Millisecond, discardLogger, nil)
 	}()
 
 	timeout := time.NewTimer(time.Second)
@@ -292,7 +292,7 @@ func TestMainStreamKeepaliveRoundTrip(t *testing.T) {
 	defer consumer.Close()
 	var watermark uint64
 	recvResult := make(chan error, 1)
-	go func() { recvResult <- resumeRecvLoop(&downstream, localConn, &watermark) }()
+	go func() { recvResult <- resumeRecvLoop(&downstream, localConn, &watermark, discardLogger, nil) }()
 	got := make([]byte, 2)
 	if _, err := io.ReadFull(consumer, got); err != nil || string(got) != "ok" {
 		t.Fatalf("received data = %q, %v", got, err)

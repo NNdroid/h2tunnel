@@ -166,7 +166,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 			name:           "masque-tcp CONNECT",
 			mutate:         func(c *clientConfig) { c.Transport = transportMasque },
 			wantMethod:     "CONNECT",
-			wantPathPrefix: "/.well-known/masque/tcp/",
+			wantPathPrefix: "/tunnel/.well-known/masque/tcp/",
 			wantProto:      "resume/2",
 			wantCT:         "",
 		},

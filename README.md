@@ -37,7 +37,7 @@ go build -trimpath -o h2tunnel ./cmd/h2tunnel
 | `grpc` | ✅ | ✅ | ✅，需 CDN 开启 gRPC | 已有 gRPC 基础设施 |
 | `h3` | ✅ | ✅ | 通常不支持回源 | 端到端 QUIC 直连 |
 | `masque` | ✅ | ✅ | 通常不支持回源 | 标准 CONNECT-TCP/UDP 直连 |
-| `wt` | ✅ | 包 API 暂不支持 | 通常不支持回源 | WebTransport TCP 字节流 |
+| `wt` | ✅ | ✅ | 通常不支持回源 | WebTransport 流承载 TCP 字节流与 UDP 数据报 |
 
 普通 CDN 不会把 UDP/QUIC 原样转发到源站，因此 CDN 场景优先选择 `h2`；H3、WebTransport 和 MASQUE 应当端到端直连。
 
@@ -278,7 +278,7 @@ if err != nil {
 return server.ListenAndServe(":8443")
 ```
 
-库不会生成或持久化证书。调用 `ListenAndServe` 托管 `h2`/`h3`/`wt`/`masque` 时必须提供包含证书的 `TLSConfig`。使用 `Handler` 嵌入现有 HTTP 服务时，TLS 可以由外部服务器或反向代理负责。
+库不会持久化证书。调用 `ListenAndServe` 托管 `h2`/`h3`/`wt`/`masque` 时必须提供包含证书的 `TLSConfig`；开发环境可用 `h2tunnel.SelfSignedTLSConfig("localhost")` 现场生成（始终附带 127.0.0.1/::1 的 IP SAN，回环连接可直接通过校验），生产环境请使用公开受信证书。使用 `Handler` 嵌入现有 HTTP 服务时，TLS 可以由外部服务器或反向代理负责。
 
 ### 8. 自己管理监听器
 
@@ -429,7 +429,7 @@ h2tunnel version
 | `listen` | 共用 | 服务端 `:8443`；客户端 `127.0.0.1:2222` | 监听地址 |
 | `server` | 客户端 | 必填 | 完整的 `http://` 或 `https://` 服务端地址 |
 | `target` | 客户端 | 必填 | 服务端要连接的目标地址 |
-| `path` | 共用 | `/tunnel` | 隧道 HTTP 路径 |
+| `path` | 共用 | `/` | 隧道 HTTP 路径；MASQUE 端点嵌在其下：`<path>/.well-known/masque/{tcp,udp}/...`（如 `path=/tunnel` → `/tunnel/.well-known/masque/...`；`path=/` 即标准 `/.well-known/masque`） |
 | `token` | 共用 | 空 | 预共享鉴权令牌；生产环境必须设置 |
 | `transport` | 共用 | 服务端 `h2`；客户端按 URL 推断 | 服务端可逗号分隔或设为 `all`；客户端只能选一个 |
 | `network` | 共用 | `tcp` | `tcp`、`udp` 或 `all` |
@@ -492,9 +492,16 @@ go vet ./...
 go build ./cmd/h2tunnel
 ```
 
-测试包含包外 API 编译与真实 TCP/UDP 端到端传输、鉴权失败、目标拒绝、context 取消传播、CDN 延迟/错误/缓冲行为、恢复握手、并发关闭和稳态基准。
+测试包含包外 API 编译与真实 TCP/UDP 端到端传输、鉴权失败、目标拒绝、context 取消传播、CDN 延迟/错误/缓冲行为、恢复握手、并发关闭和稳态基准。`TestProtocolRealTargetMatrix` 用真实语义目标验证全协议：TCP 目标是真实 HTTP server（同一条隧道连接 10 次 keep-alive 往返，并断言目标侧零新增连接），UDP 目标是真实 DNS server（同一条 PacketConn 发 10 次独立 A 查询并逐包校验）。
 
 ```bash
+# 全协议 × TCP/UDP 吞吐基准（回环）
+go test -run '^$' -bench '^BenchmarkProtocolThroughput$' -benchmem .
+
+# 数据面微基准（帧编解码 / ring / 会话下行 / 上行隔离度）
+go test -run '^$' -bench 'BenchmarkWriteFrame32KB|BenchmarkReadFrame32KB|BenchmarkRingAppendOverwrite32KB|BenchmarkRingReadAt32KB|BenchmarkSessionDownlinkWrite|BenchmarkTunnelSessionUplinkUnderDownlink' -benchmem .
+
+# CDN 拓扑端到端基准
 go test -run '^$' -bench '^BenchmarkPublicAPIThroughCDN72KB$' -benchmem .
 ```
 

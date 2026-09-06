@@ -30,7 +30,7 @@ func setupBenchmarkEnv() (serverURL, targetAddr, testToken string) {
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportAll,
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "fatal", // 压测时关掉服务端日志
 	})
 

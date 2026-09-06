@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -88,7 +89,7 @@ func executeResumableTunnelContext(ctx context.Context, sessionID string, localC
 				notifyReady(err)
 				return err
 			}
-			zlog.Warnf("[Resume] ❌ 会话不可恢复: %v", err)
+			lgWarnf(cfg.lg(), "[Resume] ❌ 会话不可恢复: %v", err)
 		}
 		// 流断：每次重拨前重新取一次主线路客户端（若主已切换，则用新传输重拨续传）
 		if mgr != nil {
@@ -104,7 +105,10 @@ func executeResumableTunnelContext(ctx context.Context, sessionID string, localC
 		if delay > resumeBackoffMax {
 			delay = resumeBackoffMax
 		}
-		zlog.Infof("[Resume] 🔁 第 %d 次重拨（同 session 续传），等待 %v", attempt, delay)
+		lgInfof(cfg.lg(), "[Resume] 🔁 第 %d 次重拨（同 session 续传），等待 %v", attempt, delay)
+		if cfg.stats != nil {
+			cfg.stats.ResumeReconnects.Add(1)
+		}
 		select {
 		case <-ctx.Done():
 			notifyReady(ctx.Err())
@@ -112,22 +116,46 @@ func executeResumableTunnelContext(ctx context.Context, sessionID string, localC
 		case <-time.After(delay):
 		}
 	}
-	zlog.Warnf("[Resume] 超过最大重试次数 (%d)，会话终止", resumeMaxAttempts)
+	lgWarnf(cfg.lg(), "[Resume] 超过最大重试次数 (%d)，会话终止", resumeMaxAttempts)
 	err := errors.New("h2tunnel: resume attempts exhausted")
 	notifyReady(err)
 	return err
 }
 
-type tunnelHTTPError struct {
+// TunnelError 表示服务端以 HTTP 状态码拒绝了隧道建立。除公开哨兵外，
+// 嵌入方可用 errors.As(*TunnelError) 取回原始状态码做细分处理。
+type TunnelError struct {
 	status int
+	// err 是映射出的公开哨兵（ErrUnauthenticated / ErrForbidden），
+	// 经 Unwrap 暴露给 errors.Is；非鉴权/授权类错误为 nil。
+	err error
 }
 
-func (e *tunnelHTTPError) Error() string {
+func (e *TunnelError) Error() string {
 	return fmt.Sprintf("h2tunnel: server rejected tunnel with HTTP %d", e.status)
 }
 
+func (e *TunnelError) Unwrap() error { return e.err }
+
+// HTTPStatus 返回服务端拒绝时的 HTTP 状态码。
+func (e *TunnelError) HTTPStatus() int { return e.status }
+
+// newTunnelHTTPError 把服务端拒绝的 HTTP 状态映射为公开哨兵错误：
+// 嵌入方可通过 errors.Is(err, h2tunnel.ErrUnauthenticated) /
+// errors.Is(err, h2tunnel.ErrForbidden) 区分"换 token"和"换目标"。
+func newTunnelHTTPError(status int) error {
+	var sentinel error
+	switch status {
+	case http.StatusProxyAuthRequired, http.StatusUnauthorized:
+		sentinel = ErrUnauthenticated
+	case http.StatusForbidden:
+		sentinel = ErrForbidden
+	}
+	return &TunnelError{status: status, err: sentinel}
+}
+
 func isPermanentTunnelError(err error) bool {
-	var statusErr *tunnelHTTPError
+	var statusErr *TunnelError
 	return errors.As(err, &statusErr) || errors.Is(err, errGap) || errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrForbidden)
 }
 
@@ -148,7 +176,7 @@ func buildResumeRequestChecked(ctx context.Context, body io.Reader, sessID strin
 			host, port = cfg.TargetAddr, "22"
 		}
 		u, _ := url.Parse(reqUrl)
-		u.Path = fmt.Sprintf("/.well-known/masque/tcp/%s/%s/", url.PathEscape(host), url.PathEscape(port))
+		u.Path = fmt.Sprintf("%s/tcp/%s/%s/", masquePathBase(cfg.Path), url.PathEscape(host), url.PathEscape(port))
 		reqURL = u.String()
 	} else {
 		// h2 / h3 / grpc：POST cfg.Path
@@ -239,13 +267,13 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 		resp, err = httpClient.Do(req)
 	}
 	if err != nil {
-		zlog.Warnf("[Resume] 建流失败: %v", err)
+		lgWarnf(cfg.lg(), "[Resume] 建流失败: %v", err)
 		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		zlog.Warnf("[Resume] ❌ 服务端拒绝: HTTP %d", resp.StatusCode)
-		return false, &tunnelHTTPError{status: resp.StatusCode}
+		lgWarnf(cfg.lg(), "[Resume] ❌ 服务端拒绝: HTTP %d", resp.StatusCode)
+		return false, newTunnelHTTPError(resp.StatusCode)
 	}
 
 	if v := resp.Header.Get("X-Resume-Uplink"); v != "" {
@@ -257,9 +285,9 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	ack := resp.Header.Get("X-Resume-Ack")
 	if ack != "ok" {
 		if code := resp.Header.Get("X-Resume-Error"); code != "" {
-			zlog.Warnf("[Resume] ❌ 握手被拒绝: %s", code)
+			lgWarnf(cfg.lg(), "[Resume] ❌ 握手被拒绝: %s", code)
 		} else {
-			zlog.Warnf("[Resume] ❌ 握手未确认 (X-Resume-Ack=%q)，终止", ack)
+			lgWarnf(cfg.lg(), "[Resume] ❌ 握手未确认 (X-Resume-Ack=%q)，终止", ack)
 		}
 		return false, errors.New("h2tunnel: resume handshake was not acknowledged")
 	}
@@ -267,27 +295,27 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	// 仅记录对齐值供日志与后续心跳使用。
 	if v := resp.Header.Get("X-Resume-Params"); v != "" {
 		aligned := alignParams(parseParams(v))
-		zlog.Debugf("[Resume] 服务端对齐参数: window_kb=%d handshake_ack=%dms keepalive=%ds",
+		lgDebugf(cfg.lg(), "[Resume] 服务端对齐参数: window_kb=%d handshake_ack=%dms keepalive=%ds",
 			aligned.windowKB, aligned.handshakeAckMs, aligned.keepaliveSec)
 	}
-	zlog.Infof("[Resume] ✅ 隧道恢复就绪 (serverUplink=%d)", *serverUplink)
+	lgInfof(cfg.lg(), "[Resume] ✅ 隧道恢复就绪 (serverUplink=%d)", *serverUplink)
 
 	// ===== B 层握手：先发 HANDSHAKE，等 HANDSHAKE-ACK，ack 前零业务字节 =====
 	if err := writeFrame(pw, resumeFrameHandshake, 0, nil, 0); err != nil {
-		zlog.Warnf("[Resume] ❌ 写 HANDSHAKE 控制帧失败: %v", err)
+		lgWarnf(cfg.lg(), "[Resume] ❌ 写 HANDSHAKE 控制帧失败: %v", err)
 		return false, err
 	}
 	hsBuf := make([]byte, 64*1024)
 	typ, _, _, err := readFrame(resp.Body, hsBuf)
 	if err != nil {
-		zlog.Warnf("[Resume] ❌ 读 HANDSHAKE-ACK 失败: %v", err)
+		lgWarnf(cfg.lg(), "[Resume] ❌ 读 HANDSHAKE-ACK 失败: %v", err)
 		return false, err
 	}
 	if typ != resumeFrameHandshakeAck {
-		zlog.Warnf("[Resume] ❌ 期望 HANDSHAKE-ACK，收到帧 0x%02x", typ)
+		lgWarnf(cfg.lg(), "[Resume] ❌ 期望 HANDSHAKE-ACK，收到帧 0x%02x", typ)
 		return false, errors.New("h2tunnel: invalid resume handshake response")
 	}
-	zlog.Debugf("[Resume] ✅ B 层握手确认 (HANDSHAKE→HANDSHAKE-ACK)")
+	lgDebugf(cfg.lg(), "[Resume] ✅ B 层握手确认 (HANDSHAKE→HANDSHAKE-ACK)")
 	if onReady != nil {
 		onReady()
 	}
@@ -299,11 +327,11 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	go func() {
 		defer wg.Done()
 		defer pw.Close()
-		sendErr = resumeSendLoop(pw, localConn, ringBuf, *serverUplink, done, cfg.HeartbeatInterval)
+		sendErr = resumeSendLoop(pw, localConn, ringBuf, *serverUplink, done, cfg.HeartbeatInterval, cfg.lg(), cfg.stats)
 	}()
 	go func() {
 		defer wg.Done()
-		recvErr = resumeRecvLoop(resp.Body, localConn, clientDownlink)
+		recvErr = resumeRecvLoop(resp.Body, localConn, clientDownlink, cfg.lg(), cfg.stats)
 	}()
 
 	wg.Wait()
@@ -322,7 +350,7 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 // done 用于本 attempt 结束时打断可能阻塞在 localConn.Read 的本次发送协程，
 // 避免旧 attempt 的 sendLoop 与下一 attempt 的 sendLoop 并发读同一条 localConn
 // （两读者会按不可预测方式瓜分字节流，破坏上行帧）。
-func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBuf, startSeq uint64, done <-chan struct{}, heartbeat time.Duration) error {
+func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBuf, startSeq uint64, done <-chan struct{}, heartbeat time.Duration, lg *slog.Logger, st *ClientStats) error {
 	var seq atomic.Uint64
 	seq.Store(startSeq)
 	sw := &seqWriter{w: w, seq: &seq}
@@ -336,7 +364,7 @@ func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBu
 		return err
 	}
 	if replayed > 0 {
-		zlog.Debugf("[Resume] ⏮️ 重放上行 %d 字节 (seq %d..%d)", replayed, startSeq, startSeq+uint64(replayed))
+		lgDebugf(lg, "[Resume] ⏮️ 重放上行 %d 字节 (seq %d..%d)", replayed, startSeq, startSeq+uint64(replayed))
 	}
 
 	// 阶段 B：实时
@@ -353,6 +381,9 @@ func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBu
 		n, rErr := localConn.Read(buf)
 		if n > 0 {
 			ringBuf.Append(buf[:n])
+			if st != nil {
+				st.UplinkBytes.Add(int64(n))
+			}
 			if _, wErr := sw.Write(buf[:n]); wErr != nil {
 				return wErr
 			}
@@ -391,7 +422,7 @@ func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBu
 // 服务端据此补发下行缺口。下行坐标系跨流连续：首帧 seq 必须等于 *clientDownlink
 // （首流为 0，重连流为上次已收字节数），否则视为缺口不可恢复。
 // 收到 END 帧 → 本地半关并正常返回；读错误 → 返回 err 让外层重拨。
-func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64) error {
+func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64, lg *slog.Logger, st *ClientStats) error {
 	payloadBuf := make([]byte, 64*1024)
 	expected := *clientDownlink
 	for {
@@ -416,13 +447,16 @@ func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64) 
 			return fmt.Errorf("resume: unexpected frame type 0x%02x", typ)
 		}
 		if seq != expected {
-			zlog.Warnf("[Resume] 下行 seq 不连续: 期望 %d, 收到 %d", expected, seq)
+			lgWarnf(lg, "[Resume] 下行 seq 不连续: 期望 %d, 收到 %d", expected, seq)
 			*clientDownlink = expected
 			return errGap
 		}
 		if _, wErr := localConn.Write(payloadBuf[:n]); wErr != nil {
 			*clientDownlink = expected
 			return wErr
+		}
+		if st != nil {
+			st.DownlinkBytes.Add(int64(n))
 		}
 		expected += uint64(n)
 		*clientDownlink = expected
