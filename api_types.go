@@ -105,35 +105,55 @@ type Service struct {
 // ClientOptions configures an embeddable tunnel client. It intentionally has
 // no local listen address or default target: callers pass the target per dial.
 type ClientOptions struct {
-	Endpoint    string
-	Path        string
-	Transport   Transport
-	Host        string
-	TLSConfig   *tls.Config
+	// 服务端地址（含 scheme）。https 搭配 h2/h3/wt/masque，http 搭配 h2c；
+	// transport 留空时按 scheme 推断。
+	Endpoint string
+	// 隧道 HTTP 路径（默认 "/"）。MASQUE 端点嵌在其下：
+	// <path>.well-known/masque/{tcp,udp}/<host>/<port>/。
+	Path string
+	// 传输协议；空 = 按 Endpoint scheme 推断（https→h2，http→h2c）。
+	Transport Transport
+	// 覆盖 HTTP Host 头（CDN 多租户回源场景）。
+	Host string
+	// TLS 配置；Clone 后使用，调用方可安全复用。http endpoint 不允许携带。
+	TLSConfig *tls.Config
+	// 每个隧道请求的鉴权回调（通常来自 NewTokenCredentials）。
 	Credentials CredentialProvider
 	Tuning      ClientTuning
 	Logger      *slog.Logger
-	Dialer      ClientDialer
-	QUICDialer  QUICDialer
+	// 底层 TCP socket 拨号器（接口绑定 / VPN protect）；nil = 标准库。
+	Dialer ClientDialer
+	// 底层 QUIC 拨号器（h3/wt/masque 生效）；nil = quic-go 默认。
+	QUICDialer QUICDialer
 }
 
 // ClientTuning contains the small set of knobs that materially affect CDN
 // reliability or per-session memory. Zero values select safe defaults.
 type ClientTuning struct {
+	// 会话恢复环形窗口容量（字节）。0 = 默认 256KB，上限 64MB（超出报错）。
 	SessionWindowBytes int
-	HeartbeatInterval  time.Duration
-	KeepaliveInterval  time.Duration
-	HandshakeTimeout   time.Duration
+	// CDN 双向心跳间隔。0 = 默认 25s；负数 = 彻底关闭心跳（仅限源站直连，
+	// 中间无 CDN/反代）；正值会被钳制到 [5s, 5min]。
+	HeartbeatInterval time.Duration
+	// 备用线路 KEEPALIVE 间隔。0 = 默认 15s；合法区间 1s-1h，超出报错。
+	KeepaliveInterval time.Duration
+	// 数据面握手 HANDSHAKE-ACK 超时。0 = 默认 3s；合法区间 1ms-30s，超出报错。
+	HandshakeTimeout time.Duration
+	// 热备用连接数（0 = 不启用；WT 传输不支持，必须为 0）。
 	StandbyConnections int
-	// DatagramQueueSize 是 UDP 数据报上行队列深度（默认 200）。队列满时
-	// 写入会阻塞至写超时（CLI 侧丢弃），调大以承载突发，代价是内存。
+	// UDP 数据报上行队列深度。0 = 默认 200；合法区间 0-65536，超出报错。
+	// 队列满时写入会阻塞至写超时（CLI 侧丢弃），调大以承载突发，代价是内存。
 	DatagramQueueSize int
 }
 
 // ServerOptions configures an embeddable tunnel server. Authenticator and
 // Dialer are mandatory so a library server never becomes an open proxy by
 // accident.
+// ServerOptions 配置可嵌入的隧道服务端。Authenticator 与 Dialer 必填，
+// 缺一即报错 —— 库默认永远不会成为开放代理。
 type ServerOptions struct {
+	// 隧道 HTTP 路径（默认 "/"）。MASQUE 端点嵌在其下：
+	// <path>.well-known/masque/{tcp,udp}/<host>/<port>/。
 	Path          string
 	Transports    []Transport
 	Networks      []Network
@@ -142,13 +162,13 @@ type ServerOptions struct {
 	Dialer        TargetDialer
 	Tuning        ServerTuning
 	Logger        *slog.Logger
-
-	// 为空时使用标准路径 /.well-known/masque/{tcp,udp}/<host>/<port>/；
-	// 设置为 "ccc" 后路径变为 /ccc/.well-known/masque/...（前段自定义，
 }
 
+// 服务端性能调参。零值选择安全默认。
 type ServerTuning struct {
+	// 会话恢复环形窗口容量（字节）。0 = 默认 256KB，上限 64MB（超出报错）。
 	SessionWindowBytes int
+	// 会话空闲回收时间。0 = 默认 60s（无活跃流的会话超时关闭）。
 	SessionIdleTimeout time.Duration
 }
 

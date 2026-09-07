@@ -76,6 +76,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if options.Tuning.StandbyConnections < 0 {
 		return nil, errors.New("h2tunnel: StandbyConnections must be non-negative")
 	}
+	if options.Tuning.DatagramQueueSize < 0 || options.Tuning.DatagramQueueSize > 65536 {
+		return nil, errors.New("h2tunnel: DatagramQueueSize must be between 0 and 65536")
+	}
 	if transport == transportWT && options.Tuning.StandbyConnections != 0 {
 		return nil, errors.New("h2tunnel: StandbyConnections is not supported by WebTransport")
 	}
