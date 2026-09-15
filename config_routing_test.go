@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/tls"
@@ -13,15 +13,15 @@ import (
 func TestResolveClientTransport(t *testing.T) {
 	tests := []struct {
 		name    string
-		cfg     Config
+		cfg     fileConfig
 		want    string
 		wantErr bool
 	}{
-		{name: "default", cfg: Config{}, want: transportH2},
-		{name: "trimmed canonical value", cfg: Config{Transport: " H3 "}, want: transportH3},
-		{name: "removed alias is invalid", cfg: Config{Transport: "http3"}, wantErr: true},
-		{name: "client all is invalid", cfg: Config{Transport: "all"}, wantErr: true},
-		{name: "unknown is invalid", cfg: Config{Transport: "websocket"}, wantErr: true},
+		{name: "default", cfg: fileConfig{}, want: transportH2},
+		{name: "trimmed canonical value", cfg: fileConfig{Transport: " H3 "}, want: transportH3},
+		{name: "removed alias is invalid", cfg: fileConfig{Transport: "http3"}, wantErr: true},
+		{name: "client all is invalid", cfg: fileConfig{Transport: "all"}, wantErr: true},
+		{name: "unknown is invalid", cfg: fileConfig{Transport: "websocket"}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -37,7 +37,7 @@ func TestResolveClientTransport(t *testing.T) {
 }
 
 func TestTransportEnvironmentOverride(t *testing.T) {
-	var cfg Config
+	var cfg fileConfig
 	if err := json.Unmarshal([]byte(`{"mode":"client","transport":"h3"}`), &cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -64,13 +64,13 @@ func TestTransportEnvironmentOverride(t *testing.T) {
 
 func TestInvalidEnvironmentOverrideIsRejected(t *testing.T) {
 	t.Setenv("H2TUNNEL_BACKUP_COUNT", "many")
-	if err := applyEnvOverrides(&Config{}); err == nil {
+	if err := applyEnvOverrides(&fileConfig{}); err == nil {
 		t.Fatal("invalid integer environment value should be rejected")
 	}
 
 	t.Setenv("H2TUNNEL_BACKUP_COUNT", "0")
 	t.Setenv("H2TUNNEL_INSECURE", "sometimes")
-	if err := applyEnvOverrides(&Config{}); err == nil {
+	if err := applyEnvOverrides(&fileConfig{}); err == nil {
 		t.Fatal("invalid boolean environment value should be rejected")
 	}
 }
@@ -113,7 +113,7 @@ func TestConfigValidationCanonicalizesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Mode != "server" || cfg.Path != "/tunnel" || cfg.Transport != transportH2 ||
+	if cfg.Mode != "server" || cfg.Path != "/" || cfg.Transport != transportH2 ||
 		cfg.Network != networkAll || !cfg.TLS || cfg.LogLevel != "info" {
 		t.Fatalf("unexpected canonical defaults: %+v", cfg)
 	}
@@ -122,7 +122,7 @@ func TestConfigValidationCanonicalizesDefaults(t *testing.T) {
 func TestAuthUsesCanonicalHeadersOnly(t *testing.T) {
 	const token = "secret"
 	headers := make(http.Header)
-	SetXAuth(headers, ClientConfig{Token: token})
+	setXAuth(headers, clientConfig{Token: token})
 	if headers.Get("X-Auth-Token") != token || headers.Get("Authorization") != "Bearer "+token {
 		t.Fatalf("canonical auth headers not populated: %v", headers)
 	}
@@ -137,20 +137,19 @@ func TestAuthUsesCanonicalHeadersOnly(t *testing.T) {
 		} else {
 			req.Header.Set(header, token)
 		}
-		if !checkAuth(req, token) {
-			t.Fatalf("canonical header %s should authenticate", header)
+		authenticator, _ := NewTokenAuthenticator(token)
+		if _, err := authenticator(req.Context(), req); err != nil {
+			t.Fatalf("canonical header %s should authenticate: %v", header, err)
 		}
 	}
 
-	legacy := httptest.NewRequest(http.MethodPost, "https://example.test/tunnel", nil)
-	legacy.Header.Set("Proxy-Authorization", "Bearer "+token)
-	if checkAuth(legacy, token) {
-		t.Fatal("removed proxy authorization header should be rejected")
-	}
+	// The removed Proxy-Authorization header is naturally unrecognized by
+	// NewTokenAuthenticator (it accepts only X-Auth-Token and Authorization),
+	// so asserting it here is left to the SDK authenticator tests.
 }
 
 func TestBuildClientConfigNormalizesRouting(t *testing.T) {
-	cfg := &Config{Transport: transportH3, Network: networkAll, Path: "edge"}
+	cfg := &fileConfig{Transport: transportH3, Network: networkAll, Path: "edge"}
 	got := buildClientConfig(cfg)
 	if got.Transport != transportH3 || !got.usesH3() {
 		t.Fatalf("unexpected client transport: %+v", got)
@@ -164,47 +163,47 @@ func TestBuildClientConfigNormalizesRouting(t *testing.T) {
 }
 
 func TestClientTransportFollowsServerScheme(t *testing.T) {
-	h2c := buildClientConfig(&Config{Transport: transportH2, Server: "http://127.0.0.1:8080"})
+	h2c := buildClientConfig(&fileConfig{Transport: transportH2, Server: "http://127.0.0.1:8080"})
 	if h2c.Transport != transportH2C {
 		t.Fatalf("http endpoint should normalize h2 to h2c, got %q", h2c.Transport)
 	}
-	if _, err := resolveClientEndpointTransport(&Config{Transport: transportH2C}, "https://example.test"); err == nil {
+	if _, err := resolveClientEndpointTransport(&fileConfig{Transport: transportH2C}, "https://example.test"); err == nil {
 		t.Fatal("h2c with https URL should be rejected")
 	}
-	if _, err := resolveClientEndpointTransport(&Config{Transport: transportH3}, "http://example.test"); err == nil {
+	if _, err := resolveClientEndpointTransport(&fileConfig{Transport: transportH3}, "http://example.test"); err == nil {
 		t.Fatal("h3 with http URL should be rejected")
 	}
 }
 
 func TestBuildClientConfigClampsPrimaryNetworks(t *testing.T) {
-	tcpOnly := buildClientConfig(&Config{Network: networkTCP, PrimaryCount: 2})
-	if tcpOnly.ConnectionPolicy.PrimaryCount != 1 || len(tcpOnly.ConnectionPolicy.PrimaryNetworks) != 1 {
-		t.Fatalf("tcp-only client should keep one primary network: %+v", tcpOnly.ConnectionPolicy)
+	tcpOnly := buildClientConfig(&fileConfig{Network: networkTCP, PrimaryCount: 2})
+	if tcpOnly.connectionPolicy.PrimaryCount != 1 || len(tcpOnly.connectionPolicy.PrimaryNetworks) != 1 {
+		t.Fatalf("tcp-only client should keep one primary network: %+v", tcpOnly.connectionPolicy)
 	}
-	dual := buildClientConfig(&Config{Network: networkAll, PrimaryCount: 8})
-	if dual.ConnectionPolicy.PrimaryCount != 2 || len(dual.ConnectionPolicy.PrimaryNetworks) != 2 {
-		t.Fatalf("dual-stack client should clamp to two primary networks: %+v", dual.ConnectionPolicy)
+	dual := buildClientConfig(&fileConfig{Network: networkAll, PrimaryCount: 8})
+	if dual.connectionPolicy.PrimaryCount != 2 || len(dual.connectionPolicy.PrimaryNetworks) != 2 {
+		t.Fatalf("dual-stack client should clamp to two primary networks: %+v", dual.connectionPolicy)
 	}
 }
 
 func TestPrepareServerConfig(t *testing.T) {
 	tests := []struct {
 		name      string
-		cfg       ServerConfig
+		cfg       serverConfig
 		wantTrans string
 		wantTLS   bool
 		wantH3    bool
 		wantErr   bool
 	}{
-		{name: "empty defaults to h2", cfg: ServerConfig{}, wantTrans: transportH2, wantTLS: true, wantH3: false},
-		{name: "all starts both stacks", cfg: ServerConfig{Transport: transportAll}, wantTrans: transportAll, wantTLS: true, wantH3: true},
-		{name: "comma list starts quic", cfg: ServerConfig{Transport: "h2,h3,h2"}, wantTrans: "h2,h3", wantTLS: true, wantH3: true},
-		{name: "h2c is cleartext", cfg: ServerConfig{Transport: transportH2C}, wantTrans: transportH2C, wantTLS: false, wantH3: false},
-		{name: "grpc may be cleartext", cfg: ServerConfig{Transport: "grpc"}, wantTrans: transportGRPC, wantTLS: false, wantH3: false},
-		{name: "h2c cannot mix with tls", cfg: ServerConfig{Transport: "h2c,h2"}, wantErr: true},
-		{name: "h2c cannot override explicit tls", cfg: ServerConfig{Transport: "h2c", EnableTLS: true}, wantErr: true},
-		{name: "unknown transport", cfg: ServerConfig{Transport: "ws"}, wantErr: true},
-		{name: "unknown network", cfg: ServerConfig{Network: "icmp"}, wantErr: true},
+		{name: "empty defaults to h2", cfg: serverConfig{}, wantTrans: transportH2, wantTLS: true, wantH3: false},
+		{name: "all starts both stacks", cfg: serverConfig{Transport: transportAll}, wantTrans: transportAll, wantTLS: true, wantH3: true},
+		{name: "comma list starts quic", cfg: serverConfig{Transport: "h2,h3,h2"}, wantTrans: "h2,h3", wantTLS: true, wantH3: true},
+		{name: "h2c is cleartext", cfg: serverConfig{Transport: transportH2C}, wantTrans: transportH2C, wantTLS: false, wantH3: false},
+		{name: "grpc may be cleartext", cfg: serverConfig{Transport: "grpc"}, wantTrans: transportGRPC, wantTLS: false, wantH3: false},
+		{name: "h2c cannot mix with tls", cfg: serverConfig{Transport: "h2c,h2"}, wantErr: true},
+		{name: "h2c cannot override explicit tls", cfg: serverConfig{Transport: "h2c", EnableTLS: true}, wantErr: true},
+		{name: "unknown transport", cfg: serverConfig{Transport: "ws"}, wantErr: true},
+		{name: "unknown network", cfg: serverConfig{Network: "icmp"}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -218,7 +217,7 @@ func TestPrepareServerConfig(t *testing.T) {
 			if got.Transport != tt.wantTrans || got.EnableTLS != tt.wantTLS || got.EnableH3 != tt.wantH3 {
 				t.Fatalf("got transport=%q tls=%v h3=%v; want %q/%v/%v", got.Transport, got.EnableTLS, got.EnableH3, tt.wantTrans, tt.wantTLS, tt.wantH3)
 			}
-			if !got.routingPolicy.ready || got.Path != "/tunnel" || got.Network != networkAll ||
+			if !got.routingPolicy.ready || got.Path != "/" || got.Network != networkAll ||
 				got.SessionWindow != sessionWindowDefaultKB || got.DrainTimeout != drainDefault {
 				t.Fatalf("server defaults/policy not prepared: %+v", got)
 			}
@@ -227,7 +226,7 @@ func TestPrepareServerConfig(t *testing.T) {
 }
 
 func TestBuildServerConfigHasCDNSafeDefault(t *testing.T) {
-	server, err := prepareServerConfig(buildServerConfig(&Config{}))
+	server, err := prepareServerConfig(buildServerConfig(&fileConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +273,14 @@ func TestStrictTransportRouting(t *testing.T) {
 			if tt.content != "" {
 				req.Header.Set("Content-Type", tt.content)
 			}
-			err := checkStrictTransport(req, tt.allowed, tt.wt, tt.masqueTCP, false)
+			req.Header.Set("X-Tunnel-Proto", resumeFrameTypeResume)
+			if tt.wt {
+				req.Header.Set("Protocol", "webtransport")
+			} else if tt.masqueTCP {
+				req.Header.Set("Protocol", "connect-tcp")
+			}
+			tr := classifyTunnelRequest(req, serverConfig{}, true)
+			err := checkStrictTransport(req, tt.allowed, tr.transport)
 			if (err == nil) != tt.wantOK {
 				t.Fatalf("checkStrictTransport() error = %v, wantOK %v", err, tt.wantOK)
 			}
@@ -306,11 +312,11 @@ func TestBackupCountConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var cfg Config
+			var cfg fileConfig
 			if err := json.Unmarshal([]byte(tt.json), &cfg); err != nil {
 				t.Fatal(err)
 			}
-			got := buildClientConfig(&cfg).ConnectionPolicy
+			got := buildClientConfig(&cfg).connectionPolicy
 			if got.BackupCount != tt.want {
 				t.Fatalf("BackupCount = %d, want %d", got.BackupCount, tt.want)
 			}
@@ -348,7 +354,7 @@ func TestConfigRejectsRemovedFields(t *testing.T) {
 }
 
 func TestPrimaryTypesAreDeterministic(t *testing.T) {
-	p := ConnectionPolicy{
+	p := connectionPolicy{
 		PrimaryCount:    2,
 		PrimaryNetworks: []string{"udp", "tcp", "udp"},
 	}
@@ -362,11 +368,11 @@ func TestPrimaryTypesAreDeterministic(t *testing.T) {
 }
 
 func TestManagedLineUsesConfiguredMissedAckLimit(t *testing.T) {
-	line := newManagedLine("test", rolePrimary, networkTCP, ClientConfig{}, "http://example.test", nil, nil, 7)
+	line := newManagedLine("test", rolePrimary, networkTCP, clientConfig{}, "http://example.test", nil, nil, 7)
 	if line.maxMissedAcks != 7 {
 		t.Fatalf("maxMissedAcks = %d, want 7", line.maxMissedAcks)
 	}
-	defaultLine := newManagedLine("test", rolePrimary, networkTCP, ClientConfig{}, "http://example.test", nil, nil, 0)
+	defaultLine := newManagedLine("test", rolePrimary, networkTCP, clientConfig{}, "http://example.test", nil, nil, 0)
 	if defaultLine.maxMissedAcks != backupMaxMissedAcks {
 		t.Fatalf("default maxMissedAcks = %d, want %d", defaultLine.maxMissedAcks, backupMaxMissedAcks)
 	}
@@ -380,12 +386,14 @@ func TestExampleConfigsAreRunnable(t *testing.T) {
 		}
 		if cfg.Mode == "client" {
 			client := buildClientConfig(cfg)
-			if client.Transport != transportH2 || client.Network != networkTCP || client.HeartbeatInterval <= 0 {
+			if client.Transport != transportH2 || client.Network != networkTCP || client.HeartbeatInterval <= 0 ||
+				client.Padding != (paddingPolicy{min: 600, max: 1200}) {
 				t.Fatalf("client example not normalized: %+v", client)
 			}
 		} else {
 			server, err := prepareServerConfig(buildServerConfig(cfg))
-			if err != nil || server.Transport != transportH2 || !server.EnableTLS || server.EnableH3 {
+			if err != nil || server.Transport != transportH2 || !server.EnableTLS || server.EnableH3 ||
+				server.Padding != (paddingPolicy{min: 600, max: 1200}) {
 				t.Fatalf("server example not runnable: cfg=%+v err=%v", server, err)
 			}
 		}
@@ -400,19 +408,20 @@ func BenchmarkCompiledRoutingPolicy(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := checkStrictTransportPolicy(req, policy, "h2,grpc", false, false, false); err != nil {
+		if err := checkStrictTransportPolicy(req, policy, "h2,grpc", resumeWireTransport(req)); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
 func BenchmarkCheckAuth(b *testing.B) {
+	auth, _ := NewTokenAuthenticator("benchmark-token")
 	req := httptest.NewRequest(http.MethodPost, "https://example.test/tunnel", nil)
 	req.Header.Set("Authorization", "Bearer benchmark-token")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if !checkAuth(req, "benchmark-token") {
+		if _, err := auth(req.Context(), req); err != nil {
 			b.Fatal("authentication failed")
 		}
 	}

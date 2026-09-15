@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"fmt"
@@ -20,11 +20,15 @@ const (
 	networkUDP = "udp"
 )
 
-// canonicalTransport 只做大小写和空白归一；配置仅接受文档列出的正式值。
+// canonicalTransport only normalizes case and whitespace; config accepts only
+// the canonical values listed in the docs. It normalizes a transport name
+// (case/whitespace) and lets library callers validate input.
 func canonicalTransport(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
+// validTransport checks whether a transport name is valid; allowAll decides
+// whether "all" is accepted.
 func validTransport(value string, allowAll bool) bool {
 	switch value {
 	case transportH2, transportH2C, transportH3, transportWT, transportMasque, transportGRPC:
@@ -36,7 +40,8 @@ func validTransport(value string, allowAll bool) bool {
 	}
 }
 
-// normalizeTransportList 规范服务端逗号分隔 allow-list，并稳定去重。
+// normalizeTransportList normalizes a server comma-separated allow-list and
+// dedupes it deterministically.
 func normalizeTransportList(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -67,8 +72,8 @@ func normalizeTransportList(value string) (string, error) {
 	return strings.Join(items, ","), nil
 }
 
-// resolveClientTransport 让 transport 字符串成为客户端唯一事实来源。
-func resolveClientTransport(cfg *Config) (string, error) {
+// resolveClientTransport makes the transport string the client's single source of truth.
+func resolveClientTransport(cfg *fileConfig) (string, error) {
 	transport := canonicalTransport(cfg.Transport)
 	if transport == "" {
 		return transportH2, nil
@@ -79,7 +84,7 @@ func resolveClientTransport(cfg *Config) (string, error) {
 	return transport, nil
 }
 
-func resolveClientEndpointTransport(cfg *Config, serverURL string) (string, error) {
+func resolveClientEndpointTransport(cfg *fileConfig, serverURL string) (string, error) {
 	transport, err := resolveClientTransport(cfg)
 	if err != nil {
 		return "", err
@@ -104,7 +109,7 @@ func resolveClientEndpointTransport(cfg *Config, serverURL string) (string, erro
 	return transport, nil
 }
 
-func (cfg ClientConfig) transportName() string {
+func (cfg clientConfig) transportName() string {
 	transport := canonicalTransport(cfg.Transport)
 	if transport != "" {
 		return transport
@@ -115,10 +120,10 @@ func (cfg ClientConfig) transportName() string {
 	return transportH2
 }
 
-func (cfg ClientConfig) usesH3() bool     { return cfg.transportName() == transportH3 }
-func (cfg ClientConfig) usesWT() bool     { return cfg.transportName() == transportWT }
-func (cfg ClientConfig) usesMasque() bool { return cfg.transportName() == transportMasque }
-func (cfg ClientConfig) usesGRPC() bool   { return cfg.transportName() == transportGRPC }
+func (cfg clientConfig) usesH3() bool     { return cfg.transportName() == transportH3 }
+func (cfg clientConfig) usesWT() bool     { return cfg.transportName() == transportWT }
+func (cfg clientConfig) usesMasque() bool { return cfg.transportName() == transportMasque }
+func (cfg clientConfig) usesGRPC() bool   { return cfg.transportName() == transportGRPC }
 
 func normalizeNetwork(value, fallback string) string {
 	normalized := strings.ToLower(strings.TrimSpace(value))
@@ -135,7 +140,7 @@ func validNetwork(value string) bool {
 func normalizeTunnelPath(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "/tunnel"
+		return "/"
 	}
 	if value[0] != '/' {
 		return "/" + value
@@ -226,7 +231,7 @@ func (p routingPolicy) allowsTransport(transport string) bool {
 	return p.transports&transportMaskFor(transport) != 0
 }
 
-func (cfg ServerConfig) effectiveRoutingPolicy() routingPolicy {
+func (cfg serverConfig) effectiveRoutingPolicy() routingPolicy {
 	if cfg.routingPolicy.ready {
 		return cfg.routingPolicy
 	}
@@ -237,9 +242,10 @@ func isNetworkAllowed(reqNet, configuredNet string) bool {
 	return compileRoutingPolicy("", configuredNet).allowsNetwork(reqNet)
 }
 
-// prepareServerConfig 在监听前一次性编译分流策略。请求热路径只做位运算，
-// 不再为每个请求 Split 字符串、分配 map。
-func prepareServerConfig(cfg ServerConfig) (ServerConfig, error) {
+// prepareServerConfig compiles the routing policy once before listening. The
+// request hot path then does only bitmask math, no longer Split-ing strings or
+// allocating a map per request.
+func prepareServerConfig(cfg serverConfig) (serverConfig, error) {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8443"
 	}
@@ -262,7 +268,8 @@ func prepareServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	}
 	cfg.routingPolicy = compileRoutingPolicy(cfg.Transport, cfg.Network)
 
-	// allow-list 同时决定监听栈，避免放行 H3 却没有启动 QUIC。
+	// The allow-list also decides which listener stacks to bind, so we never
+	// allow H3 but fail to start QUIC.
 	if cfg.Transport == transportAll {
 		cfg.EnableH3 = true
 		cfg.EnableTLS = true
@@ -285,23 +292,95 @@ func prepareServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	return cfg, nil
 }
 
-func requestTransport(r *http.Request, isWT, isMasqueTCP, isMasqueUDP bool) string {
+// tunnelKind is the protocol verdict of one inbound request. classifyTunnelRequest
+// computes it once per request and auth, policy, event labels and handler
+// dispatch share that one value object — replacing the previous pattern where
+// isWT/isMasqueTCP/isMasqueUDP booleans were re-derived in four places.
+type tunnelKind uint8
+
+const (
+	kindUnsupported tunnelKind = iota
+	kindWebTransport
+	kindMasqueTCP
+	kindMasqueUDP
+	kindResume // the POST resume/2 data plane (h2/h2c/grpc/h3 sub-classified by the transport label)
+)
+
+// tunnelRequest is the classification result: kind, carrier label, network and
+// target. target may be empty (a handler parses/rejects as a fallback when the
+// client supplied none).
+type tunnelRequest struct {
+	kind      tunnelKind
+	transport Transport // h2/h2c/grpc/h3/wt/masque (event and stats label)
+	network   string    // networkTCP / networkUDP
+	target    string
+}
+
+func classifyTunnelRequest(r *http.Request, cfg serverConfig, wtAvailable bool) tunnelRequest {
+	network, target := getRequestDestination(r, cfg)
+	if r.Method == http.MethodConnect {
+		switch {
+		case masqueConnectProtocol(r) == protocolWebTransport:
+			if !wtAvailable {
+				return tunnelRequest{}
+			}
+			return tunnelRequest{kind: kindWebTransport, transport: Transport(transportWT), network: network, target: target}
+		case masqueConnectProtocol(r) == protocolConnectTCP, masqueURISegment(r.URL.Path, masquePathBase(cfg.Path)) == "tcp":
+			return tunnelRequest{kind: kindMasqueTCP, transport: Transport(transportMasque), network: networkTCP, target: masqueRequestTarget("tcp", r, target)}
+		case masqueConnectProtocol(r) == protocolConnectUDP, masqueURISegment(r.URL.Path, masquePathBase(cfg.Path)) == "udp":
+			return tunnelRequest{kind: kindMasqueUDP, transport: Transport(transportMasque), network: networkUDP, target: masqueRequestTarget("udp", r, target)}
+		default:
+			return tunnelRequest{}
+		}
+	}
+	if r.Method == http.MethodPost {
+		// POST is always labeled by its resume carrier (h2/h2c/grpc/h3 sub-type);
+		// whether it really is resume/2 is rejected with 426 by handleH2StreamResumeServer's
+		// version hard-check, matching the historical dispatch order (auth/policy first, version last).
+		return tunnelRequest{kind: kindResume, transport: resumeWireTransport(r), network: network, target: target}
+	}
+	return tunnelRequest{}
+}
+
+// masqueRequestTarget resolves the MASQUE target: X-Target (logical service name)
+// first, then the RFC 9298 URI template, then X-Dst; if all miss it returns an
+// empty string and lets the handler decide to reject.
+func masqueRequestTarget(protocol string, r *http.Request, resolved string) string {
+	if resolved != "" {
+		return resolved
+	}
+	if parsed, err := parseMasqueTarget(protocol, r.URL.Path); err == nil {
+		return parsed
+	}
+	_, dst := getXDst(r)
+	return dst
+}
+
+// masqueURISegment returns the protocol segment right after the base in a MASQUE
+// URI template ("tcp"/"udp"), or "" if it doesn't match — a path fallback for
+// pure-RFC clients that send no header.
+func masqueURISegment(path, base string) string {
+	path = strings.TrimPrefix(strings.Trim(path, "/"), strings.Trim(base, "/")+"/")
+	if i := strings.Index(path, "/"); i > 0 {
+		if seg := strings.ToLower(path[:i]); seg == "tcp" || seg == "udp" {
+			return seg
+		}
+	}
+	return ""
+}
+
+// resumeWireTransport labels the carrier a POST resume/2 uses (h2/h2c/grpc/h3).
+// A CDN→origin link may downgrade to HTTP/1.1 but still belongs to the h2 POST-stream family.
+func resumeWireTransport(r *http.Request) Transport {
 	switch {
-	case isWT:
-		return transportWT
-	case isMasqueTCP || isMasqueUDP:
-		return transportMasque
-	case r.Method == http.MethodPost && isGRPCContentType(r.Header.Get("Content-Type")):
-		return transportGRPC
-	case r.Method == http.MethodPost && (r.ProtoMajor == 3 || strings.HasPrefix(r.Proto, "HTTP/3")):
-		return transportH3
-	case r.Method == http.MethodPost && r.ProtoMajor >= 2 && r.TLS == nil:
-		return transportH2C
-	case r.Method == http.MethodPost:
-		// CDN 到源站可能降级为 HTTP/1.1；它仍属于 h2 POST-stream 传输族。
-		return transportH2
+	case isGRPCContentType(r.Header.Get("Content-Type")):
+		return Transport(transportGRPC)
+	case r.ProtoMajor == 3 || strings.HasPrefix(r.Proto, "HTTP/3"):
+		return Transport(transportH3)
+	case r.ProtoMajor >= 2 && r.TLS == nil:
+		return Transport(transportH2C)
 	default:
-		return ""
+		return Transport(transportH2)
 	}
 }
 
@@ -314,18 +393,22 @@ func isGRPCContentType(value string) bool {
 		(len(value) > len("application/grpc") && strings.EqualFold(value[:len("application/grpc")], "application/grpc") && value[len("application/grpc")] == '+')
 }
 
-func checkStrictTransportPolicy(r *http.Request, policy routingPolicy, configuredTransport string, isWT, isMasqueTCP, isMasqueUDP bool) error {
-	actual := requestTransport(r, isWT, isMasqueTCP, isMasqueUDP)
-	if actual != "" && policy.allowsTransport(actual) {
+// checkStrictTransportPolicy verifies the actual carrier is within the compiled transport allow-list.
+func checkStrictTransportPolicy(r *http.Request, policy routingPolicy, configuredTransport string, actual Transport) error {
+	name := string(actual)
+	if name != "" && policy.allowsTransport(name) {
 		return nil
 	}
-	if actual == "" {
-		actual = "unknown"
+	if name == "" {
+		name = "unknown"
 	}
 	return fmt.Errorf("transport policy violation: allowed=[%s], got=%s Method=%s Proto=%s Content-Type=%s Protocol=%s",
-		configuredTransport, actual, r.Method, r.Proto, r.Header.Get("Content-Type"), r.Header.Get("Protocol"))
+		configuredTransport, name, r.Method, r.Proto, r.Header.Get("Content-Type"), masqueConnectProtocol(r))
 }
 
-func checkStrictTransport(r *http.Request, configuredTransport string, isWT, isMasqueTCP, isMasqueUDP bool) error {
-	return checkStrictTransportPolicy(r, compileRoutingPolicy(configuredTransport, networkAll), configuredTransport, isWT, isMasqueTCP, isMasqueUDP)
+// checkStrictTransport is a convenience wrapper for config validation/tests: it
+// compiles a policy from configuredTransport then checks. At runtime use the
+// classifyTunnelRequest result.
+func checkStrictTransport(r *http.Request, configuredTransport string, actual Transport) error {
+	return checkStrictTransportPolicy(r, compileRoutingPolicy(configuredTransport, networkAll), configuredTransport, actual)
 }

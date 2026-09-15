@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"encoding/base64"
@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-type StunProfile struct {
+type stunProfile struct {
 	ID                string `json:"id"`
 	Name              string `json:"name"`
 	SSHAddr           string `json:"sshAddr"`
@@ -26,7 +26,7 @@ type StunProfile struct {
 	ProxyAuthToken    string `json:"proxyAuthToken"`
 }
 
-func GenerateH2TunnelURI(transport, host, port, path, target, token, sni, remark, pin string, insecure bool) string {
+func generateH2TunnelURI(transport, host, port, path, target, token, sni, remark, pin string, insecure bool) string {
 	serverAddr := fmt.Sprintf("%s:%s", host, port)
 	if host == "" || host == "0.0.0.0" || host == ":" {
 		serverAddr = "YOUR_SERVER_IP:" + port
@@ -52,7 +52,7 @@ func GenerateH2TunnelURI(transport, host, port, path, target, token, sni, remark
 	}
 
 	// 1. Official stun:// URI
-	prof := StunProfile{
+	prof := stunProfile{
 		Name:              name,
 		SSHAddr:           target,
 		User:              "root",
@@ -108,7 +108,7 @@ func GenerateH2TunnelURI(transport, host, port, path, target, token, sni, remark
 	return stunURI
 }
 
-func PrintTerminalQR(text string) {
+func printTerminalQR(text string) {
 	fmt.Println("Scan in Stun Android / TV App (Supports stun:// and direct scan):")
 	fmt.Printf("\n  %s\n\n", text)
 }

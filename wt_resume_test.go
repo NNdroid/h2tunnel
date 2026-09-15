@@ -1,10 +1,12 @@
-package main
+package h2tunnel
 
-// WT 接入 resume/2 的断线续传验证。
+// Resume-after-disconnect verification for WT with resume/2.
 //
-// 核心断言：WebTransport stream 断开后，用同一 X-Session-ID 重开新 stream，
-// 服务端 targetConn 保留（不重拨目标），并从客户端上报的 clientDownlink 处
-// 补发下行缺口——即「断线数据续传」而非仅止步于会话 failover。
+// Core assertion: after a WebTransport stream drops, reopening a new stream
+// with the same X-Session-ID keeps the server-side targetConn alive (no
+// redial of the target) and replays the downlink gap starting at the
+// clientDownlink reported by the client — i.e. "data resume after
+// disconnect", not stopping at session failover.
 
 import (
 	"context"
@@ -23,8 +25,9 @@ import (
 	"github.com/quic-go/webtransport-go"
 )
 
-// fakeChunkedTarget 接受连接后持续写入 chunkCount 段固定序列（每段 chunk 字节），
-// 用于验证下行续传的连续性（各段内容唯一可定位）。
+// fakeChunkedTarget keeps writing chunkCount segments of a fixed sequence
+// (each chunk bytes) after accepting a connection, used to verify downlink
+// resume continuity (each segment's content is uniquely identifiable).
 func fakeChunkedTarget(addr string, chunkCount, chunk int) (net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -37,9 +40,10 @@ func fakeChunkedTarget(addr string, chunkCount, chunk int) (net.Listener, error)
 				return
 			}
 			go func(conn net.Conn) {
-				// 注意：写完 chunkCount 段后不能立刻 Close，否则服务端 downlinkPump
-				// 读到 EOF 会关掉 targetConn（会话判死），stream2 便无法续传。
-				// 模拟持续在线目标：写完数据段后挂起，直到对端关闭。
+				// Note: do not Close right after writing the chunkCount segments, otherwise the
+				// server-side downlinkPump sees EOF and closes targetConn (session declared dead),
+				// and stream2 could not resume. Simulate an always-online target: hang after
+				// writing the data segments until the peer closes.
 				defer conn.Close()
 				for i := 0; i < chunkCount; i++ {
 					seg := make([]byte, chunk)
@@ -51,7 +55,7 @@ func fakeChunkedTarget(addr string, chunkCount, chunk int) (net.Listener, error)
 					}
 					time.Sleep(20 * time.Millisecond)
 				}
-				// 保持连接存活（读侧检测对端关闭），模拟长连接目标。
+				// Keep the connection alive (the read side detects peer close), simulating a long-lived target.
 				one := make([]byte, 1)
 				for {
 					if _, rErr := conn.Read(one); rErr != nil {
@@ -64,7 +68,8 @@ func fakeChunkedTarget(addr string, chunkCount, chunk int) (net.Listener, error)
 	return ln, nil
 }
 
-// resumeWTHeaders 构造带 resume/2 A 层协商头 + 目标/鉴权头的 WT CONNECT 请求头。
+// resumeWTHeaders builds WT CONNECT request headers with the resume/2 layer-A
+// negotiation headers + target/auth headers.
 func resumeWTHeaders(sessionID string, target string) http.Header {
 	h := make(http.Header)
 	h.Set("Protocol", "webtransport")
@@ -78,9 +83,9 @@ func resumeWTHeaders(sessionID string, target string) http.Header {
 	return h
 }
 
-// dialWTStream 建立一条 WT stream 并完成 B 层握手（HANDSHAKE payload 携带
-// clientDownlink）。返回 stream。
-func dialWTStream(t *testing.T, dialer *webtransport.Dialer, reqURL string, sessionID string, target string, clientDownlink uint64, authToken string) *webtransport.Stream {
+// dialWTStream establishes a WT stream and completes the layer-B handshake
+// (the HANDSHAKE payload carries clientDownlink). Returns the stream.
+func dialWTStream(t *testing.T, dialer *webtransport.Transport, reqURL string, sessionID string, target string, clientDownlink uint64, authToken string) *webtransport.Stream {
 	t.Helper()
 	hdr := resumeWTHeaders(sessionID, target)
 	hdr.Set("X-Auth-Token", authToken)
@@ -92,7 +97,7 @@ func dialWTStream(t *testing.T, dialer *webtransport.Dialer, reqURL string, sess
 	if err != nil {
 		t.Fatalf("OpenStream failed: %v", err)
 	}
-	// B 层握手：发 HANDSHAKE（payload 带 clientDownlink），等 HANDSHAKE-ACK。
+	// Layer-B handshake: send HANDSHAKE (payload carries clientDownlink), wait for HANDSHAKE-ACK.
 	payload := strconv.FormatUint(clientDownlink, 10)
 	if err := writeFrame(stream, resumeFrameHandshake, 0, []byte(payload), 0); err != nil {
 		t.Fatalf("write HANDSHAKE: %v", err)
@@ -108,15 +113,16 @@ func dialWTStream(t *testing.T, dialer *webtransport.Dialer, reqURL string, sess
 	return stream
 }
 
-// readDataFrames 从 stream 读 DATA 帧直到读到 expectBytes 字节。校验 seq 连续。
-// baseSeq 是本条流下行的起始坐标系（stream1=0，续传流=clientDownlink）。
+// readDataFrames reads DATA frames from the stream until expectBytes bytes
+// are read, verifying seq continuity. baseSeq is the downlink coordinate
+// origin for this stream (stream1=0, resume stream=clientDownlink).
 func readDataFrames(t *testing.T, stream io.Reader, baseSeq uint64, expectBytes int) []byte {
 	t.Helper()
 	buf := make([]byte, 64*1024)
 	var out []byte
 	for len(out) < expectBytes {
 		seq, n, err := readResumeFrame(stream, buf)
-		if errors.Is(err, ErrResumeEndFrame) {
+		if errors.Is(err, errResumeEndFrame) {
 			return out
 		}
 		if err != nil {
@@ -130,8 +136,9 @@ func readDataFrames(t *testing.T, stream io.Reader, baseSeq uint64, expectBytes 
 	return out[:expectBytes]
 }
 
-// TestWTResumeReconnect 验证：stream1 读部分下行后关闭，stream2 用同一 session id
-// 从 clientDownlink 续传，整体序列连续无缺口无重复。
+// TestWTResumeReconnect verifies: stream1 closes after reading part of the
+// downlink, stream2 resumes from clientDownlink with the same session id, and
+// the overall sequence is contiguous with no gaps or duplicates.
 func TestWTResumeReconnect(t *testing.T) {
 	certFile := "test_cert_wtresume.pem"
 	keyFile := "test_key_wtresume.pem"
@@ -142,7 +149,7 @@ func TestWTResumeReconnect(t *testing.T) {
 	const (
 		chunkCount = 30
 		chunk      = 200
-		firstRead  = 25 // stream1 读前 25 段（5000 字节）
+		firstRead  = 25 // stream1 reads the first 25 segments (5000 bytes)
 		targetAddr = "127.0.0.1:29700"
 		serverAddr = "127.0.0.1:29743"
 		token      = "wt-resume-token"
@@ -153,27 +160,29 @@ func TestWTResumeReconnect(t *testing.T) {
 		t.Fatalf("fake target: %v", err)
 	}
 
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportWT,
-		ExpectedToken: token,
+		Authenticator: tokenAuth(token),
 		LogLevel:      "error",
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	// A WT-only server opens no TCP listener (requiredListeners returns only QUIC for wt),
+	// and fakeChunkedTarget does not echo — here we only verify the QUIC port is bound.
+	waitUDPBound(t, serverAddr, 30*time.Second)
 
-	dialer := &webtransport.Dialer{
+	dialer := &webtransport.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{http3.NextProtoH3}},
-		QUICConfig:      GetDefaultQUICConfig(),
+		QUICConfig:      getDefaultQUICConfig(),
 	}
 	sessionID := "wt-resume-sess-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
 
-	// ===== stream1：读前 firstRead 段 =====
+	// ===== stream1: read the first firstRead segments =====
 	st1 := dialWTStream(t, dialer, serverURL+"/tunnel", sessionID, targetAddr, 0, token)
 	part1 := readDataFrames(t, st1, 0, firstRead*chunk)
 	if len(part1) != firstRead*chunk {
@@ -181,10 +190,10 @@ func TestWTResumeReconnect(t *testing.T) {
 	}
 	clientDownlink := uint64(len(part1))
 	_ = st1.Close()
-	// 让服务端感知 stream 断开、清空 activeWriter，保留 targetConn 与 ring。
+	// Let the server notice the stream drop and clear activeWriter, keeping targetConn and the ring.
 	time.Sleep(300 * time.Millisecond)
 
-	// ===== stream2：同 session id，从 clientDownlink 续传 =====
+	// ===== stream2: same session id, resume from clientDownlink =====
 	st2 := dialWTStream(t, dialer, serverURL+"/tunnel", sessionID, targetAddr, clientDownlink, token)
 	defer st2.Close()
 	rest := readDataFrames(t, st2, clientDownlink, (chunkCount-firstRead)*chunk)
@@ -192,7 +201,7 @@ func TestWTResumeReconnect(t *testing.T) {
 		t.Fatalf("stream2 read %d bytes, want %d", len(rest), (chunkCount-firstRead)*chunk)
 	}
 
-	// 拼接验证整体序列连续无重复。
+	// Concatenate and verify the overall sequence is contiguous with no duplicates.
 	full := append(append([]byte{}, part1...), rest...)
 	for i := range full {
 		expect := byte(i%251 + 1)
@@ -200,6 +209,6 @@ func TestWTResumeReconnect(t *testing.T) {
 			t.Fatalf("continuity broken at byte %d: got %d want %d", i, full[i], expect)
 		}
 	}
-	t.Logf("✅ WT 断线续传成功: stream1=%dB, stream2=%dB, total=%dB, 无缺口无重复",
+	t.Logf("✅ WT resume after disconnect succeeded: stream1=%dB, stream2=%dB, total=%dB, no gaps no duplicates",
 		len(part1), len(rest), len(full))
 }

@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"encoding/binary"
@@ -8,49 +8,54 @@ import (
 )
 
 // =========================================
-// resumeFrame v2 编解码
+// resumeFrame v2 codec
 //
-// 会话恢复协议唯一数据面（X-Tunnel-Proto: resume/2）。
-// 帧格式（16B 头）：
+// The sole data plane of the session-recovery protocol (X-Tunnel-Proto: resume/2).
+// Frame layout (16-byte header):
 //
 //   ┌──────┬─────┬──────────┬──────────┬──────────┬─────────┬─────────┐
 //   │ type │ ver │ dataLen  │ padLen   │ seq      │ data    │ padding │
 //   │ 1B   │ 1B  │ uint32BE │ uint16BE │ uint64BE │ dataLen │ padLen  │
 //   └──────┴─────┴──────────┴──────────┴──────────┴─────────┴─────────┘
 //
-//   type：帧类型（见 resumeFrameType 常量）。DATA 为业务数据，
-//         END/ERROR/HANDSHAKE/HANDSHAKE-ACK/KEEPALIVE/KEEPALIVE-ACK
-//         为控制帧。控制帧与 DATA 共用同一条 HTTP 流，写路径由各自
-//         writer 的互斥锁（resumeSessionWriter.mu）串行化；控制帧在 DATA
-//         帧之间穿插写入，既不会被数据面拆裂，也不会被饿死（downlinkPump
-//         每写出一帧即释放锁，控制帧得以在帧间隙插入）。
-//   ver ：协议版本，恒为 0x02。
-//   seq ：DATA 帧内 data 的起始全局字节偏移（按方向累计）；控制帧无意义。
+//   type: frame type (see the resumeFrameType constants). DATA carries business
+//         bytes; END/ERROR/HANDSHAKE/HANDSHAKE-ACK/KEEPALIVE/KEEPALIVE-ACK are
+//         control frames. Control frames share the one HTTP stream with DATA;
+//         the write path is serialized by each writer's mutex
+//         (resumeSessionWriter.mu). Control frames interleave between DATA
+//         frames — never torn apart by the data plane and never starved
+//         (downlinkPump releases the lock after each frame so control frames can
+//         slip into the gaps).
+//   ver : protocol version, always 0x02.
+//   seq : the global byte offset where this DATA frame's data starts (accumulated
+//         per direction); meaningless for control frames.
 // =========================================
 
-// 帧类型
+// Frame types
 const (
-	resumeFrameData         byte = 0x01 // 业务数据帧
-	resumeFrameEnd          byte = 0x02 // 会话结束（半关闭/全关闭）
-	resumeFrameError        byte = 0x03 // 错误通知（携带错误码，见 resumeErrorCode）
-	resumeFrameHandshake    byte = 0x10 // 握手（客户端→服务端，B 层确认）
-	resumeFrameHandshakeAck byte = 0x11 // 握手确认（服务端→客户端）
-	resumeFrameKeepalive    byte = 0x12 // 存活探测（备用线路心跳）
-	resumeFrameKeepaliveAck byte = 0x13 // 存活确认
+	resumeFrameData         byte = 0x01 // business data frame
+	resumeFrameEnd          byte = 0x02 // session end (half/full close)
+	resumeFrameError        byte = 0x03 // error notification (carries a code, see resumeErrorCode)
+	resumeFrameHandshake    byte = 0x10 // handshake (client→server, layer-B confirmation)
+	resumeFrameHandshakeAck byte = 0x11 // handshake confirmation (server→client)
+	resumeFrameKeepalive    byte = 0x12 // liveness probe (backup-lane heartbeat)
+	resumeFrameKeepaliveAck byte = 0x13 // liveness confirmation
 )
 
-// 帧逻辑优先级（设计意图，非运行时强制）：ERROR/END 最高，握手/心跳次之，
-// DATA 最低。运行时由 writer 互斥锁串行化保证「控制帧不拆裂、不饿死」，
-// 不依赖独立的优先级调度器。
+// Frame logical priority (design intent, not enforced at runtime): ERROR/END
+// highest, handshake/heartbeat next, DATA lowest. At runtime the writer mutex
+// serialization guarantees "control frames are neither torn apart nor starved";
+// there is no separate priority scheduler.
 
-// 协议版本
+// Protocol version
 const (
 	resumeProtoVersion    byte = 0x02
 	resumeFrameTypeResume      = "resume/2"
 	resumeHeaderLen            = 1 + 1 + 4 + 2 + 8 // type+ver+dataLen+padLen+seq = 16
 )
 
-// 错误码（ERROR 控制帧 payload 首字节；同时映射到 HTTP X-Resume-Error 码名）
+// Error codes (first byte of the ERROR control-frame payload; also mapped to the
+// HTTP X-Resume-Error code name).
 type resumeErrorCode byte
 
 const (
@@ -84,8 +89,8 @@ const (
 	resumeMaxDataLen uint32 = 16 * 1024 * 1024
 )
 
-var ErrResumeEndFrame = errors.New("resume: END frame received")
-var ErrResumeBadSeq = errors.New("resume: out-of-order seq")
+var errResumeEndFrame = errors.New("resume: END frame received")
+var errResumeBadSeq = errors.New("resume: out-of-order seq")
 
 func isResumeFrameType(typ byte) bool {
 	switch typ {
@@ -123,32 +128,37 @@ func writeAll(w io.Writer, p []byte) error {
 // fillPadding repeats the pre-generated random block. padLen is allowed to be
 // the full uint16 range while paddingGarbage deliberately stays small.
 func fillPadding(dst []byte) {
+	start := fastRand(len(paddingGarbage))
 	for len(dst) > 0 {
-		n := len(dst)
-		if n > len(paddingGarbage) {
-			n = len(paddingGarbage)
+		n := len(paddingGarbage) - start
+		if n > len(dst) {
+			n = len(dst)
 		}
-		copy(dst[:n], paddingGarbage[:n])
+		copy(dst[:n], paddingGarbage[start:start+n])
 		dst = dst[n:]
+		start = 0
 	}
 }
 
 func writePadding(w io.Writer, padLen int) error {
+	start := fastRand(len(paddingGarbage))
 	for padLen > 0 {
-		n := padLen
-		if n > len(paddingGarbage) {
-			n = len(paddingGarbage)
+		n := len(paddingGarbage) - start
+		if n > padLen {
+			n = padLen
 		}
-		if err := writeAll(w, paddingGarbage[:n]); err != nil {
+		if err := writeAll(w, paddingGarbage[start:start+n]); err != nil {
 			return err
 		}
 		padLen -= n
+		start = 0
 	}
 	return nil
 }
 
-// writeFrame 组装一帧并写入 w。
-// type 为帧类型；seq 仅 DATA 帧有意义；padLen 决定尾部填充（保持混淆特征）。
+// writeFrame assembles one frame and writes it to w. typ is the frame type; seq
+// is meaningful only for DATA frames; padLen sets the trailing padding (keeping
+// the obfuscation property).
 func writeFrame(w io.Writer, typ byte, seq uint64, data []byte, padLen int) error {
 	if !isResumeFrameType(typ) {
 		return fmt.Errorf("resume frame type unsupported: 0x%02x", typ)
@@ -159,8 +169,8 @@ func writeFrame(w io.Writer, typ byte, seq uint64, data []byte, padLen int) erro
 	if padLen < 0 || padLen > 0xFFFF {
 		return fmt.Errorf("resume frame pad too large: %d", padLen)
 	}
-	if typ == resumeFrameEnd && (len(data) != 0 || padLen != 0) {
-		return errors.New("resume END frame must not carry data or padding")
+	if typ == resumeFrameEnd && len(data) != 0 {
+		return errors.New("resume END frame must not carry data")
 	}
 	dataLen := uint32(len(data))
 
@@ -170,7 +180,7 @@ func writeFrame(w io.Writer, typ byte, seq uint64, data []byte, padLen int) erro
 
 	totalData := resumeHeaderLen + int(dataLen) + padLen
 	if totalData <= len(buf) {
-		// 路径 A：整帧入池缓冲一次性写入
+		// Path A: whole frame into the pooled buffer, one write
 		buf[0] = typ
 		buf[1] = resumeProtoVersion
 		binary.BigEndian.PutUint32(buf[2:6], dataLen)
@@ -183,7 +193,7 @@ func writeFrame(w io.Writer, typ byte, seq uint64, data []byte, padLen int) erro
 		return writeAll(w, buf[:totalData])
 	}
 
-	// 路径 B：超大帧，分三次写（头/数据/填充）
+	// Path B: oversized frame, written in three parts (header/data/padding)
 	buf[0] = typ
 	buf[1] = resumeProtoVersion
 	binary.BigEndian.PutUint32(buf[2:6], dataLen)
@@ -203,26 +213,62 @@ func writeFrame(w io.Writer, typ byte, seq uint64, data []byte, padLen int) erro
 	return nil
 }
 
-// writeResumeFrame 写一个 DATA 帧（业务数据）。
+// writeResumeFrame writes a DATA frame (business data).
 func writeResumeFrame(w io.Writer, seq uint64, data []byte, padLen int) error {
 	return writeFrame(w, resumeFrameData, seq, data, padLen)
 }
 
-// writeResumeEndFrame 写入会话结束控制帧（END）。
-func writeResumeEndFrame(w io.Writer) error {
-	return writeFrame(w, resumeFrameEnd, 0, nil, 0)
+// writeResumeDataFrames writes p as one frame when shaping is disabled. When
+// enabled it splits p inside the codec, so live traffic and replay traffic use
+// the same record-size invariant. The returned byte count follows io.Writer
+// partial-write semantics and counts payload bytes, never padding bytes.
+func writeResumeDataFrames(w io.Writer, seq uint64, p []byte, policy paddingPolicy) (int, error) {
+	if !policy.enabled() {
+		if err := writeResumeFrame(w, seq, p, 0); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+	written := 0
+	for len(p) > 0 {
+		chunkLen, padLen := policy.dataChunk(len(p), resumeHeaderLen)
+		if err := writeResumeFrame(w, seq, p[:chunkLen], padLen); err != nil {
+			return written, err
+		}
+		written += chunkLen
+		seq += uint64(chunkLen)
+		p = p[chunkLen:]
+	}
+	return written, nil
 }
 
-// writeResumeErrorFrame 写入错误控制帧（ERROR）。
-func writeResumeErrorFrame(w io.Writer, code resumeErrorCode) error {
-	return writeFrame(w, resumeFrameError, 0, []byte{byte(code)}, 0)
+// writeResumeEndFrame writes the session-end control frame (END).
+func writeResumeEndFrame(w io.Writer, policy paddingPolicy) error {
+	return writeFrame(w, resumeFrameEnd, 0, nil, policy.paddingFor(resumeHeaderLen))
 }
 
-// readFrame 读一帧，返回帧类型、seq、data 拷贝（写入 payloadBuf）。
-// 填充已在函数内丢弃。返回 ErrResumeEndFrame 表示 END 控制帧。
+// writeResumeErrorFrame writes the error control frame (ERROR).
+func writeResumeErrorFrame(w io.Writer, code resumeErrorCode, policy paddingPolicy) error {
+	data := []byte{byte(code)}
+	return writeFrame(w, resumeFrameError, 0, data, policy.paddingFor(resumeHeaderLen+len(data)))
+}
+
+// readFrame reads one frame, returning its type, seq and data copy (into
+// payloadBuf). Padding is already discarded inside. errResumeEndFrame signals an
+// END control frame.
 func readFrame(r io.Reader, payloadBuf []byte) (typ byte, seq uint64, n int, err error) {
-	var hdr [resumeHeaderLen]byte
-	if _, err = io.ReadFull(r, hdr[:]); err != nil {
+	// Read the header into the front of payloadBuf first (data overwrites it
+	// next): a local stack buffer passed via the io.Reader interface escapes to
+	// the heap, costing one extra allocation per frame on the DATA hot path. If
+	// payloadBuf is too small (rare: callers that only read control frames) fall
+	// back to a heap allocation, keeping the old contract no tighter.
+	var hdr []byte
+	if len(payloadBuf) >= resumeHeaderLen {
+		hdr = payloadBuf[:resumeHeaderLen]
+	} else {
+		hdr = make([]byte, resumeHeaderLen)
+	}
+	if _, err = io.ReadFull(r, hdr); err != nil {
 		return 0, 0, 0, err
 	}
 	typ = hdr[0]
@@ -238,10 +284,15 @@ func readFrame(r io.Reader, payloadBuf []byte) (typ byte, seq uint64, n int, err
 		return 0, 0, 0, fmt.Errorf("resume frame type unsupported: 0x%02x", typ)
 	}
 	if typ == resumeFrameEnd {
-		if dataLen != 0 || padLen != 0 {
-			return 0, 0, 0, errors.New("resume END frame must not carry data or padding")
+		if dataLen != 0 {
+			return 0, 0, 0, errors.New("resume END frame must not carry data")
 		}
-		return typ, seq, 0, ErrResumeEndFrame
+		if padLen > 0 {
+			if _, err = io.CopyN(io.Discard, r, int64(padLen)); err != nil {
+				return 0, 0, 0, err
+			}
+		}
+		return typ, seq, 0, errResumeEndFrame
 	}
 	if dataLen > resumeMaxDataLen {
 		return 0, 0, 0, fmt.Errorf("resume frame data too large: %d", dataLen)
@@ -260,7 +311,7 @@ func readFrame(r io.Reader, payloadBuf []byte) (typ byte, seq uint64, n int, err
 	return typ, seq, int(dataLen), nil
 }
 
-// readResumeFrame 读一个 DATA 帧；非 DATA 帧返回错误。
+// readResumeFrame reads one DATA frame; a non-DATA frame returns an error.
 func readResumeFrame(r io.Reader, payloadBuf []byte) (seq uint64, n int, err error) {
 	typ, seq, n, err := readFrame(r, payloadBuf)
 	if err != nil {
@@ -272,8 +323,9 @@ func readResumeFrame(r io.Reader, payloadBuf []byte) (seq uint64, n int, err err
 	return seq, n, nil
 }
 
-// resumeClientRingBuf 上行客户端缓冲（写入上行帧失败时回退到此 buf，
-// 恢复时按服务端 ack 的 seq 续发）
+// resumeClientRingBuf is the client-side uplink buffer (bytes are fallen back
+// here when writing an uplink frame fails; on recovery they are re-sent from the
+// seq the server acked).
 type resumeClientRingBuf struct {
 	rb *ringBuffer
 }
@@ -282,14 +334,16 @@ func newResumeClientRingBuf(sizeKB int) *resumeClientRingBuf {
 	return &resumeClientRingBuf{rb: newRingBuffer(sizeKB)}
 }
 
-// Append 写入一段上行数据（seq 由调用方外部递增）
+// Append writes a run of uplink data (seq is advanced by the caller externally).
 func (b *resumeClientRingBuf) Append(data []byte) { b.rb.Append(data) }
 
-// WindowEnd 返回当前写入位置 seq（ringBuf.WindowStart + 已写入字节数）
+// WindowEnd returns the current write position seq (ringBuf.WindowStart + bytes
+// written).
 func (b *resumeClientRingBuf) WindowEnd() uint64 { return b.rb.WindowEnd() }
 
-// ReplayFrom 从给定 seq 起读出所有数据，写入 w。
-// 返回写入总字节数与遇到的错误（ErrGap 表示缺口不可恢复）。
+// ReplayFrom reads all data from the given seq and writes it to w. Returns the
+// total bytes written and any error encountered (errGap means the gap is
+// unrecoverable).
 func (b *resumeClientRingBuf) ReplayFrom(seq uint64, w io.Writer) (int64, error) {
 	tmp := make([]byte, 8192)
 	var total int64
@@ -302,8 +356,8 @@ func (b *resumeClientRingBuf) ReplayFrom(seq uint64, w io.Writer) (int64, error)
 			seq += uint64(n)
 			total += int64(n)
 		}
-		if errors.Is(err, ErrGap) {
-			return total, ErrGap
+		if errors.Is(err, errGap) {
+			return total, errGap
 		}
 		if err != nil || n == 0 {
 			return total, nil

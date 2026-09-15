@@ -12,7 +12,10 @@
   "insecure": false,
   "heartbeat_sec": 25,
   "session_window_kb": 256,
-  "primary_count": 1,
-  "backup_count": 1,
+  "standby_connections": 1,
+  "padding": {
+    "min_record_bytes": 600,
+    "max_record_bytes": 1200
+  },
   "log_level": "info"
 }

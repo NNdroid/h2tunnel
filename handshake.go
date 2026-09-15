@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"strconv"
@@ -6,25 +6,25 @@ import (
 )
 
 // =========================================
-// handshake.go — 握手协商（版本 / 能力 / 参数）
+// handshake.go — negotiation (version / capabilities / parameters)
 //
-// 协商逻辑是纯函数（无 I/O），便于单元测试。
-// 载体：HTTP 头（X-Resume-Version / X-Resume-Caps / X-Resume-Params），
-//       版本是硬约束（v2 唯一），能力/参数是软约束（见 §2.6）。
+// The negotiation logic is pure (no I/O) for easy unit testing. Carrier: HTTP
+// headers (X-Resume-Version / X-Resume-Caps / X-Resume-Params). Version is a
+// hard constraint (v2 is the only one); capabilities/parameters are soft (see §2.6).
 // =========================================
 
-// 默认参数与常量
+// Default parameters and constants
 const (
-	// 客户端发送的能力列表（可配置子集）
-	capDatagram   = "datagram"    // UDP 数据报模式
-	capCompress   = "compress"    // 压缩
-	capBackupLine = "backup-line" // 备用线路
-	capReplay     = "replay"      // 最小基准能力集（字节流 + seq 重放）
+	// Client capability list (a configurable subset)
+	capDatagram   = "datagram"    // UDP datagram mode
+	capCompress   = "compress"    // compression
+	capBackupLine = "backup-line" // backup lane
+	capReplay     = "replay"      // minimal baseline capability set (byte stream + seq replay)
 
-	// 参数键
+	// Parameter keys
 	paramWindowKB       = "window_kb"
-	paramHandshakeAckMs = "handshake_ack_timeout" // 毫秒
-	paramKeepaliveSec   = "keepalive_interval"    // 秒
+	paramHandshakeAckMs = "handshake_ack_timeout" // milliseconds
+	paramKeepaliveSec   = "keepalive_interval"    // seconds
 
 	defaultWindowKB       = 256
 	defaultHandshakeAckMs = 3000
@@ -34,14 +34,15 @@ const (
 	maxKeepaliveSec       = 3600
 )
 
-// resumeCaps 能力集合（交集计算用）。
+// resumeCaps is the capability set (for intersection computation).
 type resumeCaps struct {
 	datagram   bool
 	compress   bool
 	backupLine bool
 }
 
-// parseCaps 解析逗号分隔的能力列表。未知项忽略（向前兼容）。
+// parseCaps parses a comma-separated capability list. Unknown items are ignored
+// (forward compatible).
 func parseCaps(s string) resumeCaps {
 	var c resumeCaps
 	for _, name := range strings.Split(s, ",") {
@@ -57,8 +58,9 @@ func parseCaps(s string) resumeCaps {
 	return c
 }
 
-// intersectCaps 返回客户端能力与服务端能力集合的交集（客户端请求 ∩ 服务端支持）。
-// 若交集为空且双方都不支持最小基准集，返回空。
+// intersectCaps returns the intersection of the client's and server's capability
+// sets (client request ∩ server support). If the intersection is empty and
+// neither side supports the minimal baseline set, returns empty.
 func intersectCaps(client, server resumeCaps) resumeCaps {
 	return resumeCaps{
 		datagram:   client.datagram && server.datagram,
@@ -67,16 +69,18 @@ func intersectCaps(client, server resumeCaps) resumeCaps {
 	}
 }
 
-// empty 判断能力交集是否为空（连最小基准集都没有）。
-// 注意：replay 是隐式基准，任何 resume 会话都有字节流能力，故交集永不为绝对空；
-// 这里仅当连 replay 都不成立（理论不可能）才为 true。
+// empty reports whether the capability intersection is empty (not even the
+// minimal baseline set). Note: replay is an implicit baseline — every resume
+// session has byte-stream capability, so the intersection is never absolutely
+// empty; this is true only if even replay fails (theoretically impossible).
 func (c resumeCaps) empty() bool {
-	// replay 隐式存在，恒不空
+	// replay is implicit, never empty
 	return false
 }
 
-// String 序列化能力列表为逗号分隔（仅列启用的项）。
-// 无增强能力时返回最小基准能力集 "replay"（字节流 + seq 重放，任何会话都有）。
+// String serializes the capability list comma-separated (only enabled items).
+// With no enhanced capability it returns the minimal baseline set "replay"
+// (byte stream + seq replay, present on every session).
 func (c resumeCaps) String() string {
 	var parts []string
 	if c.datagram {
@@ -94,7 +98,8 @@ func (c resumeCaps) String() string {
 	return strings.Join(parts, ",")
 }
 
-// resumeParams 协商后的参数（int 毫秒/字节/秒等，量纲由键名语义约定）。
+// resumeParams are the negotiated parameters (int ms/bytes/seconds etc.; units
+// are conventionally implied by the key name).
 type resumeParams struct {
 	windowKB       int
 	handshakeAckMs int
@@ -109,7 +114,8 @@ func defaultParams() resumeParams {
 	}
 }
 
-// parseParams 解析 `;` 分隔的 k=v 参数。未知键忽略；非法值回退默认。
+// parseParams parses a `;`-separated k=v parameter list. Unknown keys are
+// ignored; invalid values fall back to defaults.
 func parseParams(s string) resumeParams {
 	p := defaultParams()
 	if s == "" {
@@ -127,7 +133,7 @@ func parseParams(s string) resumeParams {
 		key := strings.TrimSpace(kv[:eq])
 		val, err := strconv.Atoi(strings.TrimSpace(kv[eq+1:]))
 		if err != nil {
-			continue // 非法值 → 保留默认
+			continue // invalid value → keep the default
 		}
 		switch key {
 		case paramWindowKB:
@@ -141,7 +147,8 @@ func parseParams(s string) resumeParams {
 	return p
 }
 
-// alignParams 服务端对齐参数：越界 clamp 到合法区间；返回最终生效值（以服务端为准）。
+// alignParams aligns parameters on the server: out-of-range values are clamped
+// into the valid range; returns the final effective value (server wins).
 func alignParams(p resumeParams) resumeParams {
 	if p.windowKB <= 0 || p.windowKB > maxWindowKB {
 		p.windowKB = defaultWindowKB
@@ -155,7 +162,7 @@ func alignParams(p resumeParams) resumeParams {
 	return p
 }
 
-// String 序列化参数为 `;` 分隔的 k=v。
+// String serializes the parameters as a `;`-separated k=v string.
 func (p resumeParams) String() string {
 	var sb strings.Builder
 	sb.WriteString(paramWindowKB)
@@ -172,9 +179,10 @@ func (p resumeParams) String() string {
 	return sb.String()
 }
 
-// negotiateVersion 版本协商。v2 是唯一版本：
-// min(双端) == 2 → 协商成功返回 2；否则返回 0（无交集，version-unsupported）。
-// 服务端只需声明自己的最高支持版本；客户端声明最高支持版本。
+// negotiateVersion performs version negotiation. v2 is the only version:
+// min(both) == 2 ⇒ negotiation succeeds and returns 2; otherwise returns 0 (no
+// intersection, version-unsupported). The server only declares its max supported
+// version; the client declares its max supported version.
 func negotiateVersion(clientMax, serverMax int) int {
 	v := clientMax
 	if serverMax < v {
@@ -186,16 +194,17 @@ func negotiateVersion(clientMax, serverMax int) int {
 	return 2
 }
 
-// clientCapabilities 客户端声明的能力集（由 cfg 派生）。
-func clientCapabilities(cfg ClientConfig) resumeCaps {
+// clientCapabilities is the capability set the client declares (derived from cfg).
+func clientCapabilities(cfg clientConfig) resumeCaps {
 	return resumeCaps{
 		datagram:   cfg.IsUDP(),
 		backupLine: true,
 	}
 }
 
-// clientParams 客户端请求的握手参数（由 cfg 派生，未配置用默认）。
-func clientParams(cfg ClientConfig) resumeParams {
+// clientParams are the handshake parameters the client requests (derived from
+// cfg; unconfigured fields use defaults).
+func clientParams(cfg clientConfig) resumeParams {
 	return resumeParams{
 		windowKB:       resolveSessionWindow(cfg.SessionWindow),
 		handshakeAckMs: resolveHandshakeAckMs(cfg.HandshakeAckMs),

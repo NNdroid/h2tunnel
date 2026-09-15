@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"errors"
@@ -6,31 +6,32 @@ import (
 )
 
 // =========================================
-// ringBuffer — 固定容量字节环形缓冲
+// ringBuffer — fixed-capacity circular byte buffer
 //
-// 用作会话恢复层的「最近 N 字节」缓存。
+// Backs the session-recovery layer's "last N bytes" cache.
 //
-// 关键特性：
-//   - 全局 64-bit seq 坐标系，窗口 [windowStartSeq, windowStartSeq+length)
-//   - 写满时按环形覆盖最旧（覆盖即窗口滚动 + windowStartSeq++）
-//   - 读端按 seq 取，若 seq < windowStartSeq 则返回 ErrGap（缺口已不可恢复）
-//   - 支持并发写、并发读；Append 不阻塞（环形覆盖语义下总有空间）
+// Key properties:
+//   - Global 64-bit seq coordinate space; window is [windowStartSeq, windowStartSeq+length)
+//   - When full, writes overwrite the oldest bytes ring-wise (overwrite rolls the window forward: windowStartSeq++)
+//   - Reads are by seq; seq < windowStartSeq returns errGap (the gap is unrecoverable)
+//   - Concurrent writes and reads; Append never blocks (ring overwrite always has room)
 //
-// 设计动机：SSH 这种长连接流式协议，断线时不能丢会话。
-// 双端各保留最近 N KB（默认 256KB），断线后按 seq 重放补缺。
-// 覆盖最旧的代价是丢失最老窗口——客户端断线久了再来恢复，
-// 会话表能告诉它"早于 X 的数据我丢了"，客户端可选择放弃恢复。
+// Motivation: long-lived streaming protocols like SSH must not drop the session on
+// disconnect. Each side keeps its last N KB (default 256KB) and replays the gap by
+// seq after a reconnect. Overwriting the oldest means losing the oldest window —
+// after a long outage, the session table tells the client "data before X is gone"
+// and the client can choose to abandon recovery.
 // =========================================
 
-var ErrGap = errors.New("ringBuffer: requested seq is before current window start (gap unrecoverable)")
+var errGap = errors.New("ringBuffer: requested seq is before current window start (gap unrecoverable)")
 
 type ringBuffer struct {
 	mu             sync.Mutex
 	buf            []byte
 	size           int
-	head           int    // buf 中窗口起始的物理位置
-	length         int    // 当前有效字节数
-	windowStartSeq uint64 // buf[head] 对应的全局 seq
+	head           int    // physical offset of the window start in buf
+	length         int    // current number of valid bytes
+	windowStartSeq uint64 // global seq corresponding to buf[head]
 	notify         *sync.Cond
 }
 
@@ -44,9 +45,10 @@ func newRingBuffer(sizeKB int) *ringBuffer {
 	return rb
 }
 
-// Append 写入一段字节。缓冲满时按环形覆盖最旧，窗口随覆盖向前滚动。
-// 简化实现：单次写入不跨越 head/tail 边界（先一次性尽力写入，
-// 若 len(p) > free 则一次性覆盖并滚动窗口）。
+// Append writes a run of bytes. When full it overwrites the oldest ring-wise and
+// rolls the window forward. Simplified implementation: a single write never spans
+// the head/tail boundary (write what fits best in one pass; if len(p) > free,
+// overwrite in one shot and roll the window).
 func (rb *ringBuffer) Append(p []byte) {
 	if len(p) == 0 {
 		return
@@ -57,9 +59,9 @@ func (rb *ringBuffer) Append(p []byte) {
 		tail := (rb.head + rb.length) % rb.size
 		free := rb.size - rb.length
 		if free == 0 {
-			// 缓冲已满时按整段覆盖，而非一次腾一个字节。恢复窗口经常
-			// 在高吞吐下保持满载；逐字节滚动会让每个 32KB 数据块多出
-			// 32K 次循环和索引计算。
+			// When full, overwrite whole segments instead of evicting one byte at a
+			// time. The recovery window is often saturated under high throughput;
+			// byte-wise rolling would add 32K loop+index ops per 32KB block.
 			if len(p) >= rb.size {
 				overwriteLen := len(p)
 				p = p[len(p)-rb.size:]
@@ -99,15 +101,16 @@ func (rb *ringBuffer) Append(p []byte) {
 	rb.notify.Broadcast()
 }
 
-// ReadAt 从全局 seq 处开始读取最多 len(p) 字节。返回实际读取字节数。
-// 若 seq < windowStartSeq 则窗口外（已被覆盖），返回 ErrGap。
+// ReadAt reads up to len(p) bytes starting at the global seq, returning the count
+// actually read. If seq < windowStartSeq the data is out of window (overwritten)
+// and errGap is returned.
 func (rb *ringBuffer) ReadAt(seq uint64, p []byte) (int, error) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
 	windowEnd := rb.windowStartSeq + uint64(rb.length)
 	if seq < rb.windowStartSeq {
-		return 0, ErrGap
+		return 0, errGap
 	}
 	if seq >= windowEnd {
 		return 0, nil
@@ -129,14 +132,14 @@ func (rb *ringBuffer) ReadAt(seq uint64, p []byte) (int, error) {
 	return n, nil
 }
 
-// WindowEnd 返回当前窗口末尾 seq（不含）
+// WindowEnd returns the seq one past the current window end.
 func (rb *ringBuffer) WindowEnd() uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	return rb.windowStartSeq + uint64(rb.length)
 }
 
-// WaitNewData 阻塞直到窗口末尾超过 seq（用于消费者等待新数据）
+// WaitNewData blocks until the window end passes seq (consumers waiting for new data).
 func (rb *ringBuffer) WaitNewData(seq uint64) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -145,7 +148,7 @@ func (rb *ringBuffer) WaitNewData(seq uint64) {
 	}
 }
 
-// WindowStartSeq 返回当前窗口起点 seq
+// WindowStartSeq returns the current window-start seq.
 func (rb *ringBuffer) WindowStartSeq() uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()

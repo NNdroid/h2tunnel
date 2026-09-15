@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"net"
@@ -9,8 +9,9 @@ import (
 )
 
 // ============================================================================
-// 1. 本地双栈转发测试 (Dual-Stack TCP + UDP 同端口并发代理)
-// 验证 network="all" 时，客户端在同个端口上同时接受并代理 TCP 和 UDP 流量
+// 1. Local dual-stack forwarding test (Dual-Stack TCP + UDP concurrent proxy on one port)
+// Verifies that with network="all" the client accepts and proxies TCP and UDP
+// traffic simultaneously on the same port
 // ============================================================================
 func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 	certFile := "test_cert_dualstack.pem"
@@ -26,8 +27,8 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "dualstack-token"
 
-	// 启动服务端（默认允许所有网络与传输类型）
-	go startServerDirect(ServerConfig{
+	// start the server (allows all network and transport types by default)
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
@@ -35,72 +36,72 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 		Path:          "/tunnel",
 		Transport:     "all",
 		Network:       "all",
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	clientListen := "127.0.0.1:23001"
-	// 启动客户端，明确配置 network="all"
-	go startClientDirect(ClientConfig{
+	// start the client with network="all" explicitly configured
+	go startClientDirect(clientConfig{
 		ListenAddr: clientListen,
 		ServerUrl:  serverURL,
 		Path:       "/tunnel",
 		TargetAddr: targetAddr,
 		Insecure:   true,
-		Network:    "all", // 🌟 核心：双栈模式
+		Network:    "all", // 🌟 core: dual-stack mode
 		Token:      testToken,
 		LogLevel:   "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
-	// A. 测试 TCP 通道
+	// A. Test the TCP channel
 	t.Run("TCP_Channel_Over_DualStack", func(t *testing.T) {
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接客户端 TCP 端口失败: %v", err)
+			t.Fatalf("failed to connect to the client TCP port: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(3 * time.Second))
 
 		msg := []byte("DualStack-TCP-Hello")
 		if _, err := conn.Write(msg); err != nil {
-			t.Fatalf("发送 TCP 数据失败: %v", err)
+			t.Fatalf("failed to send TCP data: %v", err)
 		}
 
 		buf := make([]byte, 100)
 		n, err := conn.Read(buf)
 		if err != nil || string(buf[:n]) != string(msg) {
-			t.Fatalf("TCP 回显校验失败! 收到: %q, err=%v", string(buf[:n]), err)
+			t.Fatalf("TCP echo verification failed! received: %q, err=%v", string(buf[:n]), err)
 		}
-		t.Log("✅ 双栈模式下的 TCP 通道通信成功！")
+		t.Log("✅ TCP channel communication succeeded in dual-stack mode!")
 	})
 
-	// B. 测试同一个端口的 UDP 通道
+	// B. Test the UDP channel on the same port
 	t.Run("UDP_Channel_Over_DualStack", func(t *testing.T) {
 		conn, err := net.Dial("udp", clientListen)
 		if err != nil {
-			t.Fatalf("连接客户端 UDP 端口失败: %v", err)
+			t.Fatalf("failed to connect to the client UDP port: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(3 * time.Second))
 
 		msg := []byte("DualStack-UDP-Hello")
 		if _, err := conn.Write(msg); err != nil {
-			t.Fatalf("发送 UDP 数据失败: %v", err)
+			t.Fatalf("failed to send UDP data: %v", err)
 		}
 
 		buf := make([]byte, 100)
 		n, err := conn.Read(buf)
 		if err != nil || string(buf[:n]) != string(msg) {
-			t.Fatalf("UDP 回显校验失败! 收到: %q, err=%v", string(buf[:n]), err)
+			t.Fatalf("UDP echo verification failed! received: %q, err=%v", string(buf[:n]), err)
 		}
-		t.Log("✅ 双栈模式下的 UDP 通道通信成功！")
+		t.Log("✅ UDP channel communication succeeded in dual-stack mode!")
 	})
 }
 
 // ============================================================================
-// 2. 严格网络类型门禁测试 (network="udp" 时严格阻断 TCP)
+// 2. Strict network-type gating test (network="udp" strictly blocks TCP)
 // ============================================================================
 func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 	certFile := "test_cert_udponly.pem"
@@ -116,38 +117,38 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "udponly-token"
 
-	// 服务端严格配置仅允许 UDP 代理
-	go startServerDirect(ServerConfig{
+	// server strictly configured to allow UDP proxying only
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     "all",
-		Network:       "udp", // 🌟 仅允许 UDP
-		ExpectedToken: testToken,
+		Network:       "udp", // 🌟 UDP only
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
-	// A. 尝试通过客户端发起 TCP 连接 -> 服务端必须拦截（返回 403）
+	// A. Try a TCP connection through the client -> the server must intercept it (403)
 	t.Run("Reject_TCP_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:24001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			Network:    "tcp", // 客户端请求 TCP
+			Network:    "tcp", // client requests TCP
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -156,29 +157,29 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 		buf := make([]byte, 100)
 		_, err = conn.Read(buf)
 		if err == nil {
-			t.Fatalf("服务端 network=udp 策略本应拦截 TCP 请求，但请求居然成功了: %s", string(buf))
+			t.Fatalf("server network=udp policy should have blocked the TCP request, but it unexpectedly succeeded: %s", string(buf))
 		}
-		t.Log("✅ TCP 请求被服务端 network=udp 策略成功拦截！")
+		t.Log("✅ TCP request successfully intercepted by the server's network=udp policy!")
 	})
 
-	// B. 尝试通过客户端发起 UDP 连接 -> 必须正常通行
+	// B. Try a UDP connection through the client -> must pass through normally
 	t.Run("Accept_UDP_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:24002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			Network:    "udp", // 客户端请求 UDP
+			Network:    "udp", // client requests UDP
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitUDPReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("udp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -188,14 +189,14 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 		buf := make([]byte, 100)
 		n, err := conn.Read(buf)
 		if err != nil || string(buf[:n]) != string(msg) {
-			t.Fatalf("UDP 请求通信失败: %v, got %q", err, string(buf[:n]))
+			t.Fatalf("UDP request communication failed: %v, got %q", err, string(buf[:n]))
 		}
-		t.Log("✅ 合规的 UDP 请求顺利通行！")
+		t.Log("✅ compliant UDP request passed through smoothly!")
 	})
 }
 
 // ============================================================================
-// 3. 严格传输协议门禁测试 (transport="h2" 严格拦截 WebTransport 与 MASQUE)
+// 3. Strict transport protocol gating test (transport="h2" strictly blocks WebTransport and MASQUE)
 // ============================================================================
 func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 	certFile := "test_cert_h2only.pem"
@@ -211,38 +212,38 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "h2only-token"
 
-	// 启动严格限定为 h2 的服务端
-	go startServerDirect(ServerConfig{
+	// start the server strictly limited to h2
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
-		Transport:     "h2", // 🌟 严格只允许 H2 POST
+		Transport:     "h2", // 🌟 strictly H2 POST only
 		Network:       "tcp",
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
-	// A. 客户端尝试用 gRPC 协议连接 -> 服务端应拦截
+	// A. Client tries to connect with the gRPC protocol -> the server should intercept
 	t.Run("Reject_gRPC_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:25001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			Transport:  transportGRPC, // 违规协议
+			Transport:  transportGRPC, // non-compliant protocol
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -251,29 +252,29 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 		buf := make([]byte, 100)
 		_, err = conn.Read(buf)
 		if err == nil {
-			t.Fatalf("预期 gRPC 请求应被服务端拒绝，但成功收到回显")
+			t.Fatalf("gRPC request expected to be rejected by the server, but an echo was received successfully")
 		}
-		t.Log("✅ gRPC 请求被服务端 transport=h2 门禁拦截！")
+		t.Log("✅ gRPC request intercepted by the server's transport=h2 gating!")
 	})
 
-	// B. 客户端尝试用 MASQUE 协议连接 -> 服务端应拦截
+	// B. Client tries to connect with the MASQUE protocol -> the server should intercept
 	t.Run("Reject_MASQUE_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:25002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			Transport:  transportMasque, // 违规协议
+			Transport:  transportMasque, // non-compliant protocol
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -282,15 +283,15 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 		buf := make([]byte, 100)
 		_, err = conn.Read(buf)
 		if err == nil {
-			t.Fatalf("预期 MASQUE 请求应被服务端拒绝，但成功收到回显")
+			t.Fatalf("MASQUE request expected to be rejected by the server, but an echo was received successfully")
 		}
-		t.Log("✅ MASQUE 请求被服务端 transport=h2 门禁拦截！")
+		t.Log("✅ MASQUE request intercepted by the server's transport=h2 gating!")
 	})
 
-	// C. 客户端使用标准 H2 POST 连接 -> 必须成功
+	// C. Client connects with standard H2 POST -> must succeed
 	t.Run("Accept_H2_Traffic", func(t *testing.T) {
 		clientListen := "127.0.0.1:25003"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -299,11 +300,11 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -313,15 +314,16 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 		buf := make([]byte, 100)
 		n, err := conn.Read(buf)
 		if err != nil || string(buf[:n]) != string(msg) {
-			t.Fatalf("H2 标准请求失败: %v, got %q", err, string(buf[:n]))
+			t.Fatalf("standard H2 request failed: %v, got %q", err, string(buf[:n]))
 		}
-		t.Log("✅ 标准 H2 POST 请求成功通行！")
+		t.Log("✅ standard H2 POST request passed through successfully!")
 	})
 }
 
 // ============================================================================
-// 4. LocalOnly 本地安全转发保护测试
-// local_only=true 时，严禁转发到外部公网 IP，防止开放代理被滥用
+// 4. LocalOnly local safe-forwarding protection test
+// With local_only=true, forwarding to external public IPs is strictly forbidden,
+// preventing open-proxy abuse
 // ============================================================================
 func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 	certFile := "test_cert_localonly.pem"
@@ -337,24 +339,24 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "localonly-token"
 
-	// 开启 LocalOnly 保护模式
-	go startServerDirect(ServerConfig{
+	// enable LocalOnly protection mode
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     "all",
-		LocalOnly:     true, // 🌟 仅允许 localhost / 127.0.0.1 / ::1
-		ExpectedToken: testToken,
+		LocalOnly:     true, // 🌟 localhost / 127.0.0.1 / ::1 only
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
-	// A. 请求合法本地目标 -> 允许通行
+	// A. Request a legitimate local target -> allowed through
 	t.Run("Allow_Local_Target", func(t *testing.T) {
 		clientListen := "127.0.0.1:26001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
@@ -363,11 +365,11 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -377,28 +379,28 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 		buf := make([]byte, 100)
 		n, err := conn.Read(buf)
 		if err != nil || string(buf[:n]) != string(msg) {
-			t.Fatalf("本地请求失败: %v, got %q", err, string(buf[:n]))
+			t.Fatalf("local request failed: %v, got %q", err, string(buf[:n]))
 		}
-		t.Log("✅ 本地目标 (127.0.0.1) 顺利通行！")
+		t.Log("✅ local target (127.0.0.1) passed through smoothly!")
 	})
 
-	// B. 尝试请求外部公网目标 -> 服务端必须拦截（返回 403 Forbidden）
+	// B. Try requesting an external public target -> the server must intercept it (403 Forbidden)
 	t.Run("Block_External_Public_Target", func(t *testing.T) {
 		clientListen := "127.0.0.1:26002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
-			TargetAddr: "8.8.8.8:53", // 企图利用服务端转发至外部公网
+			TargetAddr: "8.8.8.8:53", // attempt to abuse the server for forwarding to an external public IP
 			Insecure:   true,
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -407,20 +409,20 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 		buf := make([]byte, 100)
 		_, err = conn.Read(buf)
 		if err == nil {
-			t.Fatalf("LocalOnly 策略本应拦截公网目标，但连接未被拒绝")
+			t.Fatalf("LocalOnly policy should have blocked the public target, but the connection was not refused")
 		}
-		t.Log("✅ 外部公网目标被 LocalOnly 安全策略成功拦截！")
+		t.Log("✅ external public target successfully intercepted by the LocalOnly security policy!")
 	})
 }
 
 // ============================================================================
-// 5. 配置文件与环境变量解析测试
-// 验证 Network 正式值与环境变量覆盖
+// 5. Config file and environment variable parsing tests
+// Verifies canonical Network values and environment variable overrides
 // ============================================================================
 func TestH2Tunnel_Config_NetworkAndEnv(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// 1. 测试显式 network="udp"
+	// 1. Test explicit network="udp"
 	udpJSON := `{
 		"mode": "client",
 		"listen": "127.0.0.1:1080",
@@ -431,18 +433,18 @@ func TestH2Tunnel_Config_NetworkAndEnv(t *testing.T) {
 	_ = os.WriteFile(cfgPath, []byte(udpJSON), 0644)
 	cfg, err := loadConfigFile(cfgPath)
 	if err != nil {
-		t.Fatalf("解析配置失败: %v", err)
+		t.Fatalf("config parse failed: %v", err)
 	}
 	if cfg.Network != "udp" {
-		t.Fatalf("配置 network 实际值不匹配: %s", cfg.Network)
+		t.Fatalf("config network value mismatch: %s", cfg.Network)
 	}
 	cConfig := buildClientConfig(cfg)
 	if !cConfig.IsUDP() || cConfig.IsTCP() {
-		t.Fatalf("ClientConfig 状态解析错误: IsUDP=%v, IsTCP=%v", cConfig.IsUDP(), cConfig.IsTCP())
+		t.Fatalf("clientConfig state parsing wrong: IsUDP=%v, IsTCP=%v", cConfig.IsUDP(), cConfig.IsTCP())
 	}
-	t.Log("✅ 显式 network='udp' 成功激活 UDP 专属模式！")
+	t.Log("✅ explicit network='udp' activated UDP-only mode successfully!")
 
-	// 2. 测试 network="all"
+	// 2. Test network="all"
 	dualJSON := `{
 		"mode": "client",
 		"listen": "127.0.0.1:1080",
@@ -454,22 +456,22 @@ func TestH2Tunnel_Config_NetworkAndEnv(t *testing.T) {
 	dCfg, _ := loadConfigFile(dualPath)
 	dClientCfg := buildClientConfig(dCfg)
 	if !dClientCfg.IsUDP() || !dClientCfg.IsTCP() {
-		t.Fatalf("network='all' 未能同时开启 TCP 和 UDP: IsUDP=%v, IsTCP=%v", dClientCfg.IsUDP(), dClientCfg.IsTCP())
+		t.Fatalf("network='all' failed to enable both TCP and UDP: IsUDP=%v, IsTCP=%v", dClientCfg.IsUDP(), dClientCfg.IsTCP())
 	}
-	t.Log("✅ network='all' 成功同时激活 TCP 与 UDP 双栈！")
+	t.Log("✅ network='all' activated the TCP and UDP dual stack simultaneously!")
 
-	// 3. 测试环境变量覆盖
+	// 3. Test environment variable overrides
 	os.Setenv("H2TUNNEL_NETWORK", "udp")
 	os.Setenv("H2TUNNEL_TRANSPORT", "grpc")
 	defer os.Unsetenv("H2TUNNEL_NETWORK")
 	defer os.Unsetenv("H2TUNNEL_TRANSPORT")
 
-	envCfg := &Config{Network: "tcp", Transport: "h2"}
+	envCfg := &fileConfig{Network: "tcp", Transport: "h2"}
 	if err := applyEnvOverrides(envCfg); err != nil {
 		t.Fatal(err)
 	}
 	if envCfg.Network != "udp" || envCfg.Transport != "grpc" {
-		t.Fatalf("环境变量覆盖失败: %+v", envCfg)
+		t.Fatalf("env override failed: %+v", envCfg)
 	}
-	t.Log("✅ 环境变量对 Network 和 Transport 的动态覆盖成功生效！")
+	t.Log("✅ environment variables dynamically overrode Network and Transport successfully!")
 }

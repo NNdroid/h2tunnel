@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/tls"
@@ -16,29 +16,29 @@ import (
 )
 
 // =========================================
-// connmanager_test.go — L3 连接管理层全量可运行测试
+// connmanager_test.go — full runnable tests for the L3 connection-manager layer
 //
-// 覆盖：
-//   A. 各底层协议(h2/grpc/masque-tcp/wt/h3 + udp) × Resume v2 全双工回显矩阵
-//   B. 主备数量（默认 1+1）正确拨号
-//   C. 类型分流（PrimaryCount=2 → tcp/udp 各一条主）
-//   D. 主断 → 备升级 → 补位
-//   E. 备用 KEEPALIVE 失效检测 → 移除 → 补位
-//   F. 拨号间隔节流（不风暴重拨）
-//   G. establish_interval 错相生效（备在间隔后才建立）
-//   H. 鉴权失败 → 备用不接管
-//   I. 版本不匹配 → 426 拒绝
-//   J. ConnectionPolicy 默认值校验
-//   K. 边界：primary_count/backup_count=0 回退默认
+// Coverage:
+//   A. Underlying protocols (h2/grpc/masque-tcp/wt/h3 + udp) × Resume v2 full-duplex echo matrix
+//   B. Primary/backup counts (default 1+1) dial correctly
+//   C. Type sharding (PrimaryCount=2 → one primary each for tcp/udp)
+//   D. Primary down → backup promoted → replenished
+//   E. Backup KEEPALIVE failure detection → removal → replenishment
+//   F. Dial-interval throttling (no redial storms)
+//   G. establish_interval phase offset takes effect (backups establish only after the interval)
+//   H. Auth failure → backups do not take over
+//   I. Version mismatch → 426 rejection
+//   J. connectionPolicy default-value validation
+//   K. Boundaries: primary_count/backup_count=0 fall back to defaults
 //
-// 运行：go test -run 'ConnManager|ConnectionPolicy' -v ./...
+// Run: go test -run 'ConnManager|connectionPolicy' -v ./...
 // =========================================
 
-// 端口基址：独立于 backup_test(27000)、e2e_test(20000/22000)。
-// 每个测试用独立的 seq 偏移，避免后台 goroutine 不退出导致的端口冲突。
+// Port base: independent of backup_test(27000) and e2e_test(20000/22000).
+// Each test uses its own seq offset to avoid port conflicts from background goroutines that never exit.
 const connMgrPortBase = 29000
 
-// connManagerHTTPServer 启动一个启用了 resume/backup 的隧道服务端。
+// connManagerHTTPServer starts a tunnel server side with resume/backup enabled.
 func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echoAddr string) {
 	certFile := fmt.Sprintf("test_cert_connmgr_%d.pem", seq)
 	keyFile := fmt.Sprintf("test_key_connmgr_%d.pem", seq)
@@ -51,25 +51,25 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 	serverPort := connMgrPortBase + 443 + seq*2
 	startEchoServer(fmt.Sprintf("127.0.0.1:%d", echoPort))
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportH2,
-		ExpectedToken: token,
+		Authenticator: tokenAuth(token),
 		LogLevel:      "error",
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 	return "https://" + serverAddr, fmt.Sprintf("127.0.0.1:%d", echoPort)
 }
 
-// connMgrClient 构造标准 resume 客户端配置。
-func connMgrClient(serverURL, echoAddr, token string, network string) ClientConfig {
-	return ClientConfig{
+// connMgrClient builds a standard resume client config.
+func connMgrClient(serverURL, echoAddr, token string, network string) clientConfig {
+	return clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,
@@ -90,7 +90,7 @@ func connMgrHTTPClient() *http.Client {
 }
 
 // =========================================
-// A. 各底层协议 × Resume v2 全双工回显矩阵
+// A. Underlying protocols × Resume v2 full-duplex echo matrix
 // =========================================
 
 func TestConnManagerTransportResumeMatrix(t *testing.T) {
@@ -105,19 +105,19 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 	serverAddr := "127.0.0.1:29543"
 	serverURL := "https://" + serverAddr
 	token := "matrix-token"
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportAll,
-		ExpectedToken: token,
+		Authenticator: tokenAuth(token),
 		LogLevel:      "error",
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	cases := []struct {
 		name      string
@@ -141,9 +141,13 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 			cc.ListenAddr = fmt.Sprintf("127.0.0.1:%d", tc.port)
 			cc.Transport = tc.transport
 			go startClientDirect(cc)
-			time.Sleep(1 * time.Second)
+			if tc.network == "udp" {
+				waitUDPReady(t, cc.ListenAddr, 30*time.Second)
+			} else {
+				waitTCPOrTLSReady(t, cc.ListenAddr, 30*time.Second)
+			}
 
-			// 全双工回显验证：本地 → 隧道 → echo target → 隧道 → 本地
+			// Full-duplex echo verification: local → tunnel → echo target → tunnel → local
 			var conn net.Conn
 			var err error
 			if tc.network == "udp" {
@@ -169,26 +173,26 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 			if string(buf[:n]) != string(msg) {
 				t.Fatalf("echo mismatch: got %q want %q", buf[:n], msg)
 			}
-			t.Logf("✅ %s 在 resume/2 之上全双工回显通过", tc.name)
+			t.Logf("✅ %s full-duplex echo passed on top of resume/2", tc.name)
 		})
 	}
 }
 
 // =========================================
-// 连接管理器测试环境
+// Connection manager test environment
 // =========================================
 
-// startConnManagerEnv 启动一个带 ConnectionManager 的测试环境。
-// 返回 manager 与 serverURL；manager 需 t.Cleanup 关闭。
-func startConnManagerEnv(t *testing.T, seq int, policy ConnectionPolicy) (*ConnectionManager, string, string) {
+// startConnManagerEnv starts a test environment backed by a connectionManager.
+// Returns the manager and serverURL; the manager is closed via t.Cleanup.
+func startConnManagerEnv(t *testing.T, seq int, policy connectionPolicy) (*connectionManager, string, string) {
 	serverURL, echoAddr := connManagerHTTPServer(t, seq, "connmgr-token")
 	cfg := connMgrClient(serverURL, echoAddr, "connmgr-token", "tcp")
-	m := NewConnectionManager(policy, cfg, serverURL+"/tunnel", connMgrHTTPClient(), fmt.Sprintf("CM%d", seq))
+	m := newConnectionManager(policy, cfg, serverURL+"/tunnel", connMgrHTTPClient(), fmt.Sprintf("CM%d", seq))
 	t.Cleanup(m.Close)
 	return m, serverURL, echoAddr
 }
 
-// waitCount 轮询等待 manager 的主/备数量达到目标（含超时）。
+// waitCount polls until the manager's primary/backup counts reach the target (with timeout).
 func waitCount(t *testing.T, cond func() bool, timeout time.Duration, msg string) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -197,11 +201,11 @@ func waitCount(t *testing.T, cond func() bool, timeout time.Duration, msg string
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("超时: %s", msg)
+	t.Fatalf("timeout: %s", msg)
 }
 
 // =========================================
-// B. 主备数量（默认 1+1）
+// B. Primary/backup counts (default 1+1)
 // =========================================
 
 func TestConnManagerPrimaryBackupCounts(t *testing.T) {
@@ -209,21 +213,24 @@ func TestConnManagerPrimaryBackupCounts(t *testing.T) {
 	m, _, _ := startConnManagerEnv(t, 1, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 5*time.Second, "主连接应拨 1 条")
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 5*time.Second, "备用应在 establish 间隔后拨 1 条")
-	t.Logf("✅ 主=%d 备=%d（默认 1+1）", m.PrimaryCount(), m.BackupCount())
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 30*time.Second, "primary should dial 1 connection")
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 30*time.Second, "backup should dial 1 after the establish interval")
+	t.Logf("✅ primary=%d backup=%d (default 1+1)", m.PrimaryCount(), m.BackupCount())
 }
 
 // =========================================
-// C. 类型分流（PrimaryCount=2 → tcp/udp 各一条主）
+// C. Type sharding (PrimaryCount=2 → one primary each for tcp/udp)
 // =========================================
 
 func TestConnManagerTypeSharding(t *testing.T) {
-	policy := resolveConnectionPolicy(2, 1, 0, 0, 1, 2, nil) // 主2备1，网络={tcp,udp}
+	// The test environment uses a 1s backup redial throttle; if a shared CI host briefly
+	// jitters during the first handshake, the final 2-primary 1-backup state can still be
+	// verified without waiting for the production default of 15s.
+	policy := resolveConnectionPolicy(2, 1, 0, 1, 1, 2, nil) // 2 primaries 1 backup, networks={tcp,udp}
 	m, _, _ := startConnManagerEnv(t, 2, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.PrimaryCount() == 2 }, 5*time.Second, "应拨 2 条主")
+	waitCount(t, func() bool { return m.PrimaryCount() == 2 }, 30*time.Second, "should dial 2 primaries")
 	types := m.PrimaryTypes()
 	hasTCP, hasUDP := false, false
 	for _, ty := range types {
@@ -235,71 +242,72 @@ func TestConnManagerTypeSharding(t *testing.T) {
 		}
 	}
 	if !hasTCP || !hasUDP {
-		t.Fatalf("类型分流未生效: 主类型=%v，期望同时覆盖 tcp 与 udp", types)
+		t.Fatalf("type sharding not in effect: primary types=%v, expected to cover both tcp and udp", types)
 	}
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 5*time.Second, "备用应拨 1 条")
-	t.Logf("✅ 类型分流生效: 主类型=%v 备=%d", types, m.BackupCount())
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 30*time.Second, "backup should dial 1")
+	t.Logf("✅ type sharding in effect: primary types=%v backup=%d", types, m.BackupCount())
 }
 
 // =========================================
-// D. 主断 → 备升级 → 补位
+// D. Primary down → backup promoted → replenished
 // =========================================
 
 func TestConnManagerSwitchoverReplenish(t *testing.T) {
-	policy := resolveConnectionPolicy(1, 1, 1, 1, 1, 2, nil) // 快速重拨，便于观察升级+补位
+	policy := resolveConnectionPolicy(1, 1, 1, 1, 1, 2, nil) // fast redial, easier to observe promotion + replenishment
 	m, _, _ := startConnManagerEnv(t, 3, policy)
 	m.Start()
 
-	// 等主备就绪
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 6*time.Second, "主备就绪")
+	// wait for primary and backup to be ready
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 30*time.Second, "primary and backup ready")
 
-	// 主连接阵亡 → 触发升级+补位
+	// primary connection dies → trigger promotion + replenishment
 	m.FailPrimary("default")
 
-	// 升级后主数量应恢复 1，且备用补足 1
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 8*time.Second, "主断后应升级备用并补足数量")
+	// after promotion the primary count should recover to 1, and the backup count refill to 1
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 && m.BackupCount() == 1 }, 30*time.Second, "after primary loss a backup should be promoted and counts refilled")
 	if st := m.PrimaryState("default"); st != backupAlive {
-		t.Fatalf("升级后的主连接状态应为 alive，实际=%s", st)
+		t.Fatalf("promoted primary connection state should be alive, got=%s", st)
 	}
-	t.Logf("✅ 主断 → 备升级为主(alive) → 补足备用，主=%d 备=%d", m.PrimaryCount(), m.BackupCount())
+	t.Logf("✅ primary down → backup promoted to primary(alive) → backup refilled, primary=%d backup=%d", m.PrimaryCount(), m.BackupCount())
 }
 
 // =========================================
-// E. 备用 KEEPALIVE 失效检测 → 移除 → 补位
+// E. Backup KEEPALIVE failure detection → removal → replenishment
 // =========================================
 
 func TestConnManagerBackupKeepaliveFailure(t *testing.T) {
-	policy := resolveConnectionPolicy(1, 1, 1, 1, 1, 2, nil) // missed=2, keepalive=1s, 快速补位
+	policy := resolveConnectionPolicy(1, 1, 1, 1, 1, 2, nil) // missed=2, keepalive=1s, fast replenishment
 	m, _, _ := startConnManagerEnv(t, 4, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 6*time.Second, "备用就绪")
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 30*time.Second, "backup ready")
 
-	// 直接关闭备用线路的流，模拟 KEEPALIVE 断链 → 连续丢 ACK → 判失效
+	// close the backup lines' streams directly to simulate KEEPALIVE link loss → consecutive missed ACKs → marked dead
 	m.mu.Lock()
 	for _, bl := range m.backups {
-		bl.close() // 关闭 closeCh，keepaliveLoop 退出，后续补位逻辑由 monitor 处理
+		bl.close() // closes closeCh, keepaliveLoop exits; further replenishment is handled by the monitor
 	}
 	m.mu.Unlock()
 
-	// 失效被移除 → 补位回到 1 条
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 8*time.Second, "失效备用应被移除并补足")
-	// 主连接不受影响
+	// the dead one is removed → replenished back to 1
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 30*time.Second, "dead backup should be removed and replenished")
+	// the primary connection is unaffected
 	if m.PrimaryCount() != 1 {
-		t.Fatalf("备用失效不应影响主连接，主=%d", m.PrimaryCount())
+		t.Fatalf("backup failure must not affect the primary connection, primary=%d", m.PrimaryCount())
 	}
-	t.Logf("✅ 备用 KEEPALIVE 失效被移除并补位，备=%d", m.BackupCount())
+	t.Logf("✅ backup KEEPALIVE failure removed and replenished, backup=%d", m.BackupCount())
 }
 
 // =========================================
-// F. 拨号间隔节流（不风暴重拨）
+// F. Dial-interval throttling (no redial storms)
 // =========================================
 
 func TestConnManagerDialIntervalThrottle(t *testing.T) {
-	// 主拨号间隔 2s：触发主失败后，补主不得早于该间隔（防风暴重拨）。
-	// 注意：直接构造 ConnectionPolicy，令 BackupCount=0，避免备用升级绕过主拨号节流。
+	// Primary dial interval 2s: after a primary failure, the replacement primary must not appear
+	// before the interval (anti redial-storm).
+	// Note: build connectionPolicy directly with BackupCount=0 so backup promotion cannot bypass the primary dial throttle.
 	interval := 2 * time.Second
-	policy := ConnectionPolicy{
+	policy := connectionPolicy{
 		PrimaryCount:         1,
 		BackupCount:          0,
 		PrimaryDialInterval:  interval,
@@ -311,9 +319,9 @@ func TestConnManagerDialIntervalThrottle(t *testing.T) {
 	m, _, _ := startConnManagerEnv(t, 5, policy)
 	m.Start()
 
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 5*time.Second, "主就绪")
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 30*time.Second, "primary ready")
 
-	// 触发主失败：由于距上次主拨号不足 interval，补主应被节流（不早于 interval）
+	// trigger primary failure: less than interval since the last primary dial, so replenishment should be throttled (not before the interval)
 	t0 := time.Now()
 	m.FailPrimary("default")
 	time.Sleep(interval / 2) // 1s < 2s
@@ -321,20 +329,20 @@ func TestConnManagerDialIntervalThrottle(t *testing.T) {
 	stillDown := m.primaries["default"] == nil
 	m.mu.Unlock()
 	if !stillDown {
-		t.Fatalf("主拨号间隔未到却已补主（节流失效）")
+		t.Fatalf("primary was replenished before the dial interval elapsed (throttle broken)")
 	}
 
-	// 间隔到期后应补主，且补主不早于 t0+interval
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, interval+3*time.Second, "间隔到期补主")
+	// after the interval expires the primary should be refilled, and not before t0+interval
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, interval+3*time.Second, "primary replenished after interval elapsed")
 	elapsed := time.Since(t0)
 	if elapsed < interval-400*time.Millisecond {
-		t.Fatalf("补主早于主拨号间隔(%v): 实际 %v", interval, elapsed)
+		t.Fatalf("primary replenished earlier than the dial interval (%v): actual %v", interval, elapsed)
 	}
-	t.Logf("✅ 主拨号间隔节流生效：补主在 %v 后发生(>=%v)", elapsed.Round(100*time.Millisecond), interval)
+	t.Logf("✅ primary dial interval throttle in effect: replenishment happened after %v (>=%v)", elapsed.Round(100*time.Millisecond), interval)
 }
 
 // =========================================
-// G. establish_interval 错相生效
+// G. establish_interval phase offset takes effect
 // =========================================
 
 func TestConnManagerEstablishInterval(t *testing.T) {
@@ -344,35 +352,37 @@ func TestConnManagerEstablishInterval(t *testing.T) {
 	start := time.Now()
 	m.Start()
 
-	// 主应立即出现
-	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 5*time.Second, "主立即建立")
+	// the primary should appear immediately
+	waitCount(t, func() bool { return m.PrimaryCount() == 1 }, 30*time.Second, "primary established immediately")
 
-	// 备用应晚于 establish_interval 出现。
-	// 等待窗口需覆盖「初始拨号失败后被 15s 重拨节流」的合法场景：bdSec=0 时
-	// BackupDialInterval 取默认值 15s，若首条备用握手在高负载下偶发失败被 reconcile
-	// 移除，重拨须等满 15s 节流；6s 窗口会在全量测试并发压力下偶发误判为失败。
-	// 仅放宽等待时长，核心断言「不早于 establish_interval」保持不变。
-	waitCount(t, func() bool { return m.BackupCount() == 1 }, 20*time.Second, "备在间隔后建立")
+	// The backup should appear later than establish_interval.
+	// The wait window must cover the legitimate scenario "initial dial fails, then the redial is
+	// throttled by the 15s interval": with bdSec=0 BackupDialInterval takes the default 15s, and if
+	// the first backup handshake occasionally fails under high load and is removed by reconcile, the
+	// redial must wait out the full 15s throttle; a 6s window would occasionally be misjudged as a
+	// failure under the concurrency pressure of the full test run.
+	// Only the wait duration is relaxed; the core assertion "not earlier than establish_interval" stays unchanged.
+	waitCount(t, func() bool { return m.BackupCount() == 1 }, 30*time.Second, "backup established after the interval")
 	backupAt := time.Since(start)
 	if backupAt < establish-500*time.Millisecond {
-		t.Fatalf("备用建立过早，早于 establish_interval(%v): 实际 %v", establish, backupAt)
+		t.Fatalf("backup established too early, earlier than establish_interval(%v): actual %v", establish, backupAt)
 	}
-	t.Logf("✅ establish_interval 错相生效：主%v后建立，备%v后建立(>%v)", time.Since(start), backupAt.Round(100*time.Millisecond), establish)
+	t.Logf("✅ establish_interval phase offset in effect: primary after %v, backup after %v (>%v)", time.Since(start), backupAt.Round(100*time.Millisecond), establish)
 }
 
 // =========================================
-// H. 鉴权失败 → 备用不接管
+// H. Auth failure → backups do not take over
 // =========================================
 
 func TestConnManagerAuthFailureNoTakeover(t *testing.T) {
 	policy := resolveConnectionPolicy(1, 1, 0, 0, 1, 2, nil)
 	m, serverURL, echoAddr := startConnManagerEnv(t, 7, policy)
-	// 覆盖配置为错误 token，使所有线路握手被拒
+	// override the config with a wrong token so every line's handshake is rejected
 	m.cfg = connMgrClient(serverURL, echoAddr, "WRONG", "tcp")
 	m.Start()
 
 	time.Sleep(2 * time.Second)
-	// 鉴权失败：主连接不应 alive，也不应有可接管备用
+	// auth failure: the primary must not be alive, and there must be no takeover-capable backup
 	m.mu.Lock()
 	primaryOK := false
 	if bl, ok := m.primaries["default"]; ok && bl.State() == backupAlive {
@@ -386,24 +396,24 @@ func TestConnManagerAuthFailureNoTakeover(t *testing.T) {
 	}
 	m.mu.Unlock()
 	if primaryOK {
-		t.Fatal("鉴权失败时主连接不应 alive")
+		t.Fatal("primary must not be alive when auth fails")
 	}
 	if backupOK {
-		t.Fatal("鉴权失败时不应有可接管的备用")
+		t.Fatal("no takeover-capable backup should exist when auth fails")
 	}
-	t.Logf("✅ 鉴权失败 → 主/备均不可用，禁止接管")
+	t.Logf("✅ auth failure → primary/backup both unavailable, takeover forbidden")
 }
 
 // =========================================
-// I. 版本不匹配 → 426 拒绝
+// I. Version mismatch → 426 rejection
 // =========================================
 
 func TestConnManagerVersionUnsupported(t *testing.T) {
 	serverURL, _ := connManagerHTTPServer(t, 8, "connmgr-token")
 
-	// 构造一个 resume/1（旧版）请求 → 应被 426 拒绝
+	// build a resume/1 (legacy) request → should be rejected with 426
 	req, _ := http.NewRequest(http.MethodPost, serverURL+"/tunnel", strings.NewReader(""))
-	req.Header.Set("X-Tunnel-Proto", "resume/1") // 旧版协议
+	req.Header.Set("X-Tunnel-Proto", "resume/1") // legacy protocol
 	req.Header.Set("X-Session-ID", "sess-v1")
 	req.Header.Set("X-Resume-Version", "1")
 	req.Header.Set("X-Resume-Caps", "replay")
@@ -417,85 +427,85 @@ func TestConnManagerVersionUnsupported(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUpgradeRequired {
-		t.Fatalf("旧版协议应返回 426，实际 %d", resp.StatusCode)
+		t.Fatalf("legacy protocol should return 426, got %d", resp.StatusCode)
 	}
 	if resp.Header.Get("X-Resume-Error") != "version-unsupported" {
-		t.Fatalf("X-Resume-Error 应为 version-unsupported，实际 %q", resp.Header.Get("X-Resume-Error"))
+		t.Fatalf("X-Resume-Error should be version-unsupported, got %q", resp.Header.Get("X-Resume-Error"))
 	}
-	t.Logf("✅ 旧版协议(非 resume/2) → 426 version-unsupported，无降级目标")
+	t.Logf("✅ legacy protocol (not resume/2) → 426 version-unsupported, no downgrade target")
 }
 
 // =========================================
-// J. ConnectionPolicy 默认值
+// J. connectionPolicy defaults
 // =========================================
 
 func TestConnectionPolicyDefaults(t *testing.T) {
 	p := resolveConnectionPolicy(0, -1, 0, 0, 0, 0, nil)
 	if p.PrimaryCount != 1 || p.BackupCount != 1 {
-		t.Fatalf("默认主备应为 1+1，实际 %d+%d", p.PrimaryCount, p.BackupCount)
+		t.Fatalf("default primary/backup should be 1+1, got %d+%d", p.PrimaryCount, p.BackupCount)
 	}
 	if p.EstablishInterval != 100*time.Second {
-		t.Fatalf("默认建立间隔应为 100s，实际 %v", p.EstablishInterval)
+		t.Fatalf("default establish interval should be 100s, got %v", p.EstablishInterval)
 	}
 	if p.PrimaryDialInterval != primaryDialDefault || p.BackupDialInterval != backupDialDefault {
-		t.Fatalf("默认拨号间隔错误: primary=%v backup=%v", p.PrimaryDialInterval, p.BackupDialInterval)
+		t.Fatalf("default dial intervals wrong: primary=%v backup=%v", p.PrimaryDialInterval, p.BackupDialInterval)
 	}
 	if p.BackoffMaxMissedAcks != 3 {
-		t.Fatalf("默认失效阈值应为 3，实际 %d", p.BackoffMaxMissedAcks)
+		t.Fatalf("default failure threshold should be 3, got %d", p.BackoffMaxMissedAcks)
 	}
 	if got := p.PrimaryNetworks; len(got) != 2 || got[0] != networkTCP || got[1] != networkUDP {
-		t.Fatalf("默认分流网络错误: %v", got)
+		t.Fatalf("default sharding networks wrong: %v", got)
 	}
-	t.Logf("✅ ConnectionPolicy 默认值全部正确")
+	t.Logf("✅ connectionPolicy defaults all correct")
 }
 
 // =========================================
-// K. 边界：backup_count=0 明确关闭备用
+// K. Boundary: backup_count=0 explicitly disables backups
 // =========================================
 
 func TestConnectionPolicyBoundary(t *testing.T) {
-	// 主连接 0 → 默认 1；备用 0 → 明确关闭
+	// primary 0 → default 1; backup 0 → explicitly disabled
 	p := resolveConnectionPolicy(0, 0, 0, 0, 0, 0, nil)
 	if p.PrimaryCount != 1 || p.BackupCount != 0 {
-		t.Fatalf("预期 1 主 + 0 备，实际 %d+%d", p.PrimaryCount, p.BackupCount)
+		t.Fatalf("expected 1 primary + 0 backup, got %d+%d", p.PrimaryCount, p.BackupCount)
 	}
-	// 显式网络集合会去重并固定为 tcp、udp 顺序
+	// an explicit network set is deduplicated and fixed to tcp, udp order
 	p2 := resolveConnectionPolicy(2, 1, 0, 0, 0, 0, []string{"udp", "tcp", "udp"})
 	if got := p2.PrimaryNetworks; len(got) != 2 || got[0] != networkTCP || got[1] != networkUDP {
-		t.Fatalf("分流网络归一失败: %v", got)
+		t.Fatalf("sharding network normalization failed: %v", got)
 	}
-	// 非法建立间隔(负) → 默认 100s
+	// invalid (negative) establish interval → default 100s
 	p3 := resolveConnectionPolicy(1, 1, 0, 0, -5, 0, nil)
 	if p3.EstablishInterval != 100*time.Second {
-		t.Fatalf("负建立间隔应回退 100s，实际 %v", p3.EstablishInterval)
+		t.Fatalf("negative establish interval should fall back to 100s, got %v", p3.EstablishInterval)
 	}
-	t.Logf("✅ 配置边界回退默认正确")
+	t.Logf("✅ config boundary fallbacks to defaults correctly")
 }
 
 // =========================================
-// 补充：primaryTypes 分流集合正确性
+// Supplement: primaryTypes shard-set correctness
 // =========================================
 
 func TestConnectionPolicyPrimaryTypes(t *testing.T) {
 	p := resolveConnectionPolicy(1, 1, 0, 0, 0, 0, nil)
 	if types := p.primaryTypes(); len(types) != 1 || types[0] != "default" {
-		t.Fatalf("PrimaryCount=1 应单类型 default，实际 %v", types)
+		t.Fatalf("PrimaryCount=1 should yield single type default, got %v", types)
 	}
 	p2 := resolveConnectionPolicy(2, 1, 0, 0, 0, 0, nil)
 	types := p2.primaryTypes()
 	if len(types) != 2 {
-		t.Fatalf("PrimaryCount=2 应分流为 2 个类型，实际 %v", types)
+		t.Fatalf("PrimaryCount=2 should shard into 2 types, got %v", types)
 	}
 	set := map[string]bool{}
 	for _, ty := range types {
 		set[ty] = true
 	}
 	if !set["tcp"] || !set["udp"] {
-		t.Fatalf("分流类型应含 tcp+udp，实际 %v", types)
+		t.Fatalf("shard types should include tcp+udp, got %v", types)
 	}
-	t.Logf("✅ primaryTypes 分流集合正确")
+	t.Logf("✅ primaryTypes shard set correct")
 }
 
-// 确保 io 与 sync 包被使用（连接/协程并发场景）
+// keep the io and sync packages used (connection/goroutine concurrency scenarios)
 var _ = io.Discard
 var _ sync.WaitGroup

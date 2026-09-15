@@ -1,6 +1,7 @@
-package main
+package h2tunnel
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
@@ -18,26 +19,30 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// 预生成的随机字节数组，用于极速填充 Padding，避免运行时计算和内存分配
+// paddingGarbage is a pre-generated random byte array used for ultra-fast
+// padding fill, avoiding runtime computation and allocation.
 var paddingGarbage [4096]byte
 
-// CDN 后各类反代的空闲超时上限（实测公约数）：
+// Idle-timeout ceiling across common reverse proxies behind a CDN (a practical
+// common denominator):
 //
-//	AWS ALB idle_timeout        默认 60s
-//	Nginx proxy_read_timeout    默认 60s
-//	Cloudflare 回源读超时        100s（超时返回 524）
+//	AWS ALB idle_timeout        default 60s
+//	Nginx proxy_read_timeout    default 60s
+//	Cloudflare origin read      100s (returns 524 on timeout)
 //
-// 取最小公约数 60s 的一半以下作为默认心跳间隔，留出重传与抖动余量。
+// The default heartbeat is under half of the 60s minimum, leaving room for
+// retransmission and jitter.
 const (
 	heartbeatDefault = 25 * time.Second
 	heartbeatMin     = 5 * time.Second
 	heartbeatMax     = 5 * time.Minute
-	// 优雅下线时等待存量隧道排空的上限
+	// Upper bound for draining in-flight tunnels during graceful shutdown.
 	drainDefault = 30 * time.Second
 )
 
-// clampHeartbeat 把用户配置的心跳间隔收敛到安全区间。
-// 返回 0 表示关闭心跳（仅建议在源站直连、无中间盒时使用）。
+// clampHeartbeat clamps a user-configured heartbeat interval into a safe range.
+// Returning 0 disables the heartbeat (recommended only for direct origin links
+// with no middleboxes).
 func clampHeartbeat(d time.Duration) time.Duration {
 	switch {
 	case d <= 0:
@@ -58,10 +63,10 @@ const maxCapsuleLen = 1 << 22
 
 var paddingWritePool = sync.Pool{
 	New: func() interface{} {
-		// 单次最大 chunk 为 1MB (1048576)
-		// Header(6) + Padding(最大不到 512)
-		// 分配 1048576 + 1024 = 1049600 字节，绝对安全且避免越界
-		buf := make([]byte, 1049600)
+		// All shaped records are capped below 64 KiB. Larger unshaped payloads
+		// use writeFrame's header/data/padding scatter path instead of retaining
+		// a 1 MiB object per concurrently active writer.
+		buf := make([]byte, 64*1024)
 		return &buf
 	},
 }
@@ -80,8 +85,9 @@ func fastRand(max int) int {
 	return mrand.Intn(max)
 }
 
-// NormalizeTargetAddr 标准化目标地址（支持 IP:Port 与 Domain:Port）
-func NormalizeTargetAddr(addr, defaultPort string) string {
+// normalizeTargetAddr normalizes a target address (supports IP:Port and
+// Domain:Port).
+func normalizeTargetAddr(addr, defaultPort string) string {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return ""
@@ -93,15 +99,16 @@ func NormalizeTargetAddr(addr, defaultPort string) string {
 			return net.JoinHostPort(host, port)
 		}
 	}
-	// 如果没有带端口，尝试附加默认端口
+	// If no port was given, try to append the default port.
 	if defaultPort != "" && !strings.Contains(addr, ":") {
 		return net.JoinHostPort(addr, defaultPort)
 	}
 	return addr
 }
 
-// IsValidTargetAddr 校验目标地址（支持 IPv4 / IPv6 / 域名 + 端口）
-func IsValidTargetAddr(addr string) bool {
+// isValidTargetAddr validates a target address (supports IPv4 / IPv6 / hostname
+// + port).
+func isValidTargetAddr(addr string) bool {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil || host == "" {
 		return false
@@ -113,11 +120,11 @@ func IsValidTargetAddr(addr string) bool {
 	return true
 }
 
-func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
+func checkTargetIsAvailable(target string, cfg serverConfig) bool {
 	if target == "" {
 		return false
 	}
-	// 如果开启了“仅限本地”模式，则进行主机校验
+	// In "local only" mode, perform a host check.
 	if cfg.LocalOnly {
 		host, _, err := net.SplitHostPort(target)
 		if err != nil {
@@ -134,23 +141,26 @@ func checkTargetIsAvailable(target string, cfg ServerConfig) bool {
 	return true
 }
 
-func GetDefaultQUICConfig() *quic.Config {
+func getDefaultQUICConfig() *quic.Config {
 	return &quic.Config{
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true,
-		// 允许的无序字节数。高吞吐下必须调大，否则会被拥塞控制卡死
-		MaxStreamReceiveWindow:     8 * 1024 * 1024,  // 8 MB (默认通常是 512KB)
+		// Out-of-order bytes allowed. Must be large for high throughput, or
+		// congestion control stalls the stream.
+		MaxStreamReceiveWindow:     8 * 1024 * 1024,  // 8 MB (default is usually 512KB)
 		MaxConnectionReceiveWindow: 20 * 1024 * 1024, // 20 MB
-		// 允许客户端并发开启的最大双向流数量，避免多路复用时因流耗尽导致阻塞
+		// Max concurrent bidirectional streams the client may open, so mux doesn't
+		// block once streams run out.
 		MaxIncomingStreams: 1000,
-		// 如果是纯代理环境，可以考虑关闭 KeepAlive 或调长周期，减少控制帧开销
+		// In a pure-proxy setup you can disable KeepAlive or lengthen it to cut
+		// control-frame overhead.
 		KeepAlivePeriod:       9 * time.Second,
-		MaxIdleTimeout:        30 * time.Second, // 限制超时时间
-		MaxIncomingUniStreams: 10000,            // 调大单向流限制
+		MaxIdleTimeout:        30 * time.Second, // bound the idle timeout
+		MaxIncomingUniStreams: 10000,            // raise the unidirectional-stream limit
 	}
 }
 
-func GetXNetwork(r *http.Request) string {
+func getXNetwork(r *http.Request) string {
 	network := r.Header.Get("X-Network")
 	if network != "udp" {
 		network = "tcp"
@@ -158,16 +168,16 @@ func GetXNetwork(r *http.Request) string {
 	return network
 }
 
-func GetXTarget(r *http.Request) string {
+func getXTarget(r *http.Request) string {
 	target := r.Header.Get("X-Target")
 	return target
 }
 
-func GetXDst(r *http.Request) (string, string) {
-	network := GetXNetwork(r)
-	target := GetXTarget(r)
+func getXDst(r *http.Request) (string, string) {
+	network := getXNetwork(r)
+	target := getXTarget(r)
 
-	if target == "" || !IsValidTargetAddr(target) { // 当目标为空或非法时，使用默认值
+	if target == "" || !isValidTargetAddr(target) { // fall back to a default when empty/invalid
 		switch network {
 		case "udp":
 			target = "127.0.0.1:53" // DNS
@@ -179,15 +189,22 @@ func GetXDst(r *http.Request) (string, string) {
 	return network, target
 }
 
-func SetXNetwork(h http.Header, network string) {
+func getRequestDestination(r *http.Request, cfg serverConfig) (string, string) {
+	if cfg.TargetDialer != nil {
+		return getXNetwork(r), strings.TrimSpace(getXTarget(r))
+	}
+	return getXDst(r)
+}
+
+func setXNetwork(h http.Header, network string) {
 	h.Set("X-Network", network)
 }
 
-func SetXTarget(h http.Header, target string) {
+func setXTarget(h http.Header, target string) {
 	h.Set("X-Target", target)
 }
 
-func SetXDst(h http.Header, cfg ClientConfig) (string, string) {
+func setXDst(h http.Header, cfg clientConfig) (string, string) {
 	network := "tcp"
 	if normalizeNetwork(cfg.Network, networkTCP) == networkUDP {
 		network = "udp"
@@ -196,64 +213,67 @@ func SetXDst(h http.Header, cfg ClientConfig) (string, string) {
 	if network == "udp" {
 		defaultPort = "53"
 	}
+	if cfg.LogicalTargets {
+		target := strings.TrimSpace(cfg.TargetAddr)
+		setXNetwork(h, network)
+		setXTarget(h, target)
+		return network, target
+	}
 
-	target := NormalizeTargetAddr(cfg.TargetAddr, defaultPort)
-	if !IsValidTargetAddr(target) {
+	target := normalizeTargetAddr(cfg.TargetAddr, defaultPort)
+	if !isValidTargetAddr(target) {
 		if network == "udp" {
 			target = "127.0.0.1:53"
 		} else {
 			target = "127.0.0.1:22"
 		}
 	}
-	SetXNetwork(h, network)
-	SetXTarget(h, target)
+	setXNetwork(h, network)
+	setXTarget(h, target)
 	return network, target
 }
 
-func SetXAuth(h http.Header, cfg ClientConfig) {
+func setXAuth(h http.Header, cfg clientConfig) {
 	if cfg.Token == "" {
 		return
 	}
-	// 自定义头与标准 Authorization 均可穿过常见 CDN / 反代。
+	// Both the custom header and standard Authorization survive common CDNs / reverse proxies.
 	h.Set("X-Auth-Token", cfg.Token)
 	h.Set("Authorization", "Bearer "+cfg.Token)
 }
 
-// setTunnelRequestHeaders 设置隧道请求侧的反缓冲头，与 server 端的
-// setTunnelHeaders 配对：
+func applyClientCredentials(ctx context.Context, h http.Header, cfg clientConfig) error {
+	if cfg.Credentials != nil {
+		return cfg.Credentials(ctx, h)
+	}
+	setXAuth(h, cfg)
+	return nil
+}
+
+// clientUserAgent is the User-Agent used uniformly across every tunnel request
+// (TCP/UDP resume, backup lanes, WT CONNECT). It must be set explicitly: Go's
+// HTTP/2 transport injects "Go-http-client/2.0" when a request has no UA —
+// after utls disguises the handshake as Chrome, that header immediately makes
+// the TLS fingerprint and the HTTP fingerprint contradict each other, undoing
+// all the camouflage work.
+const clientUserAgent = "Mozilla/5.0 (Linux; Android 15; SM-A057G Build/AP3A.240905.015.A2; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/151.0.7922.202 Mobile Safari/537.36 w2n/Android"
+
+// setTunnelRequestHeaders sets the tunnel request-side anti-buffering headers,
+// pairing with the server's setTunnelHeaders:
 //
-//	Accept-Encoding: identity —— Go Transport 默认会自动补 gzip 并承诺解压，
-//	  中间盒看到 Accept-Encoding: gzip 可能直接对响应做压缩缓冲。显式
-//	  identity 同时阻止 Transport 自动补头和 CDN 主动压缩。
-//	Cache-Control: no-store, no-transform —— 要求 CDN 不缓存、不改写。
+//	User-Agent: clientUserAgent — suppresses the Go-http-client default (see above).
+//	Accept-Encoding: identity — Go's transport otherwise auto-adds gzip and promises
+//	  to decompress; a middlebox seeing Accept-Encoding: gzip may compress-buffer the
+//	  response. Explicit identity blocks both the auto-added header and CDN compression.
+//	Cache-Control: no-store, no-transform — requires the CDN not to cache or rewrite.
 func setTunnelRequestHeaders(h http.Header) {
+	h.Set("User-Agent", clientUserAgent)
 	h.Set("Accept-Encoding", "identity")
 	h.Set("Cache-Control", "no-store, no-transform")
 }
 
-// checkAuth 校验单一配置 Token；不接受旧头名或多 Token 隐式语法。
-func checkAuth(r *http.Request, expectedToken string) bool {
-	if expectedToken == "" {
-		return true
-	}
-
-	if secureEqual(r.Header.Get("X-Auth-Token"), expectedToken) {
-		return true
-	}
-	const bearerPrefix = "Bearer "
-	authHeader := r.Header.Get("Authorization")
-	if len(authHeader) == len(bearerPrefix)+len(expectedToken) &&
-		strings.EqualFold(authHeader[:len(bearerPrefix)], bearerPrefix) &&
-		secureEqual(authHeader[len(bearerPrefix):], expectedToken) {
-		return true
-	}
-
-	// 鉴权失败时，只记录来源 IP，绝不打印客户端携带的 token（含 Bearer 明文），以防凭据泄露
-	zlog.Warnf("[Protocol] 鉴权拦截: 非法/缺失鉴权 (IP: %s)", clientIP(r))
-	return false
-}
-
-// secureEqual 常量时间字符串比较（长度不等时也要走完，避免长度侧信道）
+// secureEqual is a constant-time string comparison (run to completion even on a
+// length mismatch, to avoid a length side channel).
 func secureEqual(a, b string) bool {
 	if a == "" {
 		return false
@@ -261,14 +281,16 @@ func secureEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// clientIP 还原真实客户端 IP。
+// clientIP recovers the real client IP.
 //
-// 在 CDN / 反代后面 r.RemoteAddr 恒为边缘节点地址，直接拿它做日志和审计
-// 等于什么都没记。这里按常见约定依次回退取值。
+// Behind a CDN / reverse proxy r.RemoteAddr is always the edge node's address;
+// using it directly for logs and audit records nothing useful. Fall back through
+// the common conventions in order.
 //
-// ⚠️ 安全约束：这些头都可以被客户端伪造，因此本函数的返回值只能用于日志、
-// 限流统计等辅助用途，**绝不可作为鉴权或访问控制依据**。需要按 IP 做访问
-// 控制时，必须在最外层反代上校验，或显式配置可信代理层数后取倒数第 N 跳。
+// ⚠️ Security constraint: these headers can all be spoofed by the client, so the
+// return value is for logging / rate-limit stats only and MUST NEVER be used for
+// authentication or access control. To gate by IP, validate at the outermost
+// reverse proxy or configure a trusted-proxy hop count and take the Nth-from-last.
 func clientIP(r *http.Request) string {
 	for _, h := range []string{"CF-Connecting-IP", "True-Client-IP", "X-Real-IP"} {
 		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
@@ -284,11 +306,23 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// parseMasqueTarget 遵循 RFC 9298 解析 URI 模板
+// masquePathBase returns the MASQUE path base, nested under the tunnel path and
+// reusing the same path config (path=/tunnel → /tunnel/.well-known/masque;
+// path=/ → /.well-known/masque). A reverse proxy / CDN only needs to allow one
+// prefix and both ends stay consistent automatically.
+func masquePathBase(tunnelPath string) string {
+	p := strings.TrimRight(strings.TrimSpace(tunnelPath), "/")
+	if p == "" {
+		return "/.well-known/masque"
+	}
+	return p + "/.well-known/masque"
+}
+
+// parseMasqueTarget parses the URI template per RFC 9298.
 func parseMasqueTarget(protocol, reqPath string) (string, error) {
 	protocol = strings.ToLower(protocol)
 	if protocol != "tcp" && protocol != "udp" {
-		zlog.Errorf("[Protocol] URI 解析失败: 不支持的底层协议 '%s'", protocol)
+		lgErrorf(discardLogger, "[Protocol] ❌ URI parse failed: unsupported base protocol '%s'", protocol)
 		return "", fmt.Errorf("unsupported protocol: %s", protocol)
 	}
 	cleanPath := strings.Trim(reqPath, "/")
@@ -309,19 +343,19 @@ func parseMasqueTarget(protocol, reqPath string) (string, error) {
 	host, err1 := url.PathUnescape(parts[udpIdx+1])
 	port, err2 := url.PathUnescape(parts[udpIdx+2])
 	if err1 != nil || err2 != nil || host == "" || port == "" {
-		zlog.Errorf("[Protocol] URI Decode 失败: hostErr=%v, portErr=%v", err1, err2)
+		lgErrorf(discardLogger, "[Protocol] ❌ URI decode failed: hostErr=%v, portErr=%v", err1, err2)
 		return "", fmt.Errorf("failed to unescape host/port")
 	}
 
 	target := net.JoinHostPort(host, port)
-	if !IsValidTargetAddr(target) {
+	if !isValidTargetAddr(target) {
 		return "", fmt.Errorf("invalid parsed masque target: %s", target)
 	}
-	zlog.Debugf("[Protocol] 🎯 MASQUE URI 解析成功 -> 解析出目标: %s", target)
+	lgDebugf(discardLogger, "[Protocol] ✅ MASQUE URI parsed OK -> target: %s", target)
 	return target, nil
 }
 
-// --- QUIC VarInt (极高频调用，仅保留严重错误日志) ---
+// --- QUIC VarInt (called extremely often; keep only severe error logs) ---
 func writeVarInt(w io.Writer, val uint64) error {
 	var buf [8]byte
 	if val <= 0x3f {
@@ -336,6 +370,19 @@ func writeVarInt(w io.Writer, val uint64) error {
 	}
 	binary.BigEndian.PutUint64(buf[:], val|0xc000000000000000)
 	return writeAll(w, buf[:])
+}
+
+func varIntLen(val uint64) int {
+	switch {
+	case val < 1<<6:
+		return 1
+	case val < 1<<14:
+		return 2
+	case val < 1<<30:
+		return 4
+	default:
+		return 8
+	}
 }
 
 func readVarInt(r io.Reader) (uint64, error) {
@@ -359,26 +406,77 @@ func readVarInt(r io.Reader) (uint64, error) {
 	return val, nil
 }
 
+// :protocol values for MASQUE / WebTransport (tunnel protocol-shape identifiers,
+// independent of carrier).
+const (
+	protocolWebTransport = "webtransport"
+	protocolConnectTCP   = "connect-tcp"
+	protocolConnectUDP   = "connect-udp"
+)
+
+// masqueConnectProtocol returns the MASQUE CONNECT protocol name. It tolerates
+// both exposures: quic-go h3 uses a regular "Protocol" header, while x/net h2
+// extended CONNECT places the :protocol pseudo-header into r.Header(":protocol").
+func masqueConnectProtocol(r *http.Request) string {
+	if p := r.Header.Get("Protocol"); p != "" {
+		return p
+	}
+	return r.Header.Get(":protocol")
+}
+
 // --- MASQUE UDP Capsule ---
-func writeUDPCapsule(w io.Writer, p []byte) error {
-	// 随机概率插入 Padding Capsule (混淆长度和流量特征)
-	if fastRand(10) > 6 { // 30% 的概率插入
-		padLen := fastRand(64)
-		// 0x1F23 是自定义的未知类型，接收端的 io.Discard 会自动吃掉它
-		if err := writeVarInt(w, 0x1F23); err != nil {
+const (
+	paddingCapsuleType         = 0x1F23
+	maxPaddingCapsuleHeaderLen = 6 // type(2) + length varint (up to 4 for uint16-sized padding)
+	maxTunnelUDPPayload        = 65532
+)
+
+func udpCapsuleDataWireLen(payloadLen int) int {
+	// DATAGRAM capsule type + capsule length + context ID + payload.
+	return 1 + varIntLen(uint64(1+payloadLen)) + 1 + payloadLen
+}
+
+func paddingCapsuleWireLen(padLen int) int {
+	return varIntLen(paddingCapsuleType) + varIntLen(uint64(padLen)) + padLen
+}
+
+func capsulePaddingForTarget(dataWireLen, target int) int {
+	padLen := target - dataWireLen - maxPaddingCapsuleHeaderLen
+	if padLen < 0 {
+		padLen = 0
+	}
+	for dataWireLen+paddingCapsuleWireLen(padLen) < target {
+		padLen++
+	}
+	return padLen
+}
+
+func writeUDPCapsule(w io.Writer, p []byte, padding paddingPolicy) error {
+	if len(p) > maxTunnelUDPPayload {
+		return fmt.Errorf("UDP payload > %d", maxTunnelUDPPayload)
+	}
+	dataWireLen := udpCapsuleDataWireLen(len(p))
+	target := padding.targetAtLeast(dataWireLen, maxPaddingCapsuleHeaderLen)
+	addPadding := target > dataWireLen
+	padLen := 0
+	if addPadding {
+		padLen = capsulePaddingForTarget(dataWireLen, target)
+	}
+	// Unknown capsule types are ignored by the peer. Keeping padding in its own
+	// capsule preserves the CONNECT-UDP datagram payload exactly.
+	if addPadding {
+		if err := writeVarInt(w, paddingCapsuleType); err != nil {
 			return err
 		}
 		if err := writeVarInt(w, uint64(padLen)); err != nil {
 			return err
 		}
-		if padLen > 0 {
-			if err := writeAll(w, paddingGarbage[:padLen]); err != nil {
-				return err
-			}
+		if err := writePadding(w, padLen); err != nil {
+			return err
 		}
 	}
 
-	// 正常写入 Datagram (Type 0x00)
+	// Write the Datagram capsule (type 0x00).
 	if err := writeVarInt(w, 0x00); err != nil {
 		return err
 	}
@@ -415,7 +513,7 @@ func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
 				if lr.N > int64(len(payloadBuf)) {
 					return 0, fmt.Errorf("UDP capsule too large for buffer")
 				}
-				n, err := io.ReadFull(lr, payloadBuf[:lr.N]) // 直接读入复用池，不产生 GC
+				n, err := io.ReadFull(lr, payloadBuf[:lr.N]) // read straight into the pooled buffer, no GC
 				return n, err
 			}
 		}
@@ -426,26 +524,27 @@ func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
 }
 
 // --- Stream UDP Packets ---
-func writeUDPPacket(w io.Writer, p []byte) error {
-	if len(p) > 65535 {
-		return fmt.Errorf("UDP payload > 65535")
+// writeUDPPacket preserves one target UDP datagram per tunnel record.
+func writeUDPPacket(w io.Writer, p []byte, padding paddingPolicy) error {
+	if len(p) > maxTunnelUDPPayload {
+		return fmt.Errorf("UDP payload > %d", maxTunnelUDPPayload)
 	}
 
-	padLen := fastRand(64)
+	padLen := padding.paddingFor(4 + len(p))
 	totalLen := 4 + len(p) + padLen
 
 	bufPtr := udpBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer udpBufPool.Put(bufPtr)
 
-	// 组装 Header
+	// Assemble the header.
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(p)))
 	binary.BigEndian.PutUint16(buf[2:4], uint16(padLen))
 
-	// 拼接 Payload 和 Padding
+	// Concatenate payload and padding.
 	copy(buf[4:], p)
 	if padLen > 0 {
-		copy(buf[4+len(p):], paddingGarbage[:padLen])
+		fillPadding(buf[4+len(p) : totalLen])
 	}
 
 	return writeAll(w, buf[:totalLen])

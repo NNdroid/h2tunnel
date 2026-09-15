@@ -1,0 +1,68 @@
+# Changelog
+
+This file records notable changes for library users. Dates are release dates (UTC+8).
+
+## 2026-09-13
+
+### Added
+- **Application-layer record padding**: `ClientTuning.Padding` / `ServerTuning.Padding` configure a random record range via `PaddingTuning{MinRecordBytes, MaxRecordBytes}`; the CLI mirrors it with nested `padding.min_record_bytes` / `padding.max_record_bytes` keys and same-named env vars. Off by default; when only the minimum is given the cap automatically becomes 125% of it. Covers streamed DATA, replayed DATA, handshake, heartbeat, END, ERROR, and the UDP/MASQUE capsules — TCP/UDP target-visible business content stays unchanged across all six transports. Stream data is reshaped into records at random targets; UDP keeps message boundaries and packets above the cap are never split. This capability only constrains h2tunnel application records; it makes no promise about the size of actual IP packets — TLS, HTTP/QUIC/TCP, CDNs, MTU, and NIC offloads can still split or coalesce records.
+- **MASQUE dual-carrier selection**: `ClientTuning.MasqueALPN` (CLI `masque_alpn`) — `h3` (QUIC only), `h2` (TCP extended CONNECT only), empty = auto (h3 first; a failed first dial pins h2 cross-lane, so links with blocked UDP need not wait out the QUIC timeout per connection). Server-side `transport: masque` now treats TCP and QUIC as optional stacks, with `ListenAndServe` opening both by default. ⚠️ The server needs `GODEBUG=http2xconnect=1` at process start to accept extended CONNECT over h2 (x/net reads it once in init; `//go:debug` rejects non-stdlib keys). When missing, h3 is unaffected and the h2 leg is explicitly rejected with `extended connect not supported by peer`; the CLI logs a WARN.
+- **pprof**: `h2tunnel.PprofHandler()` exposes the standard net/http/pprof for embedders to mount behind their own admin boundary (the library itself binds no port); the CLI server-side `pprof` config key / `H2TUNNEL_PPROF` enables it at a given address. CI gains a `profile` job producing CPU/allocation flamegraph SVGs and top reports as the `profiles` artifact.
+
+### Changed (internal refactors, behavior unchanged)
+- **Server-side listener plan**: the anonymous `(tcp, quic bool)` of `requiredListeners` (one tuple meant both "must be provided" and "provided but unused") is replaced by `listenerPlan` — three states per stack (`unused/optional/required`) derived once from compiled transports; auto-binding, SDK validation, and test environments share `plan.bind()` (port-sharing logic now exists in one place). Fixed: a MASQUE server with only a TCP listener used to be rejected — even though MASQUE-over-h2 is exactly what it serves.
+- **Request dispatch**: one `classifyTunnelRequest` produces `tunnelRequest{kind, transport, network, target}`, shared by auth/network-policy/transport-policy/events/dispatch — replacing the three-boolean handoff `isWT/isMasqueTCP/isMasqueUDP` and the triple computation of `requestTransport()`/`getRequestDestination()` per request. Fixes two real bugs along the way: MASQUE-TCP `SessionOpened` events carried an empty Transport; standards-connect-udp (the old `MUDP` entry) did not emit `AuthRejected` on a wrong token.
+
+### Security fixes
+- **Fixed: certificate verification silently bypassed (MITM) when `UtlxFingerprint` was enabled**. `utlsTLSConfig` previously copied only `ServerName`/`InsecureSkipVerify`/`RootCAs` from the user `tls.Config` into the `utls.Config`, dropping `VerifyPeerCertificate`, `VerifyConnection`, `Certificates`/`GetClientCertificate`, `MinVersion`/`MaxVersion`, and other fields. Embedders using `InsecureSkipVerify=true` + `VerifyPeerCertificate` fingerprint pinning (e.g. in-house SSH clients) would have pinning silently disabled once camouflage was enabled, accepting any certificate. The copy is now field-by-field: all trust/authn fields pass through, with `VerifyConnection` and client certs adapted via type adapters (`crypto/tls` and `utls` same-named types are not directly assignable); `CipherSuites`/`CurvePreferences` are deliberately not copied (left to the browser fingerprint preset); `ClientSessionCache` is deliberately not copied (resuming across native/utls would skip the pinning callback on resumed connections). Regression test `utls_pinning_test.go` locks `VerifyPeerCertificate` and `VerifyConnection` (with a negative control that fails if the fix is removed). The native-TLS path and the non-camouflaged branch are unaffected (they already used full `tls.Config.Clone()`).
+
+## 2026-09-08
+
+### Added
+- **TLS fingerprint camouflage (utls)**: `ClientOptions.UtlxFingerprint` (CLI config key `utls` / env var `H2TUNNEL_UTLS`) rewrites the ClientHello of h2/grpc clients into real-browser shapes (`chrome`, `firefox`, `edge`, `safari`, `ios`, `qq`) against JA3/JA4 fingerprinting; empty default = native crypto/tls, zero behavior change. Only TCP-TLS transports take effect — h3/wt/masque TLS happens inside quic-go and cannot be injected, so misuse errors at `NewClient` (`360` is likewise rejected because its preset does not advertise h2). Bare `net.Listen` dialers and `ClientDialer` custom sockets (VPN protect) coexist with camouflage.
+
+### Changed
+- **Outbound requests now carry a browser User-Agent uniformly** (TCP/UDP resume, backup lines, WT CONNECT all covered): previously requests had no UA and Go's Transport injected `Go-http-client/2.0`, directly contradicting the camouflaged browser TLS fingerprint. The default is an Android Chrome WebView UA (with the `w2n/Android` app identifier). Server-side logging/auditing that relied on the `Go-http-client` signature must adjust.
+- **Network-change self-heal suite** (effective for TCP/UDP/WT transports):
+  - `ClientTuning.AutoRedial` — automatically resets and continues after redial exhaustion (16 attempts), i.e. infinite revival, fitting "stay down until the network returns"; when off, exhaustion terminates and dispatches `TunnelDied(max retries)`.
+  - `ClientTuning.RedialBudget` — per-attempt dial budget (constrains stream setup + handshake only; the timer stops once ready), tightening the abandon pace during outages.
+  - `Client.ForceReconnect()` — for embedders to force abandonment of the current stream and immediate redial when an OS network-change notification (NotifyAddrChange / NWPathMonitor / ConnectivityManager) arrives; session id and recovery window are preserved, invisible to the peer. Skips the passive lag of heartbeat-timeout detection.
+  - The WT-UDP datagram plane gains a disconnect-redial loop (previously a stream break ended the session); the server reuses the UDP socket by session id.
+- **Strongly-typed event callback system**: `Client.SetEventHandler` / `ClientOptions.EventHandler` (TunnelEstablished, TunnelDied, Reconnecting, TargetDenied); `Server.SetEventHandler` / `ServerOptions.EventHandler` (SessionOpened/Resumed/Closed, AuthRejected, TargetDenied, ReplayDropped). Callbacks dispatch on a dedicated goroutine with recovery and never block the packet-read loop.
+- **Context-ified connection lifecycle**: tunnels expose `Done() <-chan struct{}` and `Err() error`; the `ClientTuning.SessionWindowBytes` comment gains a note on outage duration vs window size.
+
+## 2026-09-06
+
+### Added
+- **WebTransport UDP**: `DialPacketContext` now supports the `wt` transport (UDP datagrams carried over WT streams; the server keeps the UDP socket per session id).
+- **Stats API**: `Client.Stats() *ClientStats` (dials/failures, active count, uplink/downlink bytes, resume count) and `Server.Stats() *ServerStats` (sessions opened/resumed/active, auth failures).
+- **`TunnelError`**: exported type, `HTTPStatus()` recovers the HTTP status when the server rejects; usable with `errors.As(*TunnelError)`.
+- **`ClientTuning.DatagramQueueSize`**: configurable UDP uplink queue depth (default 200).
+- **`DialRequest.Kind`**: `DialKindBusiness` / `DialKindProbe` — probe lanes never trigger real dials, and `TargetDialer` can skip probe requests accordingly.
+
+### Changed
+- **MASQUE paths derived uniformly from `path`**: endpoints become `<path>.well-known/masque/{tcp,udp}/...`; `path=/` yields the standard `/.well-known/masque`. There is no separate MASQUE prefix config anymore.
+- **Default `path` changed from `/tunnel` to `/`**.
+- **Data-plane logging unified on `log/slog`**: `options.Logger` now covers all data-plane logs (previously zap data-plane logs were invisible to embedders).
+
+### Performance
+- h2 uplink flow-control windows raised to 8MB/stream, 32MB/connection (previously x/net's 1MB default starved uplink on high-RTT CDN links).
+- Session downlink frame writes moved out of the global lock: the uplink is no longer cross-locked by downlink network writes (uplink-isolation benchmark ~5×).
+- `readFrame` allocates zero for the frame header (1 heap alloc per DATA frame on the hot path → 0).
+
+### Fixed
+- `Server.Shutdown/Close` did not close externally supplied QUIC PacketConns, so `Serve` never returned in h3/wt/masque deployments.
+
+## 2026-09-05
+
+### Added
+- Embeddable SDK (`Server`/`Client`; `NewServer`/`NewClient` mandate `Authenticator`/`Dialer` to prevent a default open proxy).
+- `ClientOptions.Dialer` / `QUICDialer`: custom underlying sockets (interface binding, VPN protect).
+- `Server.Listeners()`: port discovery for port-0 deployments.
+- Test infrastructure: real-target matrix (HTTP/DNS × all protocols), per-protocol TCP/UDP throughput benchmarks, data-plane microbenchmarks.
+
+### Fixed
+- Data race when swapping the global logger concurrently (zap core-swap approach).
+- Unlocked read/write of `backupLine.ctxCancel`.
+- Windows CI: PowerShell split the `-coverprofile=...` argument; quic-go does not support Windows + race (race only on linux/macos).
+- h2c hijacked connections leaked on Shutdown (now tracked via ConnState and closed).

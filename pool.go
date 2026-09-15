@@ -1,16 +1,16 @@
-package main
+package h2tunnel
 
 import "sync"
 
 var (
-	// tcpBufPool 用于 TCP io.CopyBuffer 的 32KB 缓冲池
+	// tcpBufPool is a 32KB buffer pool for TCP io.CopyBuffer use.
 	tcpBufPool = sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, 32*1024)
 			return &buf
 		},
 	}
-	// udpBufPool 用于 UDP 读取的 64KB 缓冲池
+	// udpBufPool is a 64KB buffer pool for UDP reads.
 	udpBufPool = sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, 65536)
@@ -19,9 +19,9 @@ var (
 	}
 )
 
-// UDPData 用于在 UDP Client 中高效地将携带缓冲池指针的数据投递到 channel
-// 以实现真正的 Zero-Allocation
-type UDPData struct {
+// udpData carries a pool-buffer pointer plus its data so the UDP client can
+// hand packets to a channel with zero allocation.
+type udpData struct {
 	BufPtr *[]byte
 	Data   []byte
 }
