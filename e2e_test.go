@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/rand"
@@ -16,7 +16,7 @@ import (
 )
 
 // =========================================
-// 1. 生成一次性测试证书 (TLS)
+// 1. Generate one-shot test certificates (TLS)
 // =========================================
 func generateTestCerts(certFile, keyFile string) error {
 	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -49,10 +49,97 @@ func generateTestCerts(certFile, keyFile string) error {
 }
 
 // =========================================
-// 2. 启动 Target 回显服务器 (TCP & UDP)
+// 2. Start the Target echo servers (TCP & UDP)
 // =========================================
-func startEchoServer(addr string) {
-	// TCP Echo
+// waitTCPOrTLSReady polls until the TCP port accepts connections (the TLS server
+// handshake completes at the http.Server layer, so a successful TCP accept means
+// the listener is ready).
+// Replaces a fixed sleep: 2s may not be enough on slow CI runners, and locally it would just be wasted waiting.
+func waitTCPOrTLSReady(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("server %s not ready within %v", addr, timeout)
+}
+
+// waitPortReady polls until a TCP port is connectable; takes no *testing.T (for
+// benchmarks / environments without t) and panics on timeout.
+func waitPortReady(addr string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	panic("port " + addr + " not ready within " + timeout.String())
+}
+
+// waitUDPReady probes UDP client readiness with a real echo (local → client → tunnel →
+// echo target → tunnel → client → local). Do not probe by "trying to bind the same
+// port": the probe socket races with the client's ListenUDP, and within that window
+// the client's bind can fail (the legacy path would even Fatal and kill the whole test
+// process). The echo probe has no race and verifies the entire UDP chain along the
+// way. Precondition: the client's target is an echo service (true for all tests).
+func waitUDPReady(t *testing.T, clientAddr string, timeout time.Duration) {
+	t.Helper()
+	conn, err := net.Dial("udp", clientAddr)
+	if err != nil {
+		t.Fatalf("dial udp client %s: %v", clientAddr, err)
+	}
+	defer conn.Close()
+	msg := []byte("udp-ready-probe")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := conn.Write(msg); err != nil {
+			continue
+		}
+		buf := make([]byte, len(msg))
+		n, err := conn.Read(buf)
+		if err == nil && n == len(msg) && string(buf[:n]) == string(msg) {
+			return
+		}
+	}
+	t.Fatalf("udp client %s not ready within %v", clientAddr, timeout)
+}
+
+// waitUDPBound probes that a UDP port is bound without racing (no tunnel data plane
+// is established). Used for scenarios where the server is expected to reject and an
+// echo will never arrive (e.g. network=tcp gating tests).
+// How it works: a connected UDP socket sending to an unlistened port receives an ICMP
+// Port Unreachable, which the kernel turns into a connection-refused error on the
+// *next* read/write — leaving time for the ICMP to arrive between two sends, an error
+// on the second means unbound, success on the second means bound.
+func waitUDPBound(t *testing.T, clientAddr string, timeout time.Duration) {
+	t.Helper()
+	conn, err := net.Dial("udp", clientAddr)
+	if err != nil {
+		t.Fatalf("dial udp client %s: %v", clientAddr, err)
+	}
+	defer conn.Close()
+	probe := []byte("udp-bound-probe")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, _ = conn.Write(probe)
+		time.Sleep(30 * time.Millisecond)
+		if _, wErr := conn.Write(probe); wErr == nil {
+			return
+		}
+	}
+	t.Fatalf("udp client %s not bound within %v", clientAddr, timeout)
+}
+
+func startEchoServer(addr string) { // TCP Echo
 	go func() {
 		l, err := net.Listen("tcp", addr)
 		if err != nil {
@@ -67,7 +154,7 @@ func startEchoServer(addr string) {
 		}
 	}()
 
-	// UDP Echo (缓冲区加大到 64KB，防止大包截断死锁)
+	// UDP Echo (buffer enlarged to 64KB to prevent large-packet truncation deadlock)
 	go func() {
 		uAddr, _ := net.ResolveUDPAddr("udp", addr)
 		conn, err := net.ListenUDP("udp", uAddr)
@@ -75,7 +162,7 @@ func startEchoServer(addr string) {
 			return
 		}
 
-		// 🚨 这里的 65536 是关键！必须大于压测的 payloadSize (16384)
+		// 🚨 The 65536 here is critical! It must be larger than the load-test payloadSize (16384)
 		buf := make([]byte, 65536)
 		for {
 			n, cAddr, err := conn.ReadFromUDP(buf)
@@ -87,10 +174,10 @@ func startEchoServer(addr string) {
 }
 
 // =========================================
-// 3. 终极自动化测试矩阵
+// 3. The ultimate automated test matrix
 // =========================================
 func TestH2TunnelAllModes(t *testing.T) {
-	// 1. 准备环境
+	// 1. Prepare the environment
 	certFile := "test_cert.pem"
 	keyFile := "test_key.pem"
 	generateTestCerts(certFile, keyFile)
@@ -104,22 +191,22 @@ func TestH2TunnelAllModes(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "secret-e2e-token"
 
-	// 2. 启动隧道服务端 (config-only: 直接构造 ServerConfig，避免依赖已移除的 CLI flag)
-	go startServerDirect(ServerConfig{
+	// 2. Start the tunnel server (config-only: build serverConfig directly, avoiding dependency on the removed CLI flags)
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportAll,
-		ExpectedToken: testToken,
-		LogLevel:      "error", // 减少测试时的日志刷屏，想看详细过程可以改为 debug
+		Authenticator: tokenAuth(testToken),
+		LogLevel:      "error", // reduce log spam during tests; change to debug to see the detailed flow
 	})
 
-	// 给服务端一点时间启动
-	time.Sleep(2 * time.Second)
+	// Give the server some time to start (polling wait instead of a fixed sleep: slow CI cold starts make this flaky)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
-	// 3. 测试用例矩阵
+	// 3. Test case matrix
 	type testCase struct {
 		name       string
 		clientPort string
@@ -127,16 +214,16 @@ func TestH2TunnelAllModes(t *testing.T) {
 		args       []string
 	}
 
-	// 3. 测试用例矩阵 (全量覆盖 10 种协议组合)
+	// 3. Test case matrix (full coverage of the 10 protocol combinations)
 	cases := []testCase{
-		// ---- TCP 系列 ----
+		// ---- TCP series ----
 		{"H2_TCP", "20001", false, []string{}},
 		{"gRPC_TCP", "20002", false, []string{"-grpc"}},
 		{"H3_TCP", "20003", false, []string{"-h3"}},
 		{"WT_TCP", "20004", false, []string{"-wt"}},
 		{"MASQUE_TCP", "20005", false, []string{"-masque"}},
 
-		// ---- UDP 系列 ----
+		// ---- UDP series ----
 		{"H2_UDP_Stream", "20006", true, []string{"-udp"}},
 		{"gRPC_UDP_Stream", "20007", true, []string{"-udp", "-grpc"}},
 		{"H3_UDP_Stream", "20008", true, []string{"-udp", "-h3"}},
@@ -144,13 +231,13 @@ func TestH2TunnelAllModes(t *testing.T) {
 		{"MASQUE_UDP", "20010", true, []string{"-udp", "-masque"}},
 	}
 
-	// 4. 执行测试矩阵
+	// 4. Run the test matrix
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clientListen := "127.0.0.1:" + tc.clientPort
 
-			// 启动对应的客户端 (config-only: 协议开关从 tc.args 映射到 ClientConfig 字段)
-			cc := ClientConfig{
+			// Start the matching client (config-only: protocol switches from tc.args mapped to clientConfig fields)
+			cc := clientConfig{
 				ListenAddr: clientListen,
 				ServerUrl:  serverURL,
 				Path:       "/tunnel",
@@ -174,9 +261,13 @@ func TestH2TunnelAllModes(t *testing.T) {
 				}
 			}
 			go startClientDirect(cc)
-			time.Sleep(1 * time.Second) // 等待客户端监听就绪
+			if tc.isUDP {
+				waitUDPReady(t, clientListen, 30*time.Second)
+			} else {
+				waitTCPOrTLSReady(t, clientListen, 30*time.Second)
+			}
 
-			// 发起真实数据测试
+			// Run a real data test
 			testMsg := []byte(fmt.Sprintf("Hello h2tunnel via %s", tc.name))
 			var conn net.Conn
 			var err error
@@ -188,39 +279,39 @@ func TestH2TunnelAllModes(t *testing.T) {
 			}
 
 			if err != nil {
-				t.Fatalf("无法连接到本地客户端监听端口: %v", err)
+				t.Fatalf("cannot connect to the local client listen port: %v", err)
 			}
 			defer conn.Close()
 
-			// 设置超时防止测试卡死
+			// set a timeout so the test cannot hang
 			conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-			// 发送测试数据
+			// send test data
 			_, err = conn.Write(testMsg)
 			if err != nil {
-				t.Fatalf("数据发送失败: %v", err)
+				t.Fatalf("data send failed: %v", err)
 			}
 
-			// 读取回显数据
+			// read the echoed data
 			buf := make([]byte, 1024)
 			n, err := conn.Read(buf)
 			if err != nil {
-				t.Fatalf("数据接收失败 (未收到回显): %v", err)
+				t.Fatalf("data receive failed (no echo received): %v", err)
 			}
 
-			// 校验数据完整性
+			// verify data integrity
 			if string(buf[:n]) != string(testMsg) {
-				t.Fatalf("数据损坏! 预期: %s, 实际收到: %s", testMsg, buf[:n])
+				t.Fatalf("data corrupted! expected: %s, actually received: %s", testMsg, buf[:n])
 			}
 
-			t.Logf("✅ 完美通过!")
+			t.Logf("✅ passed perfectly!")
 		})
 	}
 }
 
 // =========================================
-// 4. 模拟真实非 Echo 服务交互测试 (如 SSH 协议握手)
-// 验证 Padding 在真实服务端被正确解封装与封装，绝无数据污染
+// 4. Realistic non-Echo service interaction test (e.g. SSH protocol handshake)
+// Verifies Padding is correctly unwrapped and wrapped on a real server, with no data pollution
 // =========================================
 func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 	certFile := "test_cert_realistic.pem"
@@ -234,10 +325,10 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "realistic-token"
 
-	// 启动非 Echo 模拟服务 (服务端先发送 Banner，再交互)
+	// start the non-Echo mock service (server sends a Banner first, then interacts)
 	ln, err := net.Listen("tcp", targetAddr)
 	if err != nil {
-		t.Fatalf("无法监听测试服务端口: %v", err)
+		t.Fatalf("cannot listen on the test service port: %v", err)
 	}
 	defer ln.Close()
 
@@ -251,37 +342,37 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 				defer conn.Close()
 				conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-				// 1. 服务端先主动向客户端发送 SSH-Banner
+				// 1. server proactively sends the SSH-Banner to the client first
 				_, _ = conn.Write([]byte("SSH-2.0-OpenSSH_9.0\r\n"))
 
-				// 2. 服务端读取客户端发来的 Client-Banner
+				// 2. server reads the Client-Banner sent by the client
 				buf := make([]byte, 100)
 				n, err := conn.Read(buf)
 				if err != nil || string(buf[:n]) != "SSH-2.0-CustomClient\r\n" {
 					return
 				}
 
-				// 3. 服务端回复确认包
+				// 3. server replies with a confirmation packet
 				_, _ = conn.Write([]byte("SERVER_HANDSHAKE_OK\r\n"))
 			}(c)
 		}
 	}()
 
-	// 启动 H2Tunnel 服务端
-	go startServerDirect(ServerConfig{
+	// start the H2Tunnel server
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportH2,
-		ExpectedToken: testToken,
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
 	clientListen := "127.0.0.1:21001"
-	go startClientDirect(ClientConfig{
+	go startClientDirect(clientConfig{
 		ListenAddr: clientListen,
 		ServerUrl:  serverURL,
 		Path:       "/tunnel",
@@ -290,46 +381,46 @@ func TestH2Tunnel_NonEchoService_Realistic(t *testing.T) {
 		Token:      testToken,
 		LogLevel:   "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 	conn, err := net.Dial("tcp", clientListen)
 	if err != nil {
-		t.Fatalf("连接客户端失败: %v", err)
+		t.Fatalf("failed to connect to the client: %v", err)
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	// 1. 客户端应该先读取到服务端主动下发的 Banner
+	// 1. the client should first read the Banner proactively pushed down by the server
 	serverBanner := make([]byte, 21)
 	_, err = io.ReadFull(conn, serverBanner)
 	if err != nil {
-		t.Fatalf("读取服务端 Banner 失败: %v", err)
+		t.Fatalf("failed to read server Banner: %v", err)
 	}
 	if string(serverBanner) != "SSH-2.0-OpenSSH_9.0\r\n" {
-		t.Fatalf("服务端 Banner 损坏! 收到: %q", string(serverBanner))
+		t.Fatalf("server Banner corrupted! received: %q", string(serverBanner))
 	}
 
-	// 2. 客户端发送 Client-Banner
+	// 2. client sends the Client-Banner
 	_, err = conn.Write([]byte("SSH-2.0-CustomClient\r\n"))
 	if err != nil {
-		t.Fatalf("发送客户端 Banner 失败: %v", err)
+		t.Fatalf("failed to send client Banner: %v", err)
 	}
 
-	// 3. 客户端读取服务端二次回复
+	// 3. client reads the server's second reply
 	reply := make([]byte, 21)
 	_, err = io.ReadFull(conn, reply)
 	if err != nil {
-		t.Fatalf("读取确认回复失败: %v", err)
+		t.Fatalf("failed to read confirmation reply: %v", err)
 	}
 	if string(reply) != "SERVER_HANDSHAKE_OK\r\n" {
-		t.Fatalf("确认回复损坏! 收到: %q", string(reply))
+		t.Fatalf("confirmation reply corrupted! received: %q", string(reply))
 	}
 
-	t.Log("✅ 真实非 Echo 协议全双工握手测试完美通过！")
+	t.Log("✅ realistic non-Echo protocol full-duplex handshake test passed perfectly!")
 }
 
 // =========================================
-// 5. 严格协议分流与网络类型门禁测试 (Strict Demux)
+// 5. Strict protocol demux and network-type gating tests (Strict Demux)
 // =========================================
 func TestH2Tunnel_StrictDemux(t *testing.T) {
 	certFile := "test_cert_demux.pem"
@@ -345,74 +436,74 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 	serverURL := "https://" + serverAddr
 	testToken := "demux-token"
 
-	// 启动严格模式服务端：仅允许 gRPC 且仅允许 TCP
-	go startServerDirect(ServerConfig{
+	// start the strict-mode server: gRPC only and TCP only
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
-		Transport:     "grpc", // 严格限定必须为 gRPC
-		Network:       "tcp",  // 严格限定只允许 TCP，拒绝 UDP
-		ExpectedToken: testToken,
+		Transport:     "grpc", // strictly require gRPC
+		Network:       "tcp",  // strictly allow TCP only, reject UDP
+		Authenticator: tokenAuth(testToken),
 		LogLevel:      "error",
 	})
-	time.Sleep(1 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 
-	// 测试用例 1: 客户端未开启 gRPC 发起 H2 POST 请求 -> 应被服务端严格分流拦截 (403)
+	// Test case 1: client without gRPC sends an H2 POST request -> should be intercepted by the server's strict demux (403)
 	t.Run("Reject_Non_gRPC_When_Server_Requires_gRPC", func(t *testing.T) {
 		clientListen := "127.0.0.1:22001"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			Transport:  transportH2, // 故意不使用 gRPC
+			Transport:  transportH2, // deliberately not using gRPC
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(3 * time.Second))
 
 		_, err = conn.Write([]byte("ping"))
 		if err != nil {
-			t.Fatalf("写入失败: %v", err)
+			t.Fatalf("write failed: %v", err)
 		}
 
 		buf := make([]byte, 100)
 		_, err = conn.Read(buf)
-		// 远端返回 403 导致隧道握手失败，本地连接被立即关闭 (EOF)
+		// the remote returns 403 so the tunnel handshake fails and the local connection is closed immediately (EOF)
 		if err == nil {
-			t.Fatalf("预期连接应被服务端严格拦截并关闭，但成功读取到了数据: %s", string(buf))
+			t.Fatalf("connection expected to be strictly intercepted and closed by the server, but data was read successfully: %s", string(buf))
 		}
-		t.Log("✅ 非 gRPC 请求被严格模式成功拦截！")
+		t.Log("✅ non-gRPC request successfully intercepted by strict mode!")
 	})
 
-	// 测试用例 2: 客户端开启 gRPC 发起请求 -> 应顺利通过
+	// Test case 2: client with gRPC enabled sends a request -> should pass through
 	t.Run("Accept_gRPC_When_Server_Requires_gRPC", func(t *testing.T) {
 		clientListen := "127.0.0.1:22002"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
-			Transport:  transportGRPC, // 正确使用 gRPC
+			Transport:  transportGRPC, // correctly using gRPC
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		waitTCPOrTLSReady(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("tcp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(3 * time.Second))
@@ -420,53 +511,54 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 		testMsg := []byte("Hello Strict gRPC")
 		_, err = conn.Write(testMsg)
 		if err != nil {
-			t.Fatalf("写入失败: %v", err)
+			t.Fatalf("write failed: %v", err)
 		}
 
 		buf := make([]byte, 100)
 		n, err := conn.Read(buf)
 		if err != nil {
-			t.Fatalf("读取回显失败: %v", err)
+			t.Fatalf("failed to read echo: %v", err)
 		}
 		if string(buf[:n]) != string(testMsg) {
-			t.Fatalf("数据不匹配: %s != %s", buf[:n], testMsg)
+			t.Fatalf("data mismatch: %s != %s", buf[:n], testMsg)
 		}
-		t.Log("✅ 合规的 gRPC 请求成功通行！")
+		t.Log("✅ compliant gRPC request passed through successfully!")
 	})
 
-	// 测试用例 3: 客户端尝试发送 UDP 数据 -> 应被服务端限制 Network="tcp" 拦截
+	// Test case 3: client tries to send UDP data -> should be blocked by the server's Network="tcp" restriction
 	t.Run("Reject_UDP_When_Server_Requires_TCP_Only", func(t *testing.T) {
 		clientListen := "127.0.0.1:22003"
-		go startClientDirect(ClientConfig{
+		go startClientDirect(clientConfig{
 			ListenAddr: clientListen,
 			ServerUrl:  serverURL,
 			Path:       "/tunnel",
 			TargetAddr: targetAddr,
 			Insecure:   true,
 			Transport:  transportGRPC,
-			Network:    "udp", // 请求 UDP
+			Network:    "udp", // requests UDP
 			Token:      testToken,
 			LogLevel:   "error",
 		})
-		time.Sleep(500 * time.Millisecond)
+		// expect the server to reject UDP: no echo will ever arrive, so only verify the client port is bound
+		waitUDPBound(t, clientListen, 30*time.Second)
 
 		conn, err := net.Dial("udp", clientListen)
 		if err != nil {
-			t.Fatalf("连接本地客户端失败: %v", err)
+			t.Fatalf("failed to connect to the local client: %v", err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 		_, err = conn.Write([]byte("udp ping"))
 		if err != nil {
-			t.Fatalf("UDP 写入失败: %v", err)
+			t.Fatalf("UDP write failed: %v", err)
 		}
 
 		buf := make([]byte, 100)
 		_, err = conn.Read(buf)
 		if err == nil {
-			t.Fatalf("预期 UDP 请求应被服务端拒绝无回显，但收到了数据")
+			t.Fatalf("UDP request expected to be rejected by the server with no echo, but data was received")
 		}
-		t.Log("✅ 违规的 UDP 请求被服务端成功拦截！")
+		t.Log("✅ non-compliant UDP request successfully intercepted by the server!")
 	})
 }

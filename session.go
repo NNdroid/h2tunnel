@@ -1,10 +1,12 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -14,111 +16,190 @@ import (
 )
 
 // =========================================
-// session.go — 服务端会话表 + 恢复调度
+// session.go — server-side session table + resume scheduling
 //
-// 每个 resume 模式的隧道会话对应一条服务端与 targetConn 的双向字节流，
-// 跨多次 HTTP 流重建保持：
-//   - targetConn：长连接到目标服务（SSH 等），不因 HTTP 流中断而关闭
-//   - 下行缓冲 ring：服务端 targetConn.Read 出的字节帧化后双写：
-//                   ① 当前活跃 HTTP 流（如果有），② ring 缓冲
-//     流断时只停 ①，② 继续；新流 resume 时从 ring 补发缺口
-//   - 上行：HTTP body 解出 seq 帧，按 seq 连续提交给 targetConn；
-//           客户端在恢复请求中带下行收到的 seq，服务端响应上行已收的 seq
-//     会话恢复上限：服务端上行收到 X，客户端应在 X 处续传（不能更早）
+// Each resume-mode tunnel session corresponds to a bidirectional byte
+// stream between the server and targetConn, kept across HTTP stream
+// rebuilds:
+//   - targetConn: long-lived connection to the target service (SSH etc.),
+//     not closed when the HTTP stream drops
+//   - downlink ring buffer: bytes read from targetConn are framed and
+//     dual-written: 1) to the current active HTTP stream (if any),
+//     2) to the ring buffer. When the stream dies only 1) stops, 2)
+//     continues; a new stream resuming replays the gap from the ring
+//   - uplink: HTTP body yields seq frames, committed to targetConn in seq
+//     order; the client includes the downlink seq it received in the
+//     resume request and the server replies with the uplink seq already
+//     received. Resume bound: the server received uplink X, so the client
+//     must continue at X (never earlier).
 // =========================================
 
 const (
-	sessionIdleTimeout = 60 * time.Second // 无活跃流的最长保留时间
+	sessionIdleTimeout = 60 * time.Second // max retention without an active stream
 	sessionCleanupTick = 10 * time.Second
 )
 
-// tunnelSession 服务端会话
+// tunnelSession is a server-side session.
 //
-// 同一套会话表同时服务两类数据模型：
+// One session table serves two data models at once:
 //
-//	stream   —— TCP / SSH 等有序字节流。跨流重建用 seq + ring 重放补缺，
-//	           上行按 seq 连续校验（缺口不可恢复）。
-//	datagram —— UDP 等数据报。UDP 本身无序可丢，逐字节 seq 重放无意义
-//	           甚至有害（会重发已发出的包），因此只做「保持 targetConn
-//	           socket 存活 + 跨流重建」，不做重放。
+//	stream   — ordered byte streams such as TCP / SSH. Cross-stream rebuild
+//	           uses seq + ring replay to fill gaps; uplink is checked for
+//	           seq continuity (gaps are unrecoverable).
+//	datagram — datagrams such as UDP. UDP itself is unordered and lossy, so
+//	           per-byte seq replay is meaningless or even harmful (it would
+//	           resend already-sent packets); we only keep the targetConn
+//	           socket alive across stream rebuilds — no replay.
 //
-// kind 在 prepareResumeSession 拨号前由 GetXNetwork 决定并写入。
+// kind is decided by getXNetwork and written before dialing in
+// prepareResumeSession.
 type tunnelSession struct {
 	id        string
 	createdAt time.Time
-	lastSeen  time.Time // 最后一次活跃（用于超时回收）
-	datagram  bool      // true = UDP 数据报模式（无 seq 重放）
+	lastSeen  time.Time // last activity (for timeout reaping)
+	datagram  bool      // true = UDP datagram mode (no seq replay)
+	network   string    // "tcp" / "udp" (shown in events and logs)
+	events    *serverEventSink
+	logger    *slog.Logger // instance logger (from Server options, nil → discard)
+	binding   sessionBinding
 
 	mu              sync.Mutex
 	targetConn      net.Conn
 	targetCloseOnce sync.Once
 
-	// 下行：服务端 targetConn → HTTP 流 / ring buffer
-	downlinkSent uint64 // 累计写给客户端的字节
+	// downlink: server targetConn → HTTP stream / ring buffer
+	downlinkSent uint64 // bytes written to the client, cumulative
 	downlinkRing *ringBuffer
-	activeWriter *resumeSessionWriter // 当前活跃流下行 writer；nil 表示无流
+	activeWriter *resumeSessionWriter // downlink writer of the current active stream; nil = no stream
 	closed       bool
 
-	// 上行：客户端 → targetConn。按 seq 累计连续接收（缺口不可恢复）。
-	// datagram 模式不使用（UDP 无顺序保证）。
+	// downlinkMu serializes downlink frame writes (replay vs live) so the
+	// client sees strictly continuous downlink seq; frameSentSeq records
+	// the end already written to the current active stream.
+	// Network writes happen under this lock, never holding s.mu — avoids
+	// cross-locking with the uplink (T2 split).
+	downlinkMu   sync.Mutex
+	frameSentSeq uint64
+
+	// uplink: client → targetConn, accumulated in seq order (gaps are
+	// unrecoverable). Unused in datagram mode (UDP has no ordering).
 	uplinkRecv uint64
 
-	// frameW / frameR 数据面封装：stream 模式为 nil（走 writeResumeFrame /
-	// readResumeFrame + seq 校验），datagram 模式为非 nil（走 writeUDPPacket /
-	// readUDPPacket 或 masque 的 writeUDPCapsule / readUDPCapsule）。
+	// frameW / frameR data-plane wrappers: stream mode is nil (uses
+	// writeResumeFrame / readResumeFrame + seq checks), datagram mode is
+	// non-nil (uses writeUDPPacket / readUDPPacket, or masque's
+	// writeUDPCapsule / readUDPCapsule).
 	frameW func(io.Writer, []byte) error
 	frameR func(io.Reader, []byte) (int, error)
 }
 
-// writeDownlink 向活跃流 + ring 写入一段下行数据。
+// writeDownlink writes one downlink chunk to the active stream + ring.
 //
-// stream 模式：写活跃流 + 写 ring（供断线重放），字节累计。
-// datagram 模式：data 是一个完整的 UDP 包（targetConn.Read 一次返回一个包），
+// stream mode: write the active stream + write the ring (for disconnect
+// replay), accumulating bytes.
+// datagram mode: data is one complete UDP packet (targetConn.Read returns a
 //
-//	经 frameW 封装成 wire 帧后写活跃流；不写 ring（UDP 无重放），
-//	downlinkSent 语义从「字节累计」退化为「仅累计（非连续坐标系，不用于重放）」。
+//	whole packet per call); wrapped into a wire frame by frameW and written
+//	to the active stream; the ring is not written (UDP has no replay), so
+//	downlinkSent degrades from "byte accumulation" to a mere counter (a
+//	non-contiguous coordinate, never used for replay).
 //
-// 若无活跃流：stream 模式写 ring 等下次续传；datagram 模式直接丢弃该包
-// （客户端断线期间到达的 UDP 包无可恢复意义，重放反而错乱）。
-// 返回写入的字节数。
+// With no active stream: stream mode writes the ring and waits for the next
+// resume; datagram mode drops the packet (UDP packets arriving during a
+// client disconnect have no recoverable meaning, and replaying them would
+// corrupt the stream). Returns the bytes written.
+//
+// Lock order: s.mu only guards state decisions / ring appends / seq
+// allocation (pure in-memory work, hold time unrelated to the network);
+// network writes happen under downlinkMu — the original implementation held
+// s.mu across network writes, which also froze uplink acceptUplinkSeq and
+// made both directions cross-lock at full-duplex throughput.
 func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return 0, net.ErrClosed
 	}
-	s.downlinkSent += uint64(len(data))
-	if s.datagram {
-		// UDP：封装成 wire 帧写活跃流；无流则丢（跨流不重放）。
-		if s.activeWriter == nil {
+	writer := s.activeWriter
+	datagram := s.datagram
+	if datagram {
+		// UDP: wrap into a wire frame and write the active stream; drop with
+		// no stream (no replay across streams).
+		s.downlinkSent += uint64(len(data))
+		s.mu.Unlock()
+		if writer == nil {
 			return len(data), nil
 		}
-		if err := s.frameW(&resumeWriterAdapter{w: s.activeWriter}, data); err != nil {
-			s.activeWriter = nil
+		s.downlinkMu.Lock()
+		err := s.frameW(&resumeWriterAdapter{w: writer}, data)
+		s.downlinkMu.Unlock()
+		if err != nil {
+			s.clearActiveWriter(writer)
 		}
 		return len(data), nil
 	}
+	// stream mode: append to the ring before allocating seq — guarantees
+	// every byte with seq < downlinkSent is already in the ring (replay
+	// reads never hit a hole). Append is a pure in-memory copy.
 	s.downlinkRing.Append(data)
-	if s.activeWriter != nil {
-		// 本段的起始 seq = downlinkSent - len(data)（downlinkSent 刚自增）。
-		// 写 resume 帧（客户端 readResumeFrame 按 seq 解析）。
-		seq := s.downlinkSent - uint64(len(data))
-		if _, err := s.activeWriter.writeFrame(seq, data); err != nil {
-			// 流挂了不致命：ring 已写，下次流接上时从下行 seq 续传
-			s.activeWriter = nil
-		}
+	seq := s.downlinkSent
+	s.downlinkSent += uint64(len(data))
+	s.mu.Unlock()
+
+	if writer == nil {
+		return len(data), nil
+	}
+
+	// downlinkMu serializes the frame order of "replay vs live": while the
+	// replay holds the lock, live frames from the pump queue behind it; once
+	// the replay finishes, frameSentSeq advances to the replay end, and
+	// queued frames overlapping the replay window (seq allocated but not yet
+	// written — the race window) are skipped, so the seq the client sees
+	// stays strictly continuous.
+	s.downlinkMu.Lock()
+	if seq+uint64(len(data)) <= s.frameSentSeq {
+		s.downlinkMu.Unlock()
+		return len(data), nil
+	}
+	// This chunk's start seq = seq. Write a resume frame (the client's
+	// readResumeFrame parses by seq).
+	_, err := writer.writeFrame(seq, data)
+	if err == nil {
+		s.frameSentSeq = seq + uint64(len(data))
+	}
+	s.downlinkMu.Unlock()
+	if err != nil {
+		// A dead stream is not fatal: the ring holds the data, the next
+		// stream resumes from the downlink seq.
+		s.clearActiveWriter(writer)
 	}
 	return len(data), nil
 }
 
-// setActiveWriter 设置当前活跃流的下行 writer
+// lg returns the session table logger (nil-safe).
+func (t *sessionTable) lg() *slog.Logger {
+	if t.logger != nil {
+		return t.logger
+	}
+	return discardLogger
+}
+
+// lg returns the session instance logger (nil-safe, falls back to discard).
+func (s *tunnelSession) lg() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return discardLogger
+}
+
+// setActiveWriter sets the downlink writer of the current active stream.
 func (s *tunnelSession) setActiveWriter(w *resumeSessionWriter) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.activeWriter = w
 }
 
-// clearActiveWriter 流关闭时清空
+// clearActiveWriter clears it when the stream closes.
 func (s *tunnelSession) clearActiveWriter(w *resumeSessionWriter) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,21 +208,25 @@ func (s *tunnelSession) clearActiveWriter(w *resumeSessionWriter) {
 	}
 }
 
-// replayDownlink 从 fromSeq 起将已写入 ring 但未到达客户端的字节
-// 补发到当前活跃 writer。不再 Append ring（避免重复）。
-// 若 ring 窗口已被覆盖（fromSeq < windowStart），返回 ErrGap。
+// replayDownlink re-sends, from fromSeq, the bytes written into the ring but
+// not yet delivered to the client, into the current active writer. Does not
+// Append the ring again (avoids duplication). If the ring window was already
+// overwritten (fromSeq < windowStart), returns errGap.
 //
-// ⚠️ 并发约束：重放期间必须持有 s.mu。downlinkPump 的 writeDownlink 同样需要
-// s.mu 才能写 activeWriter；持锁期间 pump 的实时下行写被阻塞，保证「重放帧」
-// 与「实时下行帧」不会并发写入同一条流（否则帧交叠 + seq 乱序，客户端判 ErrGap
-// 直接断流）。锁内 downlinkSent 被冻结，重放完成后 pump 的实时帧从 target 处
-// 无缝续传，既不缺口也不重复。
-// 写失败时由 writeDownlink 和调用方的 defer 清理 activeWriter；writer 不会
-// 在持有自身锁时反向调用 session，避免与这里的锁顺序发生死锁。
-func (s *tunnelSession) replayDownlink(w *resumeSessionWriter, fromSeq uint64) error {
+// The caller MUST hold downlinkMu: sharing that lock with writeDownlink's
+// live frames guarantees the client sees strictly continuous downlink seq
+// (replay and live frames never interleave). While the lock is held, frames
+// whose seq writeDownlink already allocated queue outside the lock, and the
+// part overlapping the replay window is skipped via frameSentSeq. On write
+// failure, writeDownlink and the caller's defer clean up activeWriter; the
+// writer never calls back into the session while holding its own lock.
+func (s *tunnelSession) replayDownlinkLocked(w *resumeSessionWriter, fromSeq uint64) error {
+	// downlinkSent is written inside writeDownlink's s.mu section; the replay
+	// side runs under downlinkMu without s.mu, so it must snapshot first
+	// (the lock order is fixed downlinkMu→s.mu, one-way, cycle-free).
 	s.mu.Lock()
 	target := s.downlinkSent
-	defer s.mu.Unlock()
+	s.mu.Unlock()
 	if fromSeq >= target {
 		return nil
 	}
@@ -155,8 +240,8 @@ func (s *tunnelSession) replayDownlink(w *resumeSessionWriter, fromSeq uint64) e
 			}
 			seq += uint64(n)
 		}
-		if errors.Is(err, ErrGap) {
-			return ErrGap
+		if errors.Is(err, errGap) {
+			return errGap
 		}
 		if err != nil {
 			return err
@@ -165,12 +250,33 @@ func (s *tunnelSession) replayDownlink(w *resumeSessionWriter, fromSeq uint64) e
 			break
 		}
 	}
+	if s.frameSentSeq < seq {
+		s.frameSentSeq = seq
+	}
 	return nil
 }
 
-// acceptUplinkSeq 接受一个上行帧的 seq+data，校验连续性，
-// 连续则提交到 targetConn 并推进 uplinkRecv。
-// datagram 模式：data 是一个已解出的 UDP 包，直接提交，不校验 seq。
+// attachAndReplay atomically performs "attach the active writer + replay the
+// downlink" under downlinkMu. Atomicity is required: if the pump grabs
+// downlinkMu between setActiveWriter and the replay, live frames would cut in
+// before replay frames and the client would immediately see a seq jump
+// (ErrGap). The returned error only reports replay failure (gap / write
+// error); attaching the writer always succeeds.
+func (s *tunnelSession) attachAndReplay(writer *resumeSessionWriter, fromSeq uint64) error {
+	s.downlinkMu.Lock()
+	defer s.downlinkMu.Unlock()
+	s.setActiveWriter(writer)
+	if s.datagram {
+		// datagram has no replay (UDP has no seq coordinate system).
+		return nil
+	}
+	return s.replayDownlinkLocked(writer, fromSeq)
+}
+
+// acceptUplinkSeq accepts one uplink frame's seq+data, checks continuity,
+// and — when contiguous — commits it to targetConn and advances uplinkRecv.
+// datagram mode: data is an already-decoded UDP packet, committed directly
+// with no seq check.
 func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,7 +296,8 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 	expected := s.uplinkRecv
 	switch {
 	case seq < expected:
-		// 客户端重发了已收到的字节（恢复初期），按预期截掉头部重复部分
+		// The client re-sent bytes already received (early in recovery);
+		// trim the duplicated head as expected.
 		skip := int(expected - seq)
 		if skip >= len(data) {
 			s.lastSeen = time.Now()
@@ -198,8 +305,8 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 		}
 		data = data[skip:]
 	case seq > expected:
-		// 客户端跳了 seq：缺口不可恢复
-		return ErrResumeBadSeq
+		// The client skipped seq: the gap is unrecoverable.
+		return errResumeBadSeq
 	}
 	if _, err := s.targetConn.Write(data); err != nil {
 		return err
@@ -209,15 +316,28 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 	return nil
 }
 
-// sessionTable 全局会话表
+// sessionTable is the server-side session table (instance-level, owned by a
+// Server; embedded libraries do not share tables across Servers).
 type sessionTable struct {
-	mu       sync.Mutex
-	sessions map[string]*tunnelSession
+	events      *serverEventSink
+	logger      *slog.Logger
+	padding     paddingPolicy
+	mu          sync.Mutex
+	sessions    map[string]*tunnelSession
+	idleTimeout time.Duration
 }
 
-var globalSessionTable = &sessionTable{sessions: make(map[string]*tunnelSession)}
+type sessionBinding struct {
+	network     string
+	target      string
+	principalID string
+}
 
-var ErrSessionIDRequired = errors.New("resume session id is required")
+func (b sessionBinding) matches(other sessionBinding) bool {
+	return b.network == other.network && b.target == other.target && b.principalID == other.principalID
+}
+
+var errSessionIDRequired = errors.New("resume session id is required")
 
 func newSessionID() string {
 	var b [16]byte
@@ -225,12 +345,17 @@ func newSessionID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// getOrCreate 查表：存在则续传，不存在则新开会话。
-// dialTarget 是拨号函数（测试时可注入）。
-// datagram/frameW/frameR 仅在新建会话时使用（datagram 为 true 时设置数据面封装）。
+// getOrCreate looks up the table: resume if it exists, open a new session
+// otherwise. dialTarget is the dial function (injectable in tests).
+// datagram/frameW/frameR are only used when creating a new session (the
+// data-plane wrappers are set when datagram is true).
 func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error), sizeKB int, datagram bool, frameW func(io.Writer, []byte) error, frameR func(io.Reader, []byte) (int, error)) (*tunnelSession, bool, error) {
+	return t.getOrCreateBound(id, sessionBinding{}, dialTarget, sizeKB, datagram, frameW, frameR)
+}
+
+func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialTarget func() (net.Conn, error), sizeKB int, datagram bool, frameW func(io.Writer, []byte) error, frameR func(io.Reader, []byte) (int, error)) (*tunnelSession, bool, error) {
 	if strings.TrimSpace(id) == "" {
-		return nil, false, ErrSessionIDRequired
+		return nil, false, errSessionIDRequired
 	}
 
 	// Do not hold the table lock while dialing: a slow/unreachable target must
@@ -238,7 +363,11 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 	t.mu.Lock()
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
+		bindingMatches := existing.binding.matches(binding)
 		alive := !existing.closed && existing.targetConn != nil
+		if !bindingMatches {
+			return nil, false, fmt.Errorf("%w: resume session identity changed", ErrForbidden)
+		}
 		if alive {
 			existing.lastSeen = time.Now()
 		}
@@ -256,11 +385,15 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 		return nil, false, err
 	}
 	s := &tunnelSession{
+		logger:       t.logger,
 		id:           id,
 		createdAt:    time.Now(),
+		network:      binding.network,
+		events:       t.events,
 		lastSeen:     time.Now(),
 		targetConn:   tconn,
 		datagram:     datagram,
+		binding:      binding,
 		frameW:       frameW,
 		frameR:       frameR,
 		downlinkRing: newRingBuffer(sizeKB),
@@ -271,7 +404,11 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 	t.mu.Lock()
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
+		bindingMatches := existing.binding.matches(binding)
 		alive := !existing.closed && existing.targetConn != nil
+		if !bindingMatches {
+			return nil, false, fmt.Errorf("%w: resume session identity changed", ErrForbidden)
+		}
 		if alive {
 			existing.lastSeen = time.Now()
 		}
@@ -290,24 +427,29 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 	return s, true, nil
 }
 
-// remove 显式清理（会话结束或超时）
+// remove clears a session explicitly (ended or timed out).
 func (t *sessionTable) remove(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.sessions, id)
 }
 
-// reapIdle 周期性回收空闲超时的会话（默认 60s 无活跃流）
+// reapIdle periodically reaps sessions that exceeded the idle timeout
+// (default: 60s without an active stream).
 func (t *sessionTable) reapIdle() {
 	t.mu.Lock()
 	now := time.Now()
+	idleTimeout := t.idleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = sessionIdleTimeout
+	}
 	var toRemove []string
 	for id, s := range t.sessions {
 		s.mu.Lock()
 		idle := now.Sub(s.lastSeen)
 		dead := s.closed || s.targetConn == nil
 		s.mu.Unlock()
-		if dead || idle > sessionIdleTimeout {
+		if dead || idle > idleTimeout {
 			toRemove = append(toRemove, id)
 		}
 	}
@@ -330,7 +472,7 @@ func (t *sessionTable) removeLocked(id string) *tunnelSession {
 	return s
 }
 
-// close 关掉 targetConn 并标记 closed
+// close closes targetConn and marks the session closed.
 func (s *tunnelSession) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -342,16 +484,18 @@ func (s *tunnelSession) close() {
 	})
 }
 
-// touch 更新最后活跃时间
+// touch updates the last-activity time.
 func (s *tunnelSession) touch() {
 	s.mu.Lock()
 	s.lastSeen = time.Now()
 	s.mu.Unlock()
 }
 
-// downlinkPump 后台泵：从 targetConn 读出数据并写入 session buffer（+活跃流）。
-// 它独立于任何 HTTP 请求线程，跨流重建依然工作——targetConn 持续被读取，
-// 数据持续写入 ring，待下次流建立时从 seq 补发。
+// downlinkPump is the background pump: it reads from targetConn and writes
+// into the session buffer (+ active stream). It runs independently of any
+// HTTP request goroutine and keeps working across stream rebuilds —
+// targetConn is read continuously, data keeps going into the ring, and the
+// next stream resumes from seq.
 func (s *tunnelSession) downlinkPump() {
 	bufPtr := tcpBufPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -359,26 +503,32 @@ func (s *tunnelSession) downlinkPump() {
 	defer s.close()
 
 	for {
-		// 给 targetConn 设 5 分钟读超时；若会话空闲超时（60s）由
-		// sessionTable.reapIdle 主动关闭本会话 → Read 返回 err 退出。
+		// Give targetConn a 5-minute read deadline; when the session idle
+		// timeout (60s) hits, sessionTable.reapIdle closes the session
+		// proactively → Read returns an error and the pump exits.
 		_ = s.targetConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		// Datagram reads preserve one complete UDP message. Stream shaping is
+		// centralized in resumeSessionWriter, so live and replayed bytes follow
+		// the same record policy without increasing target read syscalls.
 		n, err := s.targetConn.Read(buf)
 		if n > 0 {
 			s.writeDownlink(buf[:n])
 			s.touch()
 		}
 		if err != nil {
-			// targetConn 死或超时：停泵。
-			// stream 模式：目标 EOF 时发 END 帧给当前活跃流，通知客户端会话结束。
-			// datagram 模式：不发 END（客户端读侧 frameR 只会解析 UDP 数据报，
-			//   END 帧会被当成非法包解析而破坏流）；客户端读到流 EOF 自然触发重连。
+			// targetConn died or timed out: stop the pump.
+			// stream mode: on target EOF send an END frame to the active
+			// stream, telling the client the session ended.
+			// datagram mode: no END (the client's frameR only parses UDP
+			// datagrams, an END frame would be parsed as an invalid packet and
+			// corrupt the stream); the client reads stream EOF and reconnects.
 			if !s.datagram {
 				s.mu.Lock()
 				writer := s.activeWriter
 				closed := s.closed
 				s.mu.Unlock()
 				if writer != nil && !closed {
-					// 尝试发 END（若流还活着）
+					// Try to send END (if the stream is still alive).
 					_ = writer.writeEnd()
 				}
 			}
@@ -387,21 +537,24 @@ func (s *tunnelSession) downlinkPump() {
 	}
 }
 
-// —— 活跃流下行 writer ——
-// 同一时刻只有一个活跃流能写下行；活跃流由新流建立时设置，
-// 流断（写失败或上下文取消）时清空。
+// —— active-stream downlink writer ——
+// Only one stream can write the downlink at a time; it is set when a new
+// stream is established and cleared when the stream dies (write failure or
+// context cancellation).
 type resumeSessionWriter struct {
-	// w 是当前活跃流的下行写目标。h2/grpc/masque 传 http.ResponseWriter
-	//（io.Writer 子集，flusher 可用）；wt 传 webtransport.Stream（自带流式写）。
+	// w is the active stream's downlink write target. h2/grpc/masque pass an
+	// http.ResponseWriter (an io.Writer subset, flusher available); wt passes
+	// a webtransport.Stream (its own streaming writer).
 	w       io.Writer
 	flusher http.Flusher
 	mu      sync.Mutex
 	closed  bool
+	padding paddingPolicy
 }
 
-// resumeWriterAdapter 把 resumeSessionWriter 适配成 io.Writer，
-// 供 datagram 数据面的 frameW（writeUDPPacket / writeUDPCapsule）写入。
-// 用 writeRaw（UDP 数据报自封装，不再套 resume 帧）。
+// resumeWriterAdapter adapts resumeSessionWriter into an io.Writer for the
+// datagram data plane's frameW (writeUDPPacket / writeUDPCapsule). Uses
+// writeRaw (UDP packets self-wrap, no resume frame on top).
 type resumeWriterAdapter struct {
 	w *resumeSessionWriter
 }
@@ -410,26 +563,41 @@ func (a *resumeWriterAdapter) Write(p []byte) (int, error) {
 	return a.w.writeRaw(p)
 }
 
-// writeFrame 在流上写一段 resume 帧（stream 模式下行）并 flush。
-// seq 是本段数据在会话下行坐标系里的起始偏移。
+// writeFrame writes one resume frame on the stream (stream-mode downlink)
+// and flushes. seq is this chunk's starting offset in the session's downlink
+// coordinate space.
 func (w *resumeSessionWriter) writeFrame(seq uint64, data []byte) (int, error) {
+	written := 0
+	for len(data) > 0 {
+		chunkLen, padLen := w.padding.dataChunk(len(data), resumeHeaderLen)
+		if err := w.writeOneFrame(seq, data[:chunkLen], padLen); err != nil {
+			return written, err
+		}
+		written += chunkLen
+		seq += uint64(chunkLen)
+		data = data[chunkLen:]
+	}
+	return written, nil
+}
+
+func (w *resumeSessionWriter) writeOneFrame(seq uint64, data []byte, padLen int) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return 0, net.ErrClosed
+		return net.ErrClosed
 	}
-	if err := writeResumeFrame(w.w, seq, data, 0); err != nil {
+	if err := writeResumeFrame(w.w, seq, data, padLen); err != nil {
 		w.closed = true
-		return 0, err
+		return err
 	}
 	if w.flusher != nil {
 		w.flusher.Flush()
 	}
-	return len(data), nil
+	return nil
 }
 
-// writeRaw 在流上写一段原始字节并 flush，不做 resume 分帧。
-// 供 datagram 数据面（frameW 已自封装 UDP 数据报）使用。
+// writeRaw writes raw bytes on the stream and flushes, without resume
+// framing. For the datagram data plane (frameW already wrapped the UDP packet).
 func (w *resumeSessionWriter) writeRaw(data []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -446,14 +614,14 @@ func (w *resumeSessionWriter) writeRaw(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// writeEnd 在流上写 END 控制帧
+// writeEnd writes an END control frame on the stream.
 func (w *resumeSessionWriter) writeEnd() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return net.ErrClosed
 	}
-	if err := writeResumeEndFrame(w.w); err != nil {
+	if err := writeResumeEndFrame(w.w, w.padding); err != nil {
 		w.closed = true
 		return err
 	}
@@ -463,15 +631,16 @@ func (w *resumeSessionWriter) writeEnd() error {
 	return nil
 }
 
-// writeControl 在流上写一个控制帧（HANDSHAKE-ACK / KEEPALIVE-ACK 等）并 flush。
-// 供服务端握手与备用线路存活应答使用。
+// writeControl writes one control frame (HANDSHAKE-ACK / KEEPALIVE-ACK etc.)
+// on the stream and flushes. Used by the server handshake and backup-link
+// liveness replies.
 func (w *resumeSessionWriter) writeControl(typ byte, data []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return net.ErrClosed
 	}
-	if err := writeFrame(w.w, typ, 0, data, 0); err != nil {
+	if err := writeFrame(w.w, typ, 0, data, w.padding.paddingFor(resumeHeaderLen+len(data))); err != nil {
 		w.closed = true
 		return err
 	}
@@ -481,47 +650,55 @@ func (w *resumeSessionWriter) writeControl(typ byte, data []byte) error {
 	return nil
 }
 
-// close 标记底层 HTTP handler 已返回，禁止后续写入（避免
-// "Write called after Handler finished" panic）。由 handler 的 defer 调用。
+// close marks the underlying HTTP handler as returned and forbids further
+// writes (avoids the "Write called after Handler finished" panic). Called
+// from the handler's defer.
 func (w *resumeSessionWriter) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.closed = true
 }
 
-// —— 服务端 handler 入口 ——
+// —— server handler entry point ——
 //
-// 由 server.go 在 routeTunnelRequest 收到 X-Tunnel-Proto: resume/2 时调用。
-// 返回 (session, isNew, error)；isNew=true 表示新建会话，error 非空表示拨号失败。
-// 参数：
-//   - r: 请求（带 X-Session-ID、可能带 X-Resume-Downlink、X-Network）
-//   - dialTarget: 拨号目标服务的函数
-//   - sessionWindowKB: 服务端为下行重放保留的窗口容量
+// Called by server.go in routeTunnelRequest when X-Tunnel-Proto: resume/2 is
+// seen. Returns (session, isNew, error); isNew=true means a new session, a
+// non-nil error means the dial failed. Parameters:
+//   - r: the request (carries X-Session-ID, possibly X-Resume-Downlink, X-Network)
+//   - dialTarget: the function dialing the target service
+//   - sessionWindowKB: the window capacity the server keeps for downlink replay
 //
-// datagram 模式（X-Network=udp）下依据请求头为会话设置数据面封装：
-//   - Protocol: connect-udp（MASQUE-UDP）→ writeUDPCapsule / readUDPCapsule
-//   - 其余（H2/H3/gRPC UDP 流）→ writeUDPPacket / readUDPPacket
+// In datagram mode (X-Network=udp) the data-plane wrappers are chosen from
+// request headers:
+//   - Protocol: connect-udp (MASQUE-UDP) → writeUDPCapsule / readUDPCapsule
+//   - otherwise (H2/H3/gRPC UDP streams) → writeUDPPacket / readUDPPacket
 //
-// 调用方负责后续：① 响应头写 X-Resume-Uplink ② 进入帧循环读上行 ③ 通知下行泵绑定活跃 writer
+// The caller owns the follow-up: 1) write X-Resume-Uplink in the response
+// 2) enter the frame loop reading the uplink 3) tell the downlink pump to
+// bind the active writer.
 func (t *sessionTable) prepareResumeSession(r *http.Request, dialTarget func() (net.Conn, error), sessionWindowKB int) (*tunnelSession, bool, error) {
 	id := r.Header.Get("X-Session-ID")
-	network := GetXNetwork(r)
+	network := getXNetwork(r)
 	datagram := network == "udp"
 	var frameW func(io.Writer, []byte) error
 	var frameR func(io.Reader, []byte) (int, error)
 	if datagram {
-		if r.Header.Get("Protocol") == "connect-udp" {
-			frameW = writeUDPCapsule
+		padding := t.padding
+		if masqueConnectProtocol(r) == protocolConnectUDP {
+			frameW = func(w io.Writer, p []byte) error { return writeUDPCapsule(w, p, padding) }
 			frameR = readUDPCapsule
 		} else {
-			frameW = writeUDPPacket
+			frameW = func(w io.Writer, p []byte) error { return writeUDPPacket(w, p, padding) }
 			frameR = readUDPPacket
 		}
 	}
-	return t.getOrCreate(id, dialTarget, sessionWindowKB, datagram, frameW, frameR)
+	state := requestState(r)
+	binding := sessionBinding{network: network, target: getXTarget(r), principalID: state.principal.ID}
+	return t.getOrCreateBound(id, binding, dialTarget, sessionWindowKB, datagram, frameW, frameR)
 }
 
-// parseResumeDownlink 从请求头解析客户端已收到的下行字节数
+// parseResumeDownlink parses the downlink bytes the client already received
+// from the request header.
 func parseResumeDownlink(r *http.Request) uint64 {
 	v := r.Header.Get("X-Resume-Downlink")
 	if v == "" {
@@ -534,17 +711,34 @@ func parseResumeDownlink(r *http.Request) uint64 {
 	return n
 }
 
-// startSessionReaper 启动后台回收器（只启动一次）
-var reaperOnce sync.Once
+// runReaper is the instance-level session reaper (called on Server start,
+// stopped by closing stopCh).
+func (t *sessionTable) runReaper(stopCh <-chan struct{}) {
+	tick := time.NewTicker(sessionCleanupTick)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-tick.C:
+			t.reapIdle()
+		}
+	}
+}
 
-func startSessionReaper() {
-	reaperOnce.Do(func() {
-		go func() {
-			t := time.NewTicker(sessionCleanupTick)
-			defer t.Stop()
-			for range t.C {
-				globalSessionTable.reapIdle()
-			}
-		}()
-	})
+// len returns the current active session count (snapshot).
+func (t *sessionTable) len() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.sessions)
+}
+
+// closeAll closes every session in the table (called on Server.Close/Shutdown).
+func (t *sessionTable) closeAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, s := range t.sessions {
+		s.close()
+	}
+	t.sessions = make(map[string]*tunnelSession)
 }

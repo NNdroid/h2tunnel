@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/ecdsa"
@@ -15,8 +15,9 @@ import (
 	"time"
 )
 
-// GenerateSelfSignedCert 生成自签名 TLS 证书（供本隧道工具自签场景使用）
-func GenerateSelfSignedCert(customDomain string) (tls.Certificate, string, error) {
+// generateSelfSignedCert generates a self-signed TLS certificate (for this
+// tunnel tool's self-signed scenarios).
+func generateSelfSignedCert(customDomain string) (tls.Certificate, string, error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, "", fmt.Errorf("failed to generate ECDSA private key: %w", err)
@@ -28,7 +29,7 @@ func GenerateSelfSignedCert(customDomain string) (tls.Certificate, string, error
 		return tls.Certificate{}, "", fmt.Errorf("failed to generate serial number: %w", err)
 	}
 
-	// 真实公网证书标准：提前 1 天生效，有效期约 390 天 (合规 CA/B Forum 397 天上限)
+	// Real public-cert convention: valid from 1 day early, ~390-day lifetime (within the CA/B Forum 397-day cap).
 	notBefore := time.Now().Add(-24 * time.Hour)
 	notAfter := notBefore.Add(390 * 24 * time.Hour)
 
@@ -75,7 +76,7 @@ func GenerateSelfSignedCert(customDomain string) (tls.Certificate, string, error
 		return tls.Certificate{}, "", fmt.Errorf("failed to create certificate: %w", err)
 	}
 
-	// 计算并格式化 SHA-256 指纹 (AA:BB:CC:...)
+	// Compute and format the SHA-256 fingerprint (AA:BB:CC:...)
 	sha256Sum := sha256.Sum256(derBytes)
 	var fpBuilder strings.Builder
 	for i, b := range sha256Sum {

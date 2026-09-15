@@ -1,258 +1,603 @@
 # h2tunnel
 
-Enterprise High-Performance HTTP/2, HTTP/3 (QUIC), WebTransport, MASQUE (RFC 9298), and gRPC Multiplexing Tunnel.
+[![Test](https://github.com/NNdroid/h2tunnel/actions/workflows/test.yml/badge.svg)](https://github.com/NNdroid/h2tunnel/actions/workflows/test.yml)
 
-## Features
+`h2tunnel` is a secure tunneling library embeddable in Go programs, and it also ships a standalone command-line program. It wraps TCP or UDP services inside HTTP/2, HTTP/3, WebTransport, MASQUE, or gRPC connections, with disconnect recovery, CDN-friendly request headers, and bounded session buffering.
 
-- **Multi-Protocol Transport Stack**: Supports `h2`, `h2c`, `h3` (QUIC), `wt` (WebTransport), `masque` (CONNECT-TCP/UDP), and `grpc`.
-- **Auto Self-Signed TLS**: Generates high-authenticity ECDSA certificates automatically when TLS is enabled without manual certificate setup.
-- **Unified Transport Configuration**: Server listens on both TCP and UDP on a single port for all incoming protocols.
-- **Health Check Probe (`/healthz`)**: Built-in HTTP probe endpoint for AWS ALB, Cloudflare, and Nginx health monitors.
-- **Stun Node Sharing (`gen-uri`)**: One-click sharing URI and terminal ASCII QR code generation for Android & TV.
-- **Graceful Connection Draining**: Clean zero-drop drain shutdown on `SIGINT` / `SIGTERM`.
+The server does not become an open proxy by default: the package API forces callers to provide both an `Authenticator` and a `TargetDialer`. Prefer logical service names (for example `ssh`, `postgres`) and do not let the client decide arbitrary target addresses.
 
----
+## Installation
 
-## One-Key Management (Linux Server & Client)
+Use it as a Go package:
 
-### 1. Server Installation (Default)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NNdroid/h2tunnel/main/scripts/install.sh | sudo bash -s install server
+go get github.com/NNdroid/h2tunnel
 ```
 
-### 2. Client Installation (Linux)
+One-line install of the command-line program (Linux, includes systemd service registration):
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NNdroid/h2tunnel/main/scripts/install.sh | sudo bash -s install client
+curl -fsSL https://raw.githubusercontent.com/NNdroid/h2tunnel/main/scripts/install.sh | sudo bash -s -- install
 ```
 
-### 3. Upgrade / Uninstall
-```bash
-# One-key Upgrade (Keeps existing config.json)
-curl -fsSL https://raw.githubusercontent.com/NNdroid/h2tunnel/main/scripts/install.sh | sudo bash -s upgrade
+The script prefers a local prebuilt binary, then builds from source, and finally downloads the bare binary matching the system architecture from a GitHub Release (no extraction needed).
 
-# One-key Uninstall
-curl -fsSL https://raw.githubusercontent.com/NNdroid/h2tunnel/main/scripts/install.sh | sudo bash -s uninstall
+Build the command-line program from source:
+
+```bash
+go build -trimpath -o h2tunnel ./cmd/h2tunnel
 ```
 
-### 4. Service Management
-```bash
-systemctl start h2tunnel    # Start service
-systemctl stop h2tunnel     # Stop service
-systemctl restart h2tunnel  # Restart service
-systemctl status h2tunnel   # Check status
-journalctl -u h2tunnel -f   # View live logs
+## Choosing a transport
+
+| Transport | TCP | UDP | Plain CDN | Typical use |
+| --- | ---: | ---: | ---: | --- |
+| `h2` | ✅ | ✅ | ✅ recommended | CDN, reverse proxy, general public access |
+| `h2c` | ✅ | ✅ | plaintext origin links only | internal networks, TLS terminated at an external gateway |
+| `grpc` | ✅ | ✅ | ✅, requires CDN with gRPC enabled | existing gRPC infrastructure |
+| `h3` | ✅ | ✅ | usually no origin forwarding | end-to-end QUIC direct connection |
+| `masque` | ✅ | ✅ | usually no origin forwarding | standard CONNECT-TCP/UDP direct connection |
+| `wt` | ✅ | ✅ | usually no origin forwarding | WebTransport streams carrying TCP byte streams and UDP datagrams |
+
+Plain CDNs do not forward UDP/QUIC verbatim to the origin, so for CDN scenarios prefer `h2`; H3, WebTransport, and MASQUE should be used as end-to-end direct connections.
+
+## Package API overview
+
+Client:
+
+```go
+func NewClient(ClientOptions) (*Client, error)
+func (*Client) Start(context.Context) error
+func (*Client) DialContext(context.Context, string, string) (net.Conn, error)
+func (*Client) DialPacketContext(context.Context, string, string) (PacketConn, error)
+func (*Client) Shutdown(context.Context) error
+func (*Client) Close() error
 ```
 
----
+Server:
 
-## Configuration Reference (`config.json`)
+```go
+func NewServer(ServerOptions) (*Server, error)
+func (*Server) Handler() http.Handler
+func (*Server) Serve(Listeners) error
+func (*Server) ListenAndServe(string) error
+func (*Server) Listeners() Listeners
+func (*Server) Shutdown(context.Context) error
+func (*Server) Close() error
+```
 
-| Field | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `mode` | `string` | `"server"` | Operational mode: `"server"` or `"client"`. |
-| `listen` | `string` | `":8443"` | Listening address (`":8443"` for server; `"127.0.0.1:2222"` for client). |
-| `server` | `string` | `""` | Server URL for client mode (e.g. `"https://example.com:8443"`). |
-| `target` | `string` | `"127.0.0.1:22"` | Client-only target backend requested from the server. |
-| `path` | `string` | `"/tunnel"` | HTTP endpoint path. |
-| `transport` | `string` | `"h2"` | **Semantics differ by side.** *Server* = an **allow-list** of protocols it will accept; supports **multiple comma-separated values** (e.g. `"h2,h3,masque"`), or `"all"` to accept every protocol on the shared port. *Client* = the **single transport** that process actually runs (`"h2"`, `"h2c"`, `"h3"`, `"wt"`, `"masque"`, `"grpc"`). |
-| `network` | `string` | server: `"all"`; client: `"tcp"` | Accepted values: `"tcp"`, `"udp"`, or `"all"`. |
-| `token` | `string` | `""` | Single authentication token, sent through CDN-safe request headers. |
-| `tls` | `bool` | transport-derived | Server only. `h2`/`h3`/`wt`/`masque`/`all` require TLS, `h2c` disables it, and `grpc` follows this field. |
-| `cert` | `string` | `""` | Path to custom TLS certificate. |
-| `key` | `string` | `""` | Path to custom TLS private key. |
-| `local_only` | `bool` | `false` | Restrict proxying strictly to localhost (server). |
-| `insecure` | `bool` | `false` | Client only. Skip upstream TLS certificate verification. |
-| `host` | `string` | `""` | Client only. Override the HTTP Host header. |
-| `sni` | `string` | `""` | Client only. Override TLS SNI. |
-| `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
-| `heartbeat_sec` | `int` | `25` | Client only. Application-layer keepalive interval in seconds. Must stay below your CDN/reverse-proxy idle timeout. Negative value disables it (direct connections only). |
-| `drain_timeout_sec` | `int` | `30` | Max seconds to drain existing tunnels after `SIGTERM` before force close. |
-| `session_window_kb` | `int` | `256` | Ring-buffer window size for recovery; a disconnect longer than this window degrades the session honestly (`ErrGap`). |
-| `handshake_ack_ms` | `int` | `3000` | Client only. Data-plane handshake `HANDSHAKE-ACK` timeout (ms). |
-| `keepalive_sec` | `int` | `15` | Client only. `KEEPALIVE` heartbeat interval for backup lines / sessions (sec). |
-| `primary_count` | `int` | `1` | Client only. Number of primary connections. `2` with `network: "all"` separates TCP and UDP. |
-| `backup_count` | `int` | `1` | Client only. Number of warm backup connections; set to `0` to disable backups. |
-| `primary_dial_interval_sec` | `int` | `30` | Client only. Re-dial throttle for primary connections. |
-| `backup_dial_interval_sec` | `int` | `15` | Client only. Re-dial throttle for backup / replacement connections. |
-| `establish_interval_sec` | `int` | `100` | Client only. Primary/backup establish phase offset so a CDN idle-kill does not take down both together. |
+Security helpers:
 
-> **`transport` is intentionally asymmetric** — a single shared field whose meaning depends on `mode`:
-> - **Server = a gateway allow-list.** One `listen` port multiplexes `h2`/`h3`/`grpc`/`wt`/`masque` simultaneously, telling them apart by HTTP method, `Content-Type`, `Protocol` header and HTTP/3. So `"h2,h3,masque"` means "accept these kinds of clients together" — the server never picks just one.
-> - **Client = a single choice.** A client process is one tunnel endpoint; each outbound connection can only ride **one** transport stack (WT session, QUIC/h3, or h2/h2c/grpc). `transport` is normalized once and is the only runtime source of truth.
-> - Prefer one process per transport on the client side if you need several protocols at once; the server side needs only one config row to serve them all.
-> - `h2c` is cleartext and cannot share one listening address with TLS/QUIC transports. For CDN deployment, use `h2` (or `grpc` when the CDN explicitly supports it); the origin may receive HTTP/1.1 after CDN protocol translation and is still classified as the `h2` POST-stream family.
-> - Configuration parsing is strict: unknown/removed fields and non-canonical transport or network values are rejected instead of being silently ignored.
-> - Mode-specific no-op fields are rejected (for example, `target` in server mode or `local_only` in client mode). Every field can be overridden with its canonical `H2TUNNEL_*` environment variable, such as `H2TUNNEL_TRANSPORT` or `H2TUNNEL_BACKUP_COUNT`; malformed typed values fail fast.
+```go
+func NewTokenCredentials(string) (CredentialProvider, error)
+func NewTokenAuthenticator(string) (Authenticator, error)
+func NewStaticServiceDialer(map[string]Service, *net.Dialer) (TargetDialer, error)
+```
 
----
+`Client` is safe for concurrent use; each dial owns an independent logical session. `Server` is a single-lifetime object — create a new instance after closing it. `NewClient` and `NewServer` only validate configuration; they do not open ports or start background tasks.
 
-## Running Behind a CDN / Reverse Proxy
+If `Client.Start` fails it releases all transport resources and resets state, so `Start` can simply be called again to retry; after success, calling `Start` again returns the first result. `Client.Shutdown` returns once the context deadline passes, but existing tunnels keep draining in the background — call `Close` to force every active connection down when you need an immediate stop.
 
-### Protocol constraints (read this first)
+`Server.Listeners()` returns the listeners `Serve` actually bound; with port 0 you can read the real port via `Listeners().QUIC.LocalAddr()` (a WT-only deployment has no TCP listener, so this is the only port-discovery path). The values are for reading addresses only; listener ownership stays with `Serve`.
 
-CDN edge nodes only proxy TCP-based HTTP back to your origin. Therefore:
+## Full package API example
 
-| Transport | Works behind CDN? | Reason |
-| :--- | :--- | :--- |
-| `h2` (POST stream) | ✅ **Use this** | Standard HTTP/2 streaming |
-| `grpc` | ✅ Works | Requires the CDN to support gRPC (e.g. enable it on Cloudflare) |
-| `h3` / `wt` / `masque` | ❌ No | Requires end-to-end UDP/QUIC, which standard CDN origin-pull does not forward |
+### 1. Build a closed service registry
 
-### Idle timeout vs heartbeat
+The server below only allows access to two explicitly registered targets. Unknown service names, network-type mismatches, or insufficient roles are rejected.
 
-CDN and load balancers silently drop connections with no traffic for a while
-(AWS ALB 60s, Nginx `proxy_read_timeout` 60s, Cloudflare 100s → HTTP 524).
-When a TCP `resume/2` stream is idle, the client emits a `KEEPALIVE` control
-frame and the server replies with `KEEPALIVE-ACK`, creating traffic in both
-directions without exposing anything to the tunneled application. Keep
-`heartbeat_sec` **below** your provider's idle timeout; the 25s default leaves
-a 2x margin against the smallest common timeout (60s). UDP/QUIC transports do
-not traverse an ordinary CDN origin proxy (see the table above).
+```go
+package main
 
-### Response headers
+import (
+    "context"
+    "log"
+    "net/http"
 
-The server emits `Content-Type: application/octet-stream`,
-`Cache-Control: no-store, no-transform`, `Content-Encoding: identity` and
-`X-Accel-Buffering: no` on tunnel responses, and the client sends
-`Accept-Encoding: identity` on requests. These stop CDNs from sniffing,
-buffering or compressing the binary stream (an SSH banner would otherwise be
-detected as `text/plain` and gzip-buffered, destroying realtime streaming).
+    "github.com/NNdroid/h2tunnel"
+)
 
-### Nginx reverse proxy sample
+func main() {
+    tokenAuth, err := h2tunnel.NewTokenAuthenticator("replace-with-a-long-random-token")
+    if err != nil {
+        log.Fatal(err)
+    }
+    auth := func(ctx context.Context, request *http.Request) (h2tunnel.Principal, error) {
+        principal, err := tokenAuth(ctx, request)
+        if err != nil {
+            return h2tunnel.Principal{}, err
+        }
+        principal.ID = "operations-client"
+        principal.Roles = []string{"ops"}
+        return principal, nil
+    }
 
-```nginx
-location /tunnel {
-    proxy_pass http://127.0.0.1:8443;
-    proxy_http_version 1.1;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_buffering off;              # honor X-Accel-Buffering: no, keep it explicit
-    proxy_request_buffering off;
-    proxy_read_timeout 300s;          # > heartbeat_sec, adjust to your usage
-    proxy_send_timeout 300s;
+    dialer, err := h2tunnel.NewStaticServiceDialer(map[string]h2tunnel.Service{
+        "ssh": {
+            Network: h2tunnel.NetworkTCP,
+            Address: "127.0.0.1:22",
+            Roles:   []string{"ops"},
+        },
+        "dns": {
+            Network: h2tunnel.NetworkUDP,
+            Address: "127.0.0.1:53",
+        },
+    }, nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    server, err := h2tunnel.NewServer(h2tunnel.ServerOptions{
+        Path:          "/tunnel",
+        Transports:    []h2tunnel.Transport{h2tunnel.TransportH2},
+        Networks:      []h2tunnel.Network{h2tunnel.NetworkTCP, h2tunnel.NetworkUDP},
+        Authenticator: auth,
+        Dialer:        dialer,
+        Tuning: h2tunnel.ServerTuning{
+            Padding: h2tunnel.PaddingTuning{
+                MinRecordBytes: 600,
+                MaxRecordBytes: 1200,
+            },
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // TLS is terminated at the CDN/Nginx; the origin listens on plain HTTP on the loopback address.
+    origin := &http.Server{Addr: "127.0.0.1:8080", Handler: server.Handler()}
+    log.Fatal(origin.ListenAndServe())
 }
 ```
 
-### Client IP logging
+`TransportH2` is allowed here instead of `TransportH2C` because client-to-CDN uses H2; even if CDN-to-origin degrades to HTTP/1.1, it still belongs to the H2 POST-stream transport family. The origin must listen only on a trusted network or the loopback address.
 
-Behind a CDN, `RemoteAddr` is always the edge node. The server logs the real
-client IP from `CF-Connecting-IP` / `True-Client-IP` / `X-Real-IP` /
-`X-Forwarded-For` (in that order). These headers are client-forgeable and are
-used for logging only — never for access control.
+### 2. Create a client and dial a logical service
 
----
+```go
+credentials, err := h2tunnel.NewTokenCredentials("replace-with-a-long-random-token")
+if err != nil {
+    return err
+}
+client, err := h2tunnel.NewClient(h2tunnel.ClientOptions{
+    Endpoint:    "https://tunnel.example.com",
+    Path:        "/tunnel",
+    Transport:   h2tunnel.TransportH2,
+    Credentials: credentials,
+    Tuning: h2tunnel.ClientTuning{
+        SessionWindowBytes: 256 * 1024,
+        HeartbeatInterval:  25 * time.Second,
+        StandbyConnections: 1,
+        Padding: h2tunnel.PaddingTuning{
+            MinRecordBytes: 600,
+            MaxRecordBytes: 1200,
+        },
+    },
+})
+if err != nil {
+    return err
+}
+defer client.Close()
 
-## Session Recovery (`resume`)
-
-Resume turns the data plane into a **transport-agnostic engine** (seq frames +
-a server-side session table + a ring buffer). Any TCP tunnel stream can be
-re-established after a cut and continue from the last acknowledged byte, so
-long-lived sessions like SSH survive CDN idle-kills.
-
-### Transport coverage
-
-Resume is a **transport-agnostic engine**, but it runs two distinct data
-planes depending on the tunnel type:
-
-- **TCP tunnels → full `resume/2`**: the 16-byte v2 frame header
-  (`[type][ver][dataLen][padLen][seq]`) with seq replay and a B-layer
-  `HANDSHAKE`/`HANDSHAKE-ACK`.
-- **UDP tunnels → datagram resume**: reuses resume's A-layer negotiation +
-  ring buffer + re-dial/rebuild, but frames datagrams with a **4-byte length
-  prefix** (`writeUDPPacket`) — **no** v2 seq frames, **no** B-layer
-  handshake.
-
-| Transport | Resume supported? | Data plane |
-| :--- | :--- | :--- |
-| `h2` (POST) | ✅ | Full `resume/2` (original implementation) |
-| `h3` (QUIC) | ✅ | TCP: full `resume/2`; UDP: datagram resume |
-| `grpc` | ✅ | Full `resume/2` — `Content-Type: application/grpc` marker; body carries raw resume frames (no double grpc-framing) |
-| `masque` (CONNECT) | ✅ | `masque-tcp`: full `resume/2`; `masque-udp`: datagram resume via capsule |
-| `wt` (WebTransport) | ✅ | Full `resume/2` — per-tunnel `WTSessionManager`; each `Stream` is a resume data plane sharing the v2 session table / ring buffer; `clientDownlink` carried in the HANDSHAKE frame payload |
-
-> `masque`/`wt`/`h3` are direct-QUIC transports and do **not** traverse a CDN
-> (see the constraint table above). The CDN idle-cut scenario resume solves
-> therefore applies mainly to `h2`/`grpc`.
-
-**How `wt` fits the resume engine.** WebTransport is itself a session+stream
-protocol, so historically it kept a separate `WTSessionManager` (primary/backup
-warm-up + failover via `GetSession`) and only *borrowed* `writeFrame`'s encoding —
-it did **not** use the v2 session table / ring buffer / seq replay. That was
-tracked as tech debt: a `wt` stream cut could not re-dial and continue from the
-last byte (session failover only, no data continuation).
-
-That gap is now closed. `wt` data paths run **through the same `resume/2`
-engine** as `h2`/`grpc`/`masque`:
-- Each tunnel gets its own `WTSessionManager` whose headers carry the resume
-  A-layer negotiation (`X-Tunnel-Proto: resume/2`, `X-Session-ID`,
-  `X-Resume-Version/Caps/Params`) plus `Protocol: webtransport`.
-- On the server, `handleWebTransportServer` dispatches every business stream to
-  the global v2 session table (`prepareResumeSession`) — an existing
-  `X-Session-ID` reuses the same `targetConn` + ring buffer; a missing one dials
-  the target.
-- Since WT streams cannot carry per-stream HTTP headers, `clientDownlink` (the
-  resume offset) travels in the **B-layer HANDSHAKE frame payload** as a decimal
-  string, and the server replays the downlink gap from there.
-- The server-side `resumeSessionWriter.w` was widened from `http.ResponseWriter`
-  to `io.Writer` so a `webtransport.Stream` is a drop-in downlink target
-  (`flusher` optional; h2/grpc/masque call sites unchanged).
-
-The net effect: **`wt` now does true data continuation** — after a `Stream` cut,
-a new stream with the same session id resumes from `clientDownlink` with no gap
-and no duplicate (see `TestWTResumeReconnect`).
-
-### Requirements
-
-- **`resume/2` is always enabled** — the `resume` config flag was removed
-  (v1 escape hatch deleted). It is the *only* data plane on both ends, so there
-  is no one-sided-enablement incompatibility: every stream carries
-  `X-Tunnel-Proto: resume/2`.
-- All **TCP transports** (`h2`, `h3`, `grpc`, `masque-tcp`, `wt`) run the full
-  `resume/2` engine automatically, and **datagram resume** is always on for UDP
-  tunnels (`h2-udp`/`h3-udp`, `masque-udp`).
-
----
-
-## Layered Architecture
-
-h2tunnel is organized as a strict, single-direction dependency stack. Each
-layer only talks to the one directly below it; the connection layer sits on
-top and manages the concrete transports beneath.
-
-| Layer | Component | Responsibility |
-| :--- | :--- | :--- |
-| **L3 — Connection Manager** | `ConnectionManager` (`connmanager.go`) | Owns the primary/backup line set, dial intervals, establish phase offset, failover & replenishment, type sharding. Exposes `PickClient(typ)` so business tunnels grab the active primary's dedicated transport pool. |
-| **L2 — Session / resume/2** | resume v2 engine (`session.go`, frame codec) | `resume/2` is the **single** upper-layer protocol (v1 removed). Frame encode/decode, control-frame ordering (control frames are serialized ahead of `DATA` via the writer mutex on `resumeSessionWriter` — no dedicated scheduler), ring-buffer seq replay, A+B handshake, KEEPALIVE. **Exception:** UDP tunnels use *datagram resume* (`writeUDPPacket`, 4-byte length prefix — A-layer + rebuild, no v2 seq/handshake). `wt` streams run through this engine like `h2`/`grpc`/`masque`. |
-| **L1 — Transports** | `h2` / `h3` / `grpc` / `masque-tcp` / `masque-udp` / `wt` | Only create a stream and expose byte I/O; no session semantics. `wt` keeps its `WTSessionManager` for session multiplexing, but its business streams are wired into the L2 resume engine (v2 session table + ring buffer) for data continuation. |
-
-### Connection policy (`ConnectionManager`)
-
-The client keeps `primary_count` primary lines and `backup_count` backup
-lines. Defaults: `1` primary + `1` backup.
-
-- **Type sharding**: when `primary_count > 1`, each net type (`tcp`, `udp`)
-  gets its own dedicated primary so the two never contend.
-- **Failover**: when a primary dies, the manager promotes a confirmed-alive
-  backup to primary, then replenishes a new backup.
-- **Establish phase offset**: `establish_interval_sec` staggers primary vs
-  backup dialing so a CDN idle-kill never takes both down at once.
-- **Probe lines do not dial the target**: backup/primary probe lines only
-  complete the A+B handshake and run `KEEPALIVE` — they never connect to the
-  target service. This keeps the liveness probe independent of any banner the
-  target might push and avoids needless target connections.
-
-### `resume/2` frame protocol
-
-16-byte header `[1B type][1B ver][4B dataLen][2B padLen][8B seq]`. Frame types:
-`0x01` DATA, `0x02` END, `0x03` ERROR, `0x10` HANDSHAKE, `0x11` HANDSHAKE-ACK,
-`0x12` KEEPALIVE, `0x13` KEEPALIVE-ACK. Non-`resume/2` version → `426`
-version-unsupported (no downgrade target).
-
----
-
-## Quick Start
-
-### 1. Export Stun QR Code & Sharing Link
-```bash
-h2tunnel gen-uri -c /etc/h2tunnel/config.json
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+conn, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "ssh")
+if err != nil {
+    return err
+}
+defer conn.Close()
 ```
+
+`DialContext` returns only after server authentication, target authorization, target connection, and the tunnel handshake have all completed. The passed context propagates all the way to the server-side `TargetDialer`; a timeout or cancellation leaves no target connection still dialing in the background.
+
+### 3. Event callbacks and network-change self-heal (optional)
+
+```go
+client.SetEventHandler(func(ev h2tunnel.ClientEvent) {
+    switch ev.Kind {
+    case h2tunnel.EventReconnecting:
+        log.Printf("tunnel reconnecting (attempt %d): %v", ev.Attempt, ev.Err)
+    case h2tunnel.EventTunnelDied:
+        log.Printf("tunnel died: %s", ev.Reason)
+    }
+})
+
+// When an OS network-change notification arrives (NotifyAddrChange / NWPathMonitor etc.):
+client.ForceReconnect() // abandon the current stream and redial immediately; session/data not lost
+```
+
+Callbacks are dispatched on a dedicated goroutine with panic recovery and never block the packet-read loop. Each tunnel exposes `Done() <-chan struct{}` and `Err() error` (context-style lifecycle).
+
+Self-heal tuning (`ClientTuning`):
+
+- `AutoRedial: true` — automatically resets and continues after redial exhaustion (16 attempts), essential for "stay down until the network returns" scenarios; when off, exhaustion terminates the tunnel and dispatches a `TunnelDied` event.
+- `RedialBudget` — per-attempt dial budget for stream setup + handshake, tightening the abandon pace during outages; the timer stops once the tunnel is ready and never affects established streams.
+- `SessionWindowBytes` — when outage duration × downlink rate exceeds the window, the gap is unrecoverable; raise it for long outages / high throughput.
+
+### 4. Make `http.Client` reach services uniformly through the tunnel
+
+```go
+transport := &http.Transport{DialContext: client.DialContext}
+httpClient := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+
+// The URL's host is passed to the server registry as the logical target.
+response, err := httpClient.Get("http://internal-api/health")
+```
+
+If the logical name includes a port, use the same string as the registry key, e.g. `internal-api:80`. Response bodies are still managed by the ordinary `http.Client`.
+
+### 5. Build an SSH client on top of a reused tunnel
+
+```go
+raw, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "ssh")
+if err != nil {
+    return err
+}
+sshConn, channels, requests, err := ssh.NewClientConn(raw, "ssh", sshConfig)
+if err != nil {
+    raw.Close()
+    return err
+}
+sshClient := ssh.NewClient(sshConn, channels, requests)
+defer sshClient.Close()
+```
+
+### 6. UDP / datagram access
+
+```go
+packetConn, err := client.DialPacketContext(ctx, h2tunnel.NetworkUDP, "dns")
+if err != nil {
+    return err
+}
+defer packetConn.Close()
+
+_ = packetConn.SetDeadline(time.Now().Add(5 * time.Second))
+if _, err := packetConn.Write(dnsQuery); err != nil {
+    return err
+}
+response := make([]byte, 64*1024)
+n, err := packetConn.Read(response)
+```
+
+What comes back is a "connected" `PacketConn`: the address argument of `WriteTo` cannot change the logical target fixed at creation time. Dial a separate `PacketConn` per remote UDP conversation.
+
+### 7. Application-layer record padding
+
+`PaddingTuning` applies to both TCP byte streams and UDP datagrams, and covers all six transports `h2`, `h2c`, `grpc`, `h3`, `wt`, `masque`. To shape both uplink and downlink, configure it on client and server alike:
+
+```go
+padding := h2tunnel.PaddingTuning{
+    MinRecordBytes: 600,
+    MaxRecordBytes: 1200,
+}
+
+clientOptions.Tuning.Padding = padding // client to server
+serverOptions.Tuning.Padding = padding // server to client
+```
+
+Stream data is sliced into full records whose lengths fall randomly in `[600, 1200]`; short records get padding appended. UDP always keeps one packet per record: short packets are padded, and packets originally above the cap stay intact and are never split. Padding is discarded by the peer after decoding, so the business payload the TCP/UDP target receives is unchanged. Omitting the config or setting both values to `0` disables padding entirely; setting only `MinRecordBytes` makes the cap default to 125% of the minimum.
+
+What is guaranteed here is the **h2tunnel application-layer record size**, not the size of every IP packet on the wire. TLS, HTTP/2, HTTP/3, QUIC, TCP ACKs/retransmissions, CDNs, path MTU, and TSO/GSO may still split or coalesce records; no application can guarantee every actual IP packet is at least 600B. To verify the live packet-size distribution, capture on the target interface with NIC segmentation offload disabled.
+
+### 8. Custom authentication and dynamic routing
+
+Production systems can turn JWT, mTLS identity, or an existing session into a stable `Principal.ID`, then enforce tenant, role, network, and target policies inside the `TargetDialer`.
+
+```go
+authenticator := func(ctx context.Context, r *http.Request) (h2tunnel.Principal, error) {
+    claims, err := verifyJWT(r.Header.Get("Authorization"))
+    if err != nil {
+        return h2tunnel.Principal{}, h2tunnel.ErrUnauthenticated
+    }
+    return h2tunnel.Principal{ID: claims.Subject, Roles: claims.Roles}, nil
+}
+
+targetDialer := func(ctx context.Context, request h2tunnel.DialRequest) (net.Conn, error) {
+    address, ok := lookupAllowedService(request.Principal.ID, request.Target, request.Network)
+    if !ok {
+        return nil, h2tunnel.ErrForbidden
+    }
+    var dialer net.Dialer
+    return dialer.DialContext(ctx, string(request.Network), address)
+}
+```
+
+Never dial `request.Target` without validation inside the `TargetDialer`, or the tunnel becomes an SSRF/open internal proxy. For UDP, the `TargetDialer` must return a connected datagram `net.Conn`, typically a `*net.UDPConn`.
+
+### 9. Direct TLS with H2/H3 sharing one port
+
+```go
+certificate, err := tls.LoadX509KeyPair("server.crt", "server.key")
+if err != nil {
+    return err
+}
+server, err := h2tunnel.NewServer(h2tunnel.ServerOptions{
+    Path:       "/tunnel",
+    Transports: []h2tunnel.Transport{h2tunnel.TransportH2, h2tunnel.TransportH3},
+    Networks:   []h2tunnel.Network{h2tunnel.NetworkTCP, h2tunnel.NetworkUDP},
+    TLSConfig: &tls.Config{
+        MinVersion:   tls.VersionTLS13,
+        Certificates: []tls.Certificate{certificate},
+    },
+    Authenticator: authenticator,
+    Dialer:        targetDialer,
+})
+if err != nil {
+    return err
+}
+
+// Automatically creates TCP and UDP listeners on the same numeric port.
+return server.ListenAndServe(":8443")
+```
+
+The library never persists certificates. When `ListenAndServe` hosts `h2`/`h3`/`wt`/`masque` you must supply a `TLSConfig` containing a certificate; for development use `h2tunnel.SelfSignedTLSConfig("localhost")` to generate one on the fly (it always carries 127.0.0.1/::1 IP SANs so loopback connections pass verification directly); for production use publicly trusted certificates. When embedding via `Handler` into an existing HTTP server, TLS can be handled by the external server or reverse proxy.
+
+### 10. Manage listeners yourself
+
+```go
+tcpListener, err := net.Listen("tcp", ":8443")
+if err != nil {
+    return err
+}
+udpListener, err := net.ListenPacket("udp", ":8443")
+if err != nil {
+    tcpListener.Close()
+    return err
+}
+err = server.Serve(h2tunnel.Listeners{TCP: tcpListener, QUIC: udpListener})
+```
+
+`Serve` takes over the passed listeners; an unexpected failure of either listener stack closes the other stack and returns the error.
+
+### 11. Graceful shutdown
+
+```go
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+if err := client.Shutdown(shutdownCtx); err != nil {
+    _ = client.Close() // force-close after timeout
+}
+if err := server.Shutdown(shutdownCtx); err != nil {
+    _ = server.Close()
+}
+```
+
+`Shutdown` refuses new sessions and waits for existing connections to end naturally; `Close` terminates immediately. When embedded in an external `http.Server`, stop the external server from accepting new requests first, then call the tunnel server's `Shutdown`.
+
+## CDN and reverse-proxy deployment
+
+Recommended path:
+
+```text
+app -> h2tunnel Client -> HTTPS/H2 -> CDN -> HTTPS/HTTP origin -> h2tunnel Server -> internal service
+```
+
+Tunnel requests and responses set the following key properties:
+
+- `Cache-Control: no-store, no-transform`
+- `Content-Type: application/octet-stream`
+- `Content-Encoding: identity`
+- `Accept-Encoding: identity`
+- `User-Agent`: a real browser UA (camouflaged as Android Chrome WebView by default, suppressing Go's `Go-http-client/2.0` default; pairs with `utls` browser TLS fingerprints)
+- `X-Accel-Buffering: no`
+- `X-Auth-Token`, plus a standard Bearer Authorization as well
+
+These settings stop proxies from caching, compressing, or buffering binary streams. The server never advances the recovery cursor on non-2xx responses, auth failures, or proxy-substituted error pages.
+
+### Nginx: TLS to the origin
+
+The standalone CLI's `h2` mode listens with TLS at the origin. Nginx can proxy like this:
+
+```nginx
+location /tunnel {
+    proxy_pass https://127.0.0.1:8443;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cache off;
+    gzip off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Auth-Token $http_x_auth_token;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 1h;
+    proxy_send_timeout 1h;
+    # CLI-generated certificates are only fit for a protected local origin link.
+    proxy_ssl_verify off;
+}
+```
+
+For a plaintext origin, use the `Server.Handler()` embedding example above and let the external server listen only on `127.0.0.1` or a protected private address. Do not allow the CDN to cache `/tunnel`, and do not enable request/response buffering.
+
+The heartbeat interval must be smaller than the shortest idle timeout on the path. The default 25s suits common 60s proxy timeouts; adjust explicitly if the CDN's shortest timeout differs. Controlled proxy latency, error responses, auth-header forwarding, cache/buffer headers, and steady-state throughput are all covered by automated tests.
+
+## CLI usage
+
+### Server configuration
+
+```json
+{
+  "mode": "server",
+  "listen": ":8443",
+  "path": "/tunnel",
+  "transport": "h2",
+  "network": "tcp",
+  "token": "replace-with-a-long-random-token",
+  "tls": true,
+  "cert": "/usr/local/etc/h2tunnel/server.crt",
+  "key": "/usr/local/etc/h2tunnel/server.key",
+  "local_only": true,
+  "session_window_kb": 256,
+  "drain_timeout_sec": 30,
+  "padding": {
+    "min_record_bytes": 600,
+    "max_record_bytes": 1200
+  },
+  "log_level": "info"
+}
+```
+
+When `cert` and `key` are both empty, the CLI generates an in-process self-signed certificate; for public production origins provide a real certificate. `local_only: true` resolves the target host and rejects any non-loopback address, reducing SSRF risk.
+
+### Client configuration
+
+```json
+{
+  "mode": "client",
+  "listen": "127.0.0.1:2222",
+  "server": "https://tunnel.example.com",
+  "target": "127.0.0.1:22",
+  "path": "/tunnel",
+  "transport": "h2",
+  "network": "tcp",
+  "token": "replace-with-a-long-random-token",
+  "sni": "tunnel.example.com",
+  "host": "tunnel.example.com",
+  "insecure": false,
+  "utls": "chrome",
+  "heartbeat_sec": 25,
+  "session_window_kb": 256,
+  "handshake_ack_ms": 3000,
+  "keepalive_sec": 15,
+  "standby_connections": 1,
+  "drain_timeout_sec": 30,
+  "padding": {
+    "min_record_bytes": 600,
+    "max_record_bytes": 1200
+  },
+  "log_level": "info"
+}
+```
+
+Starting it:
+
+```bash
+h2tunnel -c /usr/local/etc/h2tunnel/config.json
+h2tunnel server -c /usr/local/etc/h2tunnel/config.json
+h2tunnel client -c /usr/local/etc/h2tunnel/config.client.json
+h2tunnel version
+```
+
+The client's `listen` is the TCP/UDP entry given to local programs, and `target` is the address the server will ultimately connect to. The CLI is a direct-address proxy; use the package API when you need logical service registries, per-identity routing, or embedding into another program uniformly.
+
+### Configuration fields
+
+Config parsing is strict: unknown fields, removed fields, wrong types, and fields with no effect in the current mode all fail hard, with no backward compatibility for old versions.
+
+| Field | Mode | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | shared | `server` | `server` or `client` |
+| `listen` | shared | server `:8443`; client `127.0.0.1:2222` | listen address |
+| `server` | client | required | full `http://` or `https://` server address |
+| `target` | client | required | target address the server should connect to |
+| `path` | shared | `/tunnel` | tunnel HTTP path; MASQUE endpoints are nested beneath it: `<path>/.well-known/masque/{tcp,udp}/...` (e.g. `path=/tunnel` → `/tunnel/.well-known/masque/...`; `path=/` yields the standard `/.well-known/masque`) |
+| `token` | shared | empty | pre-shared auth token; must be set in production |
+| `transport` | shared | server `h2`; client inferred from URL | server accepts comma-separated lists or `all`; client picks exactly one |
+| `network` | shared | `tcp` | `tcp`, `udp`, or `all` |
+| `tls` | server | `false` | enable TLS; `h2/h3/wt/masque` imply TLS automatically, `h2c` forces plaintext |
+| `cert` / `key` | server | empty | TLS certificate and private key, must be set together |
+| `local_only` | server | `false` | allow loopback targets only |
+| `insecure` | client | `false` | skip certificate verification, for controlled testing only |
+| `host` | client | empty | override the HTTP Host, for CDN multi-tenant origin routing |
+| `sni` | client | URL hostname | override the TLS SNI |
+| `utls` | client | empty | TLS ClientHello fingerprint camouflage: `chrome`, `firefox`, `edge`, `safari`, `ios`, `qq`; only effective for `h2`/`grpc` (the QUIC family does TLS inside quic-go and cannot be injected) |
+| `masque_alpn` | client | empty (auto) | MASQUE carrier: `h3` (QUIC only), `h2` (TCP extended CONNECT only), empty = auto (h3 first; pins h2 when UDP is unreachable) |
+| `padding.min_record_bytes` | shared | `0` (off) | minimum application-layer tunnel record length; must be `17..65527`. The client shapes the uplink, the server shapes the downlink |
+| `padding.max_record_bytes` | shared | 125% of the minimum | random cap for application-layer tunnel records; at most `65535`, at least 8B above the minimum. Large UDP packets are never split to satisfy the cap |
+| `pprof` | server | empty | when non-empty, start `net/http/pprof` at that address (e.g. `127.0.0.1:6060`); bind only to trusted addresses |
+| `heartbeat_sec` | client | `25` | CDN bidirectional heartbeat; negative disables it |
+| `session_window_kb` | shared | `256` | bounded ring window per resumable session |
+| `handshake_ack_ms` | client | `3000` | data-plane handshake ack timeout |
+| `keepalive_sec` | client | `15` | session/backup-line keepalive interval |
+| `standby_connections` | client | `0` | number of hot standby connections |
+| `drain_timeout_sec` | shared | `30` | seconds to wait for existing sessions at exit |
+| `log_level` | shared | `info` | `debug`, `info`, `warn`, `error` |
+
+Every field can be overridden by an uppercased env var of the same name, e.g. `H2TUNNEL_SERVER`, `H2TUNNEL_TRANSPORT`, `H2TUNNEL_STANDBY_CONNECTIONS`, `H2TUNNEL_UTLS`, `H2TUNNEL_MASQUE_ALPN`, `H2TUNNEL_PADDING_MIN_RECORD_BYTES`, `H2TUNNEL_PADDING_MAX_RECORD_BYTES`, `H2TUNNEL_PPROF`. Malformed boolean or integer env values also fail at startup.
+
+### MASQUE dual carriers (h3 / h2)
+
+`transport: masque` describes the **protocol shape** (CONNECT + `.well-known/masque/...` URI + the resume/2 data plane); the carrier is selectable:
+
+- **`h3`**: QUIC/UDP, ALPN `h3`.
+- **`h2`**: TCP/TLS over HTTP/2 extended CONNECT (RFC 8441, `:protocol` pseudo-header).
+- **auto (default)**: h3 first; the first failed h3 dial pins h2 (links with UDP blocked need not wait for the QUIC timeout again per connection). Use `masque_alpn` to force one.
+
+Server-side listeners are automatic for both carriers: `masque` makes TCP and QUIC **optional stacks** (`listenerPlan`), and `ListenAndServe` opens both by default. ⚠️ **For the server to accept extended CONNECT over h2, the process must set `GODEBUG=http2xconnect=1` at startup** (x/net reads that switch only once in `init`, and `//go:debug` rejects non-stdlib keys). Without it the h3 carrier is unaffected and only the h2 leg is explicitly rejected with `extended connect not supported by peer` — the CLI logs a WARN when masque is enabled and the switch is missing. This limitation disappears if x/net upstream drops the gate.
+
+### Multi-protocol server
+
+The server's `transport` is an allow-list, for example:
+
+```json
+{
+  "mode": "server",
+  "listen": ":8443",
+  "transport": "h2,h3,masque",
+  "network": "all",
+  "token": "replace-with-a-long-random-token"
+}
+```
+
+TCP-based TLS and QUIC-based protocols can share one numeric port. `h2c` is plaintext and cannot mix with TLS/H3 protocols on the same listen address. Each client process selects exactly one transport. Note `h2` is now a TLS-only transport: use `h2c` for a plaintext origin.
+
+### Generating auxiliary configs
+
+```bash
+h2tunnel gen-nginx -domain tunnel.example.com -path /tunnel -backend 127.0.0.1:8443
+h2tunnel gen-systemd -bin /usr/local/bin/h2tunnel -listen :8443 -path /tunnel -token 'TOKEN'
+h2tunnel gen-uri -host tunnel.example.com -port 443 -path /tunnel -token 'TOKEN'
+```
+
+## Performance and reliability
+
+- Transport/network dispatch on hot paths is compiled into bitmasks at server start; request handling never re-parses config strings.
+- Recovery windows are strictly bounded and never grow with connection lifetime.
+- TCP and UDP use independent primary lines so datagram bursts cannot stall byte streams; enable `standby_connections` only when fast failover matters.
+- TLS configs are cloned at client and server construction, so callers can safely reuse their own templates.
+- UDP writes use bounded queues and direct selection instead of one goroutine per datagram.
+- CDN non-2xx responses never commit unacknowledged data; after service recovery it continues from the server-confirmed cursor.
+
+If you prefer lower memory, lower `session_window_kb`; if the link is flaky or throughput is high, raise it. When unacknowledged data during recovery exceeds the window it fails explicitly instead of silently dropping or reordering.
+
+## Testing and verification
+
+```bash
+go test ./...
+go vet ./...
+go build ./cmd/h2tunnel
+```
+
+Tests cover out-of-package API compilation and real TCP/UDP end-to-end transport, auth failures, target denial, context cancellation propagation, CDN latency/error/buffering behavior, recovery handshakes, concurrent closes, and steady-state benchmarks. `TestProtocolRealTargetMatrix` validates every protocol against real semantic targets: the TCP target is a real HTTP server (10 keep-alive round-trips over one tunnel connection, asserting zero new connections on the target side) and the UDP target is a real DNS server (10 independent A queries over one PacketConn, validated packet by packet).
+
+```bash
+# All-protocol × TCP/UDP throughput benchmarks (loopback)
+go test -run '^$' -bench '^BenchmarkProtocolThroughput$' -benchmem .
+
+# Data-plane microbenchmarks (frame codec / ring / session downlink / uplink isolation)
+go test -run '^$' -bench 'BenchmarkWriteFrame32KB|BenchmarkReadFrame32KB|BenchmarkRingAppendOverwrite32KB|BenchmarkRingReadAt32KB|BenchmarkSessionDownlinkWrite|BenchmarkTunnelSessionUplinkUnderDownlink' -benchmem .
+
+# CDN-topology end-to-end benchmark
+go test -run '^$' -bench '^BenchmarkPublicAPIThroughCDN72KB$' -benchmem .
+```
+
+## Continuous integration and releases
+
+Every push automatically runs `go vet`, `go build`, and `go test -race` on Ubuntu, Windows, and macOS (see `.github/workflows/test.yml`).
+
+The release flow (`.github/workflows/release.yml`):
+
+1. **Automatic release**: push any `v*` tag to trigger; cross-compiles 7 platforms of bare binaries (linux amd64/arm64/arm/386, windows amd64, darwin amd64/arm64), uploaded directly as Release assets without packaging archives.
+2. **Manual build**: trigger the Release workflow manually from the GitHub Actions page; artifacts are only collected into that run's Artifacts (`h2tunnel-manual-<sha>`) and no Release is created.
+
+Binaries inject the version via `-ldflags "-X github.com/NNdroid/h2tunnel.buildVersion=..."`, formatted as `v1.0.yyyyMMdd-<short commit hash>`, which `h2tunnel version` prints. The tag name itself does not enter version computation; after pushing, the Release title is the computed canonical version.
+
+## Security notes
+
+- Both `Authenticator` and `TargetDialer` are mandatory in the package API.
+- Pre-shared tokens should be high-entropy random values and always used with TLS.
+- `TLSConfig.InsecureSkipVerify` is only for controlled test environments.
+- The server should only expose the networks and transports you need; prefer logical service registries over dialing arbitrary addresses.
+- `Principal.ID` must be stable; resumed sessions bind identity, target, and network and must not be reattached by a different identity.
+- `/healthz` returns an uncacheable simple health status; other unknown paths return 404.

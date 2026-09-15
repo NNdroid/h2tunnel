@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"crypto/tls"
@@ -12,16 +12,17 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// splitTestEnv 解析 startBackupTestEnv 返回的 "https://addr|echoPort"。
+// splitTestEnv parses the "https://addr|echoPort" returned by startBackupTestEnv.
 func splitTestEnv(s string) (serverURL, echoAddr string) {
 	parts := strings.Split(s, "|")
 	return parts[0], "127.0.0.1:" + parts[1]
 }
 
-// ================= 三、主备线路集成测试 =================
+// ================= 3. Primary/backup line integration tests =================
 
-// startBackupTestEnv 启动备用测试所需环境：echo target + 隧道服务端。
-// seq 用于隔离端口，避免测试间冲突。返回 serverURL。
+// startBackupTestEnv starts the environment needed by the backup tests:
+// echo target + tunnel server. seq isolates the ports to avoid conflicts
+// between tests. Returns serverURL.
 func startBackupTestEnv(t *testing.T, seq int) string {
 	certFile := fmt.Sprintf("test_cert_backup_%d.pem", seq)
 	keyFile := fmt.Sprintf("test_key_backup_%d.pem", seq)
@@ -30,30 +31,31 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 	}
 	t.Cleanup(func() { os.Remove(certFile); os.Remove(keyFile) })
 
-	// 端口基址选在 27000 段，避免与 e2e_test 的 StrictDemux (22000-22003)
-	// 等硬编码端口段冲突 —— 各测试的 go startXxx 后台协程不会退出，会长期占用端口。
+	// Port bases sit in the 27000 range to avoid colliding with hardcoded
+	// ranges such as e2e_test's StrictDemux (22000-22003) — the go startXxx
+	// background goroutines of each test never exit and hold their ports for a long time.
 	echoPort := 27000 + seq*2
 	serverPort := 27443 + seq*2
 	startEchoServer(fmt.Sprintf("127.0.0.1:%d", echoPort))
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
-	go startServerDirect(ServerConfig{
+	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
 		TLSKey:        keyFile,
 		EnableTLS:     true,
 		Path:          "/tunnel",
 		Transport:     transportH2,
-		ExpectedToken: "backup-token",
+		Authenticator: tokenAuth("backup-token"),
 		LogLevel:      "error",
 		SessionWindow: 256,
 		Network:       "all",
 	})
-	time.Sleep(2 * time.Second)
+	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
 	return "https://" + serverAddr + "|" + fmt.Sprintf("%d", echoPort)
 }
 
 func newInsecureHTTPClient() *http.Client {
-	// 与真实客户端一致：HTTP/2（h2c/TLS h2），帧流式传输依赖多路复用。
+	// Consistent with the real client: HTTP/2 (h2c / TLS h2); frame streaming relies on multiplexing.
 	return &http.Client{
 		Transport: &http2.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -61,11 +63,11 @@ func newInsecureHTTPClient() *http.Client {
 	}
 }
 
-// TestBackupHotStandbyAlive 热备：备用独立握手成功后进入 Alive 状态。
+// TestBackupHotStandbyAlive hot standby: the backup enters Alive after its independent handshake succeeds.
 func TestBackupHotStandbyAlive(t *testing.T) {
 	env := startBackupTestEnv(t, 1)
 	serverURL, echoAddr := splitTestEnv(env)
-	cfg := ClientConfig{
+	cfg := clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,
@@ -83,30 +85,30 @@ func TestBackupHotStandbyAlive(t *testing.T) {
 	go bl.Start()
 	defer bl.close()
 
-	// 等待备用握手完成 → Alive
+	// Wait for the backup handshake to complete → Alive
 	deadline := time.After(8 * time.Second)
 	for {
 		if bl.Alive() {
 			break
 		}
 		if bl.State() == backupFailed {
-			t.Fatalf("备用握手失败，state=%s", bl.State())
+			t.Fatalf("backup handshake failed, state=%s", bl.State())
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("备用未在期限内变为 Alive，state=%s", bl.State())
+			t.Fatalf("backup did not become Alive within the deadline, state=%s", bl.State())
 		default:
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	t.Logf("✅ 备用热备进入 Alive（可接管）")
+	t.Logf("✅ backup hot standby reached Alive (takeover-ready)")
 }
 
-// TestBackupTakeoverOnlyIfConfirmed 只有已确认存活的备用才允许接管。
+// TestBackupTakeoverOnlyIfConfirmed only a backup confirmed alive may take over.
 func TestBackupTakeoverOnlyIfConfirmed(t *testing.T) {
 	env := startBackupTestEnv(t, 2)
 	serverURL, echoAddr := splitTestEnv(env)
-	cfg := ClientConfig{
+	cfg := clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,
@@ -120,16 +122,16 @@ func TestBackupTakeoverOnlyIfConfirmed(t *testing.T) {
 	}
 	hc := newInsecureHTTPClient()
 
-	// 场景 A：新建未启动的备用 → 未确认 → 禁止接管
+	// Scenario A: freshly created, not started backup → unconfirmed → takeover forbidden
 	bl := newManagedLine("sess-takeover-a", roleBackup, networkTCP, cfg, serverURL+"/tunnel", hc, nil, 0)
 	if bl.Alive() {
-		t.Fatal("未启动的备用不应 Alive（禁止接管）")
+		t.Fatal("a not-started backup must not be Alive (takeover forbidden)")
 	}
 	if bl.State() != backupIdle {
-		t.Fatalf("未启动备用 state = %s, want idle", bl.State())
+		t.Fatalf("not-started backup state = %s, want idle", bl.State())
 	}
 
-	// 场景 B：启动后变为 Alive → 允许接管
+	// Scenario B: becomes Alive after start → takeover allowed
 	go bl.Start()
 	defer bl.close()
 	deadline := time.After(8 * time.Second)
@@ -138,31 +140,31 @@ func TestBackupTakeoverOnlyIfConfirmed(t *testing.T) {
 			break
 		}
 		if bl.State() == backupFailed {
-			t.Fatalf("备用握手失败")
+			t.Fatalf("backup handshake failed")
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("备用未 Alive")
+			t.Fatalf("backup not Alive")
 		default:
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
 	if !bl.Alive() {
-		t.Fatal("已确认存活的备用应允许接管")
+		t.Fatal("a backup confirmed alive should allow takeover")
 	}
-	t.Logf("✅ 只有确认存活的备用允许接管")
+	t.Logf("✅ only a backup confirmed alive is allowed to take over")
 }
 
-// TestBackupWrongTokenRejected 鉴权失败 → 备用握手被拒 → 不可接管。
+// TestBackupWrongTokenRejected auth failure → backup handshake rejected → no takeover.
 func TestBackupWrongTokenRejected(t *testing.T) {
 	env := startBackupTestEnv(t, 3)
 	serverURL, echoAddr := splitTestEnv(env)
-	cfg := ClientConfig{
+	cfg := clientConfig{
 		ServerUrl:      serverURL,
 		Path:           "/tunnel",
 		TargetAddr:     echoAddr,
 		Insecure:       true,
-		Token:          "WRONG-token", // 错误 token
+		Token:          "WRONG-token", // wrong token
 		Network:        "tcp",
 		LogLevel:       "error",
 		SessionWindow:  256,
@@ -177,7 +179,7 @@ func TestBackupWrongTokenRejected(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 	if bl.Alive() {
-		t.Fatal("鉴权失败的备用不应 Alive（禁止接管）")
+		t.Fatal("a backup that failed auth must not be Alive (takeover forbidden)")
 	}
-	t.Logf("✅ 鉴权失败备用被拒，不可接管")
+	t.Logf("✅ auth-failed backup rejected, no takeover")
 }

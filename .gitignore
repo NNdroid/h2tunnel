@@ -35,4 +35,5 @@ go.work.sum
 bin/
 
 .workbuddy/
-.codebuddy/
+.codebuddy/docs/
+*.pem

@@ -4,7 +4,7 @@ set -e
 APP_NAME="h2tunnel"
 GITHUB_REPO="NNdroid/${APP_NAME}"
 INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/${APP_NAME}"
+CONFIG_DIR="/usr/local/etc/${APP_NAME}"
 SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_FILE="${SYSTEMD_DIR}/${APP_NAME}.service"
 
@@ -33,10 +33,10 @@ get_arch() {
   esac
 }
 
-# 生成分享 URI 时的额外参数：
-#   GEN_URI_PIN   —— 指定固定的 6 位分享 PIN（默认留空=每次随机生成，需在输出中抄下）。
-#   GEN_URI_HOST  —— 覆盖分享 URI 中的服务器公网 IP/域名（server 配置通常只有 listen 端口，
-#                     不包含公网地址；不设置时占位为 your-server-ip，客户端无法连接）。
+# Extra arguments when generating the share URI:
+#   GEN_URI_PIN   —— a fixed 6-digit sharing PIN (default empty = randomly generated each time, note it from the output).
+#   GEN_URI_HOST  —— override the server public IP/domain in the share URI (server configs usually only have a listen port,
+#                     no public address; if unset the placeholder is your-server-ip and clients cannot connect).
 gen_uri_extra_args() {
   local args=""
   if [ -n "${GEN_URI_PIN:-}" ]; then
@@ -59,9 +59,9 @@ install_binary() {
   elif [ -f "./${APP_NAME}" ]; then
     echo -e "${CYAN}--> Using local binary...${PLAIN}"
     cp "./${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
-  elif command -v go >/dev/null 2>&1 && [ -f "./main.go" ]; then
+  elif command -v go >/dev/null 2>&1 && [ -f "./go.mod" ] && [ -d "./cmd/h2tunnel" ]; then
     echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
-    CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" .
+    CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" ./cmd/h2tunnel
   else
     echo -e "${CYAN}--> Downloading latest release binary (${goarch})...${PLAIN}"
     local download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${APP_NAME}_linux_${goarch}"
@@ -80,7 +80,7 @@ get_config_file() {
   if [ "${mode}" == "client" ]; then
     echo "${CONFIG_DIR}/config.client.json"
   else
-    echo "${CONFIG_DIR}/config.server.json"
+    echo "${CONFIG_DIR}/config.json"
   fi
 }
 
@@ -243,9 +243,9 @@ do_logs() {
 }
 
 do_uri() {
-  local config_file="${CONFIG_DIR}/config.server.json"
+  local config_file="${CONFIG_DIR}/config.json"
   if [ ! -f "${config_file}" ]; then
-    config_file="${CONFIG_DIR}/config.json"
+    config_file="${CONFIG_DIR}/config.server.json"
   fi
   "${INSTALL_DIR}/${APP_NAME}" gen-uri -c "${config_file}" $(gen_uri_extra_args)
 }

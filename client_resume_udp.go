@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"context"
@@ -14,48 +14,55 @@ import (
 )
 
 // =========================================
-// 客户端 UDP 会话恢复（datagram resume）
+// Client UDP session resume (datagram resume).
 //
-// 与 executeResumableTunnel（stream/TCP）的差异：
-//   - UDP 是数据报模型，不做 seq 重放。断线重拨同 session id 的 HTTP 流
-//     后，服务端复用同一个 UDP socket（tunnelSession.datagram=true），
-//     新流上继续收发后续 UDP 包，已发出/已收到的包不重放。
-//   - 上行：本地 UDP 包经 frameW（writeUDPPacket / writeUDPCapsule）
-//     封装成 wire 帧写入流 body。
-//   - 下行：从流 body 用 frameR 解出 UDP 包写回本地 UDP socket。
-//   - 流断（读错误/写失败）不结束会话，回到外层 attempts 循环用
-//     同一 session id 重拨。
+// Differences from executeResumableTunnel (stream/TCP):
+//   - UDP is a datagram model with no seq replay. After reconnecting an HTTP
+//     stream with the same session id, the server reuses the same UDP socket
+//     (tunnelSession.datagram=true) and continues sending/receiving subsequent
+//     UDP packets on the new stream; already-sent/received packets are not replayed.
+//   - Uplink: local UDP packets are wrapped into wire frames by frameW
+//     (writeUDPPacket / writeUDPCapsule) and written into the stream body.
+//   - Downlink: UDP packets are decoded from the stream body via frameR and written back to the local UDP socket.
+//   - A stream break (read error / write failure) does not end the session; it returns to the outer attempts loop to redial with the same session id.
 // =========================================
 
 const (
-	udpResumeMaxAttempts = 16              // 单次 UDP 会话生命周期内的最大重建次数
-	udpResumeBackoffMax  = 5 * time.Second // 重建 backoff 上限
+	udpResumeMaxAttempts = 16              // max rebuilds within one UDP-session lifetime
+	udpResumeBackoffMax  = 5 * time.Second // rebuild backoff cap
 )
 
-// udpSession 一个逻辑 UDP 会话：承载某个 clientAddr → 目标 UDP 地址的转发。
-// 上行数据经 upstream 通道灌入当前活跃流的 write goroutine；
-// 下行由读循环解出写回本地 UDP socket。流断后重建，会话不中断。
+// udpSession is one logical UDP session carrying forwarding from a clientAddr to
+// the target UDP address. Uplink data flows through the upstream channel into the
+// current active stream's write goroutine; downlink is decoded by the read loop and
+// written back to the local UDP socket. On a stream break it rebuilds without ending the session.
 type udpSession struct {
 	sessionID  string
-	cfg        ClientConfig
+	cfg        clientConfig
 	reqUrl     string
 	httpClient *http.Client
 	localConn  *net.UDPConn
 	clientAddr *net.UDPAddr
 
-	// 数据面封装：masque-udp 用 capsule，其余用 datagram packet。
+	// Data-plane framing: masque-udp uses capsules, the rest use datagram packets.
 	frameW func(io.Writer, []byte) error
 	frameR func(io.Reader, []byte) (int, error)
 
-	// upstream 上行队列：本地 UDP 收包协程放入，流写协程消费。
+	// upstream is the uplink queue: the local UDP receive goroutine enqueues, the stream write goroutine consumes.
 	upstream chan []byte
-	// done 关闭时通知当前流的读写循环退出（会话结束）。
-	done     chan struct{}
-	doneOnce sync.Once
+	// closing done signals the current stream's read/write loops to exit (session end).
+	done      chan struct{}
+	doneOnce  sync.Once
+	ctx       context.Context
+	deliver   func([]byte) error
+	ready     chan<- error
+	readyOnce sync.Once
+	onDone    func(error)
+	force     chan struct{}
 }
 
-// newUDPSession 为单个 UDP clientAddr 建立逻辑会话并启动断线续传循环。
-func newUDPSession(sessionID string, cfg ClientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
+// newUDPSession creates a logical session for one UDP clientAddr and starts the reconnect loop.
+func newUDPSession(sessionID string, cfg clientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
 	s := &udpSession{
 		sessionID:  sessionID,
 		cfg:        cfg,
@@ -63,14 +70,14 @@ func newUDPSession(sessionID string, cfg ClientConfig, reqUrl string, httpClient
 		httpClient: httpClient,
 		localConn:  localConn,
 		clientAddr: clientAddr,
-		upstream:   make(chan []byte, 200),
+		upstream:   make(chan []byte, cfg.datagramQueueSize()),
 		done:       make(chan struct{}),
 	}
 	if cfg.usesMasque() {
-		s.frameW = writeUDPCapsule
+		s.frameW = func(w io.Writer, p []byte) error { return writeUDPCapsule(w, p, cfg.Padding) }
 		s.frameR = readUDPCapsule
 	} else {
-		s.frameW = writeUDPPacket
+		s.frameW = func(w io.Writer, p []byte) error { return writeUDPPacket(w, p, cfg.Padding) }
 		s.frameR = readUDPPacket
 	}
 	return s
@@ -80,27 +87,52 @@ func (s *udpSession) close() {
 	s.doneOnce.Do(func() { close(s.done) })
 }
 
-// enqueue 把本地 UDP 收到的包入上行队列；会话已结束则丢弃。
+func (s *udpSession) notifyReady(err error) {
+	if s.ready == nil {
+		return
+	}
+	s.readyOnce.Do(func() { s.ready <- err })
+}
+
+// enqueue puts a locally received UDP packet onto the uplink queue; drops it if the session already ended.
 func (s *udpSession) enqueue(pkt []byte) {
 	select {
 	case <-s.done:
 		return
 	case s.upstream <- pkt:
 	default:
-		zlog.Warnf("[UDP-Resume:%s] 上行队列溢出，丢弃来自 %s 的包", s.sessionID, s.clientAddr)
+		lgWarnf(s.cfg.lg(), "[UDP-Resume:%s] ⚠️ uplink queue overflow, dropping packet from %s", s.sessionID, s.clientAddr)
 	}
 }
 
-// run 启动会话主循环：持续建流 → 续传，直到本地 socket 关闭或超过最大重试。
+// run starts the session main loop: keep opening streams -> resuming, until the local socket closes or max retries are exceeded.
 func (s *udpSession) run() {
-	defer s.close()
-	for attempt := 1; attempt <= udpResumeMaxAttempts; attempt++ {
+	var finalErr error
+	defer func() {
+		s.notifyReady(finalErr)
+		s.close()
+		if s.onDone != nil {
+			s.onDone(finalErr)
+		}
+	}()
+	for attempt := 1; ; attempt++ {
 		if s.isDone() {
+			if err := s.context().Err(); err != nil {
+				finalErr = err
+			} else {
+				finalErr = net.ErrClosed
+			}
 			return
 		}
 		err := s.runOneStream()
 		if err == nil {
-			return // 正常结束（对端关闭）
+			return // normal end (peer closed)
+		}
+		finalErr = err
+		// AutoRedial semantics match the TCP side: when on, even "permanent" errors
+		// (auth / target denied) keep redialing — these are usually transient after a network change.
+		if !s.cfg.AutoRedial && isPermanentTunnelError(err) {
+			return
 		}
 		if s.isDone() {
 			return
@@ -109,36 +141,108 @@ func (s *udpSession) run() {
 		if delay > udpResumeBackoffMax {
 			delay = udpResumeBackoffMax
 		}
-		zlog.Infof("[UDP-Resume:%s] 🔁 流断，第 %d 次重拨（同 session 续传），等待 %v: %v",
+		lgInfof(s.cfg.lg(), "[UDP-Resume:%s] 🔁 stream break, redial #%d (same-session resume), waiting %v: %v",
 			s.sessionID, attempt, delay, err)
+		if s.cfg.events != nil {
+			s.cfg.events.dispatch(ClientEvent{
+				Kind:      EventReconnecting,
+				Target:    s.cfg.TargetAddr,
+				Network:   NetworkUDP,
+				Transport: s.cfg.transportValue(),
+				Attempt:   attempt,
+				Reason:    "datagram stream interrupted",
+				Err:       err,
+			})
+		}
+		if s.cfg.stats != nil {
+			s.cfg.stats.ResumeReconnects.Add(1)
+		}
 		select {
 		case <-s.done:
 			return
+		case <-s.context().Done():
+			finalErr = s.context().Err()
+			return
 		case <-time.After(delay):
 		}
+
+		// Redial-exhaustion handling: AutoRedial matches the TCP side (infinite revival).
+		if attempt%udpResumeMaxAttempts == 0 {
+			if !s.cfg.AutoRedial {
+				break
+			}
+			lgWarnf(s.cfg.lg(), "[UDP-Resume:%s] 🔁 redial hit the %d cap; AutoRedial resets the counter and continues", s.sessionID, udpResumeMaxAttempts)
+		}
 	}
-	zlog.Warnf("[UDP-Resume:%s] 超过最大重试次数 (%d)，会话终止", s.sessionID, udpResumeMaxAttempts)
+	lgWarnf(s.cfg.lg(), "[UDP-Resume:%s] ❌ exceeded max retries (%d); session terminated", s.sessionID, udpResumeMaxAttempts)
 }
 
 func (s *udpSession) isDone() bool {
 	select {
 	case <-s.done:
 		return true
+	case <-s.context().Done():
+		return true
 	default:
 		return false
 	}
 }
 
-// runOneStream 建立一条 HTTP 流并在其上续传。返回 nil 表示正常结束；
-// 返回 err 表示流中断（应重拨）。
+func (s *udpSession) context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+func (s *udpSession) enqueueContext(ctx context.Context, pkt []byte) error {
+	select {
+	case <-s.done:
+		return net.ErrClosed
+	case <-s.context().Done():
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.upstream <- pkt:
+		return nil
+	}
+}
+
+// runOneStream opens one HTTP stream and resumes over it. Returns nil on a normal end;
+// returns err on a stream break (should redial).
 func (s *udpSession) runOneStream() error {
 	pr, pw := io.Pipe()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.context())
 	defer cancel()
 
-	req := buildResumeUDPRequest(ctx, pr, s.sessionID, s.reqUrl, s.cfg)
+	// RedialBudget bounds only the stream-open phase; the timer stops at ready, so
+	// established streams are unaffected (matching the TCP/WT side).
+	var budgetStop func()
+	if s.cfg.RedialBudget > 0 {
+		timer := time.AfterFunc(s.cfg.RedialBudget, func() {
+			lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] ⏱️ dial budget %v expired, canceling this stream open", s.sessionID, s.cfg.RedialBudget)
+			cancel()
+		})
+		budgetStop = func() { timer.Stop() }
+		defer timer.Stop()
+	}
+
+	// A force signal cancels this stream's ctx, interrupting the reader to trigger a redial (the server's UDP socket is preserved).
+	go func() {
+		select {
+		case <-s.force:
+			lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] 🔌 force pulse: interrupting the current stream and redialing immediately (server UDP socket preserved)", s.sessionID)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	req, err := buildResumeUDPRequestChecked(ctx, pr, s.sessionID, s.reqUrl, s.cfg)
+	if err != nil {
+		return err
+	}
 	var resp *http.Response
-	var err error
+	err = nil
 	if rt, ok := s.httpClient.Transport.(http.RoundTripper); ok && s.cfg.usesMasque() {
 		resp, err = rt.RoundTrip(req)
 	} else {
@@ -149,62 +253,83 @@ func (s *udpSession) runOneStream() error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("服务端拒绝: HTTP %d", resp.StatusCode)
+		return newTunnelHTTPError(resp.StatusCode)
 	}
-	zlog.Infof("[UDP-Resume:%s] ✅ 隧道就绪", s.sessionID)
+	lgInfof(s.cfg.lg(), "[UDP-Resume:%s] ✅ tunnel ready", s.sessionID)
+	if budgetStop != nil {
+		budgetStop() // after ready the budget no longer bounds the data plane
+	}
+	s.notifyReady(nil)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 上行：消费 upstream 队列 → frameW 封装 → 写流 body。
+	// Uplink: drain the upstream queue -> wrap via frameW -> write into the stream body.
 	go func() {
 		defer wg.Done()
+		defer cancel()
 		defer pw.Close()
 		for {
 			select {
 			case <-s.done:
+				return
+			case <-ctx.Done():
 				return
 			case pkt, ok := <-s.upstream:
 				if !ok {
 					return
 				}
 				if err := s.frameW(pw, pkt); err != nil {
-					zlog.Debugf("[UDP-Resume:%s] 上行写失败: %v", s.sessionID, err)
+					lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] ❌ uplink write failed: %v", s.sessionID, err)
 					return
 				}
 			}
 		}
 	}()
 
-	// 下行：读流 body → frameR 解包 → 写回本地 UDP socket。
+	// Downlink: read the stream body -> decode via frameR -> write back to the local UDP socket.
 	go func() {
 		defer wg.Done()
+		defer cancel()
 		bufPtr := udpBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer udpBufPool.Put(bufPtr)
 		for {
 			n, rErr := s.frameR(resp.Body, buf)
 			if rErr != nil {
-				zlog.Debugf("[UDP-Resume:%s] 下行读结束: %v", s.sessionID, rErr)
+				lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] downlink read ended: %v", s.sessionID, rErr)
 				return
 			}
-			if _, wErr := s.localConn.WriteToUDP(buf[:n], s.clientAddr); wErr != nil {
-				zlog.Debugf("[UDP-Resume:%s] 本地 UDP 写失败: %v", s.sessionID, wErr)
+			var wErr error
+			if s.deliver != nil {
+				wErr = s.deliver(buf[:n])
+			} else if s.localConn != nil {
+				_, wErr = s.localConn.WriteToUDP(buf[:n], s.clientAddr)
+			} else {
+				wErr = errors.New("udp resume session has no delivery target")
+			}
+			if wErr != nil {
+				lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] local UDP write failed: %v", s.sessionID, wErr)
 				return
 			}
 		}
 	}()
 
 	wg.Wait()
-	return errors.New("stream closed") // 流结束 → 触发重拨
+	return errors.New("stream closed") // stream ended -> trigger a redial
 }
 
-// buildResumeUDPRequest 构造 UDP resume 请求：
+// buildResumeUDPRequest builds a UDP resume request:
 //   - masque-udp：CONNECT /.well-known/masque/udp/<host>/<port>/, Protocol: connect-udp
 //   - h2/h3/grpc：POST cfg.Path，X-Network=udp，X-Target=<target>
 //
-// 帧数据面：masque 用 capsule，其余用 datagram packet（不含 seq）。
-func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl string, cfg ClientConfig) *http.Request {
+// Frame data plane: masque uses capsules, the rest use datagram packets (no seq).
+func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl string, cfg clientConfig) *http.Request {
+	req, _ := buildResumeUDPRequestChecked(ctx, body, sessID, reqUrl, cfg)
+	return req
+}
+
+func buildResumeUDPRequestChecked(ctx context.Context, body io.Reader, sessID, reqUrl string, cfg clientConfig) (*http.Request, error) {
 	var method, reqURL string
 	if cfg.usesMasque() {
 		method = http.MethodConnect
@@ -213,53 +338,59 @@ func buildResumeUDPRequest(ctx context.Context, body io.Reader, sessID, reqUrl s
 			host, port = cfg.TargetAddr, "53"
 		}
 		u, _ := url.Parse(reqUrl)
-		u.Path = fmt.Sprintf("/.well-known/masque/udp/%s/%s/", url.PathEscape(host), url.PathEscape(port))
+		u.Path = fmt.Sprintf("%s/udp/%s/%s/", masquePathBase(cfg.Path), url.PathEscape(host), url.PathEscape(port))
 		reqURL = u.String()
 	} else {
 		method = http.MethodPost
 		reqURL = reqUrl
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, method, reqURL, body)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyClientCredentials(ctx, req.Header, cfg); err != nil {
+		return nil, err
+	}
 	req.Header.Set("X-Tunnel-Proto", resumeFrameTypeResume)
 	req.Header.Set("X-Session-ID", sessID)
-	// ===== resume/2 握手头：版本 / 能力 / 参数（datagram 也走 A 层协商）=====
+	// ===== resume/2 handshake headers: version / capabilities / parameters (datagram also does layer-A negotiation) =====
 	req.Header.Set("X-Resume-Version", "2")
 	req.Header.Set("X-Resume-Caps", clientCapabilities(cfg).String())
 	req.Header.Set("X-Resume-Params", clientParams(cfg).String())
 	if cfg.RoleBackup {
 		req.Header.Set("X-Resume-Role", "backup")
 	}
-	SetXNetwork(req.Header, "udp")
-	SetXTarget(req.Header, cfg.TargetAddr)
+	setXNetwork(req.Header, "udp")
+	setXTarget(req.Header, cfg.TargetAddr)
 	if cfg.CustomHost != "" {
 		req.Host = cfg.CustomHost
 	}
-	SetXAuth(req.Header, cfg)
 	setTunnelRequestHeaders(req.Header)
 
 	if cfg.usesMasque() {
-		req.Header.Set("Protocol", "connect-udp")
+		req.Header.Set("Protocol", protocolConnectUDP)
 		req.Header.Set("Capsule-Protocol", "?1")
-		// http3.Transport 需要显式声明 HTTP/3，否则 CONNECT 目标路径可能被改写为空
+		// http3.Transport needs an explicit HTTP/3 declaration, or the CONNECT target path may be rewritten to empty
 		req.Proto = "HTTP/3"
 	}
 	if cfg.usesGRPC() {
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
 	}
-	return req
+	return req, nil
 }
 
-// clientUDPResumeSession 管理器：一个 UDP 会话对应一个活跃 HTTP 流。
-// 供 runStreamUDPClient / runMasqueUDPClient 复用同一套断线续传逻辑。
+// clientUDPResumeSession: one UDP session maps to one active HTTP stream.
+// runStreamUDPClient / runMasqueUDPClient reuse the same reconnect logic.
 
-// connectResumeUDP 建立一个新的 UDP resume 会话，返回其实例与入队函数。
-// sessionID 需在调用方生成（newClientSessionID）。httpClient 为空时返回 nil
-// （无可用主线路，调用方应优雅丢弃该 UDP 会话）。
-func connectResumeUDP(sessionID string, cfg ClientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
+// connectResumeUDP creates a new UDP resume session and returns its instance and
+// enqueue function. sessionID must be generated by the caller (newClientSessionID).
+// Returns nil when httpClient is empty (no available primary lane; the caller should
+// drop this UDP session gracefully).
+func connectResumeUDP(sessionID string, cfg clientConfig, reqUrl string, httpClient *http.Client, localConn *net.UDPConn, clientAddr *net.UDPAddr) *udpSession {
 	if httpClient == nil {
-		zlog.Warnf("[UDP-Resume:%s] 无可用主线路客户端，放弃 UDP 会话", sessionID)
+		lgWarnf(cfg.lg(), "[UDP-Resume:%s] ❌ no available primary-lane client, dropping UDP session", sessionID)
 		return nil
 	}
 	s := newUDPSession(sessionID, cfg, reqUrl, httpClient, localConn, clientAddr)
@@ -267,7 +398,7 @@ func connectResumeUDP(sessionID string, cfg ClientConfig, reqUrl string, httpCli
 	return s
 }
 
-// validateResumeUDPID 供测试/日志确认 session id 非空。
+// validateResumeUDPID lets tests/logs confirm the session id is non-empty.
 func validateResumeUDPID(id string) string {
 	if id == "" {
 		return strconv.FormatInt(time.Now().UnixNano(), 16)

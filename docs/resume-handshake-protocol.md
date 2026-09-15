@@ -1,107 +1,107 @@
-# Resume 会话恢复协议 v2 · 握手与能力协商标准（含主备切换）
+# Resume Session-Recovery Protocol v2 · Handshake and Capability Negotiation Standard (with Primary/Backup Switchover)
 
-> 目标：把当前「隐式、单向下发」的 resume 握手，升级为「显式、双向、可协商、可演进、含主备冗余」的握手标准。
-> 支持版本协商、能力/参数交换、协商确认（ack）、控制帧优先处理、错误重试，以及主备线路的握手协同。
+> Goal: upgrade the current "implicit, one-way push-down" resume handshake into an explicit, bidirectional, negotiable, evolvable handshake standard with primary/backup redundancy.
+> It supports version negotiation, capability/parameter exchange, negotiation acknowledgement (ack), control-frame priority, error retries, and handshake coordination between the primary and backup lines.
 
 ---
 
-## 0. 现状诊断（为什么需要这次升级）
+## 0. Current-State Diagnosis (Why This Upgrade Is Needed)
 
-当前 `resume/1` 握手（`handleH2StreamResumeServer` + `buildResumeRequest`）存在以下缺陷：
+The current `resume/1` handshake (`handleH2StreamResumeServer` + `buildResumeRequest`) has the following defects:
 
-| 缺陷 | 现状 | 后果 |
+| Defect | Current state | Consequence |
 |---|---|---|
-| **无版本协商** | `X-Tunnel-Proto: resume/1` 硬编码字符串 | 协议演进（resume/2）无从谈起；新旧不兼容只能靠双方手动改配置 |
-| **无能力交换** | 服务端从 `X-Network` 头**猜**是否 datagram；从 `Content-Type` **猜**是否 grpc | 客户端真实能力（如"我支持压缩/备用线路/超时参数"）无法告知，无法动态自适应 |
-| **无参数协商** | `session_window_kb`、超时等是**双端各自配置** | 双端参数不一致时静默错配（如窗口一大一小），无法在握手中对齐 |
-| **无确认(ack)** | `X-Resume-Uplink` 是单向的下行坐标信息，**不是**协商确认 | 服务端是否接受客户端的能力集，客户端无从得知；"协商成功"无协议级信号 |
-| **错误粒度粗** | 依赖 HTTP 状态码（403/502） | 无法区分"版本不兼容 / 能力不支持 / 参数非法 / 备用线路不可用"等 |
-| **无备用线路握手** | 主/备切换是纯客户端本地行为 | 备用线路的存活、能力、参数在协议层完全不可见，切换是"盲切" |
-| **v1 旧路径冗余** | `resume/1` + Padding 帧路径 + grpcReader + copyWithHeartbeat 并存 | 双实现维护成本翻倍；旧路径无握手/无 ack/无主备，是功能盲区 |
+| **No version negotiation** | `X-Tunnel-Proto: resume/1` is a hardcoded string | Protocol evolution (resume/2) is out of the question; old/new incompatibility can only be fixed by both sides manually editing configuration |
+| **No capability exchange** | The server side **guesses** whether datagram is used from the `X-Network` header; **guesses** whether grpc is used from `Content-Type` | The client's real capabilities (e.g. "I support compression / backup line / timeout parameters") cannot be communicated, so there is no dynamic adaptation |
+| **No parameter negotiation** | `session_window_kb`, timeouts, etc. are **configured independently on each side** | When the two sides' parameters disagree there is a silent mismatch (e.g. one window big, one small) that cannot be aligned in the handshake |
+| **No acknowledgement (ack)** | `X-Resume-Uplink` is one-way downlink coordinate information, **not** a negotiation confirmation | The client has no way to know whether the server accepted its capability set; "negotiation succeeded" has no protocol-level signal |
+| **Coarse error granularity** | Relies on HTTP status codes (403/502) | Cannot distinguish "version incompatible / capability unsupported / invalid parameters / backup line unavailable" and the like |
+| **No backup-line handshake** | Primary/backup switchover is a purely local client-side behavior | The backup line's liveness, capabilities, and parameters are completely invisible at the protocol layer; switching is a "blind switchover" |
+| **Redundant v1 legacy path** | `resume/1` + the Padding frame path + grpcReader + copyWithHeartbeat coexist | The maintenance cost of two implementations doubles; the legacy path has no handshake, no ack, and no primary/backup — a functional blind spot |
 
-**本版设计决策（用户拍板）**：
-1. **v2 唯一、默认使用、彻底移除 v1**：`resume/2` 是唯一数据面。旧 `resume/1`、Padding 帧路径、`grpcReader/Writer`、`copyWithHeartbeat`、`proxyStream` 等全部删除，不留逃生通道。WT 传输也统一迁移到 v2 数据面。
-2. **主备切换本期实现**：完整热备/冷备 + KEEPALIVE 存活确认 + 仅接管已确认存活的备用。主备不是二期，是本期核心。
-3. **控制帧优先于数据帧**：握手/心跳/错误控制帧在发送队列中**始终优先于业务数据帧**，防止数据面拥塞阻塞握手与故障信号。
+**Design decisions for this version (finalized by the user)**:
+1. **v2 only, used by default, v1 fully removed**: `resume/2` is the only data plane. The old `resume/1`, the Padding frame path, `grpcReader/Writer`, `copyWithHeartbeat`, `proxyStream`, etc. are all deleted, leaving no escape hatch. WT transport is also unified onto the v2 data plane.
+2. **Primary/backup switchover is implemented this iteration**: full hot standby / cold standby + KEEPALIVE liveness confirmation + takeover only of a backup confirmed alive. Primary/backup is not phase 2 — it is a core deliverable of this iteration.
+3. **Control frames outrank data frames**: handshake/heartbeat/error control frames are **always prioritized over business data frames** in the send queue, preventing data-plane congestion from blocking handshake and failure signals.
 
-**格式原则**：字段**可扩展 + 向前兼容**——未知的能力名、参数名**必须忽略并继续工作**，绝不因一方新增字段而拒绝另一方。但**版本**是硬约束：版本无交集即失败（v1 已移除，无降级目标）。
+**Format principles**: fields are **extensible + forward-compatible** — unknown capability names and parameter names **must be ignored and work must continue**; never reject the other side just because it added new fields. But the **version** is a hard constraint: no version intersection means failure (v1 is removed, there is no downgrade target).
 
 ---
 
-## 1. 握手消息的字段设计与格式定义
+## 1. Field Design and Format Definition of Handshake Messages
 
-### 1.1 传输载体
+### 1.1 Transport carrier
 
-握手信息**全部放在 HTTP 头**（请求头 + 响应头），**不在数据面帧里**。
-理由：
-- 握手是一次性的、在流建立瞬间完成；HTTP 头天然适合"请求-响应"式一次交换。
-- 数据面帧（resumeframe.go）是**持续流动**的字节流，塞入握手会让帧解析复杂化，且无法覆盖"流重建后重新协商"的场景（每建一条流都要重协商能力，浪费）。
-- 中间件/CDN 可见 HTTP 头（对调试、灰度、审计友好）。
+All handshake information goes **in HTTP headers** (request headers + response headers), **not in data-plane frames**.
+Reasons:
+- The handshake is one-shot and completes at the instant the stream is established; HTTP headers are naturally suited to a single "request-response" exchange.
+- Data-plane frames (resumeframe.go) are a **continuously flowing** byte stream; cramming the handshake into them would complicate frame parsing and could not cover the "re-negotiate after a stream rebuild" scenario (re-negotiating capabilities for every new stream would be wasteful).
+- Middleware/CDNs can see HTTP headers (friendly to debugging, canary releases, and auditing).
 
-> ⚠️ 例外：**ack 确认**与**主备握手心跳**属于"需要实时往返且必须端到端"的信号，
-> 用**握手控制帧**（数据面哨兵帧）承载，见 1.4 与第 3 节。
+> ⚠️ Exceptions: the **ack confirmation** and the **primary/backup handshake heartbeats** are signals that "need real-time round trips and must be end-to-end";
+> they are carried by **handshake control frames** (data-plane sentinel frames) — see 1.4 and section 3.
 
-### 1.2 请求头（客户端 → 服务端）
+### 1.2 Request headers (client → server side)
 
-| 头字段 | 语义 | 示例 | 必填 | 兼容规则 |
+| Header field | Semantics | Example | Required | Compatibility rule |
 |---|---|---|---|---|
-| `X-Tunnel-Proto` | 协议名+大版本 | `resume/2` | ✅ | 仍为最高优先路由键 |
-| `X-Resume-Version` | 客户端**支持的最低协议版本** | `2` | ✅ | 服务端据此决定响应版本 |
-| `X-Resume-Caps` | 能力列表（逗号分隔） | `datagram,compress,zstd,backup-line` | 可选 | 未知能力服务端忽略 |
-| `X-Resume-Params` | 参数 k=v（`;` 分隔） | `window_kb=512;idle=90;attempts=16` | 可选 | 未知参数忽略；已知但非法 → 回退默认并记日志 |
-| `X-Resume-Ack` | 对**上一条流**服务端能力集的确认回执 | `proto=2;caps=datagram,compress;params=...` | 可选（重建时） | 见 1.4 |
-| `X-Session-ID` | 会话 id | （已有） | ✅ | 不变 |
-| `X-Resume-Downlink` | 客户端已收下行字节 | （已有） | ✅ | 不变 |
-| `X-Network` | `tcp` / `udp` | 已有 | ✅ | 不变 |
-| `X-Target` / masque path | 目标地址 | 已有 | ✅ | 不变 |
+| `X-Tunnel-Proto` | Protocol name + major version | `resume/2` | ✅ | Still the highest-priority routing key |
+| `X-Resume-Version` | The **minimum protocol version supported** by the client | `2` | ✅ | The server decides the response version accordingly |
+| `X-Resume-Caps` | Capability list (comma-separated) | `datagram,compress,zstd,backup-line` | Optional | Unknown capabilities are ignored by the server |
+| `X-Resume-Params` | Parameters k=v (`;` separated) | `window_kb=512;idle=90;attempts=16` | Optional | Unknown parameters are ignored; known-but-invalid → fall back to defaults and log |
+| `X-Resume-Ack` | Receipt acknowledging the server capability set of the **previous stream** | `proto=2;caps=datagram,compress;params=...` | Optional (on rebuild) | See 1.4 |
+| `X-Session-ID` | Session id | (existing) | ✅ | Unchanged |
+| `X-Resume-Downlink` | Downlink bytes already received by the client | (existing) | ✅ | Unchanged |
+| `X-Network` | `tcp` / `udp` | existing | ✅ | Unchanged |
+| `X-Target` / masque path | Target address | existing | ✅ | Unchanged |
 
-### 1.3 响应头（服务端 → 客户端）
+### 1.3 Response headers (server side → client)
 
-| 头字段 | 语义 | 示例 | 必填 | 兼容规则 |
+| Header field | Semantics | Example | Required | Compatibility rule |
 |---|---|---|---|---|
-| `X-Resume-Version` | **协商后的协议版本**（min(双方)） | `2` | ✅ | 必回；是"版本协商成功"的显式信号 |
-| `X-Resume-Caps` | 服务端**已接受**的能力集（交集） | `datagram,compress` | ✅ | 客户端只应使用交集内的能力 |
-| `X-Resume-Params` | 服务端**最终生效**的参数（对齐后） | `window_kb=256;idle=90` | ✅ | 客户端必须以响应值为准 |
-| `X-Resume-Ack` | 服务端确认客户端能力集 | `ok` 或 `error:<code>` | ✅ | 见 1.4 |
-| `X-Resume-Uplink` | 服务端已收上行字节（坐标） | 已有 | ✅ | 不变，属于数据面坐标而非协商 |
-| `X-Resume-Error` | 协商失败错误码 | `version-unsupported` | 仅失败时 | 见 1.5 |
+| `X-Resume-Version` | The **negotiated protocol version** (min of both sides) | `2` | ✅ | Must be returned; the explicit signal that "version negotiation succeeded" |
+| `X-Resume-Caps` | The capability set **accepted** by the server (the intersection) | `datagram,compress` | ✅ | The client should only use capabilities within the intersection |
+| `X-Resume-Params` | The parameters **finally in effect** on the server (after alignment) | `window_kb=256;idle=90` | ✅ | The client must defer to the response values |
+| `X-Resume-Ack` | Server acknowledgement of the client capability set | `ok` or `error:<code>` | ✅ | See 1.4 |
+| `X-Resume-Uplink` | Uplink bytes already received by the server (coordinate) | existing | ✅ | Unchanged; a data-plane coordinate, not negotiation |
+| `X-Resume-Error` | Negotiation-failure error code | `version-unsupported` | On failure only | See 1.5 |
 
-### 1.4 确认机制（ack）—— 双层确认
+### 1.4 Acknowledgement mechanism (ack) — two-layer confirmation
 
-协商确认分**两层**，分别解决"能力对齐"与"端点活性"：
+Negotiation confirmation is split into **two layers**, addressing "capability alignment" and "endpoint liveness" respectively:
 
-**A 层：HTTP 头内确认（协商结果确认）**
-- 服务端在响应头回 `X-Resume-Caps`（交集）+ `X-Resume-Ack: ok`，表示"我收到了你的能力，并按交集生效"。
-- 客户端**必须先读到** `X-Resume-Ack: ok` 且版本、参数都符合预期，**才允许**开始上行数据写入。
-- 若服务端能力交集为空（无任何共同能力）→ `X-Resume-Ack: error:<code>` + 对应 HTTP 状态码（见 1.5）。
+**Layer-A: confirmation inside HTTP headers (negotiation-result confirmation)**
+- The server returns `X-Resume-Caps` (the intersection) + `X-Resume-Ack: ok` in the response headers, meaning "I received your capabilities and am applying the intersection".
+- The client **must first read** `X-Resume-Ack: ok` with version and parameters as expected **before it is allowed** to start writing uplink data.
+- If the capability intersection is empty (no common capability at all) → `X-Resume-Ack: error:<code>` + the corresponding HTTP status code (see 1.5).
 
-**B 层：数据面握手控制帧（端点活性 + 流级确认）**
-- 流建立后、传业务数据前，客户端先发一个**握手控制帧**（新帧类型 `HANDSHAKE`），携带客户端对响应能力集的回执哈希；服务端收帧后回一个 `HANDSHAKE-ACK` 控制帧。
-- 目的：① 证明"这条流真正端到端活着"（HTTP 200 可能只是中间层缓存/假响应）；② 让双方知道"可以开始正式数据"。
-- **超时**：若 `handshakeAckTimeout`（默认 3s，可参数化）内未收到对端 HANDSHAKE-ACK，判定握手失败，走重试逻辑（1.6）。
+**Layer-B: data-plane handshake control frames (endpoint liveness + stream-level confirmation)**
+- After the stream is established and before business data is transferred, the client first sends a **handshake control frame** (new frame type `HANDSHAKE`) carrying the client's receipt hash of the response capability set; upon receiving it, the server replies with a `HANDSHAKE-ACK` control frame.
+- Purpose: ① prove "this stream is truly alive end-to-end" (an HTTP 200 may be nothing but an intermediate-layer cache/fake response); ② let both sides know "official data may begin".
+- **Timeout**: if no HANDSHAKE-ACK is received from the peer within `handshakeAckTimeout` (default 3s, parameterizable), the handshake is judged failed and retry logic kicks in (1.6).
 
-> 双层原因：A 层快（头级，建流即得），但不可靠（可能被反代改写）；B 层稳（端到端），但多一次往返。
-> 生产环境两者都要；测试可分别测。
+> Why two layers: layer-A is fast (header-level, available as soon as the stream is built) but unreliable (a reverse proxy may rewrite it); layer-B is solid (end-to-end) but costs one extra round trip.
+> Production needs both; tests may exercise each separately.
 
-### 1.5 错误与重试处理
+### 1.5 Error and retry handling
 
-协商失败错误码（响应头 `X-Resume-Error` + 对应 HTTP 状态）：
+Negotiation-failure error codes (response header `X-Resume-Error` + corresponding HTTP status):
 
-| 错误码 | HTTP | 含义 | 客户端行为 |
+| Error code | HTTP | Meaning | Client behavior |
 |---|---|---|---|
-| `version-unsupported` | 426 | 双方协议版本无交集 | 终止（v1 已移除，**无降级目标**，直接失败并提示升级） |
-| `no-common-capability` | 406 | 能力交集为空 | 终止或降级到最小能力集（见 2.6） |
-| `invalid-params` | 400 | 客户端参数非法 | 用服务端回传的默认参数重试一次 |
-| `auth-failed` | 401/403 | 鉴权失败 | 终止 |
-| `target-unavailable` | 502/503 | 目标不可达 | 指数退避重试 |
-| `handshake-timeout` | 504 | B 层 HANDSHAKE-ACK 超时 | 重试建流 |
-| `backup-unavailable` | 200+`X-Resume-Ack:error` | 备用线路不可用 | 仅主用，见第 3 节 |
+| `version-unsupported` | 426 | No protocol-version intersection between the two sides | Terminate (v1 is removed, **no downgrade target**; fail outright with an upgrade hint) |
+| `no-common-capability` | 406 | Capability intersection is empty | Terminate or downgrade to the minimum capability set (see 2.6) |
+| `invalid-params` | 400 | Invalid client parameters | Retry once with the default parameters echoed back by the server |
+| `auth-failed` | 401/403 | Authentication failed | Terminate |
+| `target-unavailable` | 502/503 | Target unreachable | Retry with exponential backoff |
+| `handshake-timeout` | 504 | Layer-B HANDSHAKE-ACK timeout | Retry stream establishment |
+| `backup-unavailable` | 200+`X-Resume-Ack:error` | Backup line unavailable | Primary only, see section 3 |
 
-重试策略（统一到 `resumeMaxAttempts=16` + 指数退避 `200ms→5s`，沿用现有 backoff）：
-- `version-unsupported` / `no-common-capability` / `auth-failed` → **不可重试**（确定性失败），立即终止。
-- 其余 → 重试；每次重试用**服务端最新回传的版本/能力/参数**（自适应收敛）。
+Retry strategy (unified at `resumeMaxAttempts=16` + exponential backoff `200ms→5s`, reusing the existing backoff):
+- `version-unsupported` / `no-common-capability` / `auth-failed` → **not retryable** (deterministic failures), terminate immediately.
+- Everything else → retry; each retry uses the **latest version/capabilities/parameters echoed back by the server** (adaptive convergence).
 
-### 1.6 握手时序图
+### 1.6 Handshake sequence diagram
 
 ```
 Client                                  Server
@@ -109,288 +109,288 @@ Client                                  Server
   │   X-Resume-Version:2, X-Resume-Caps:datagram,      │
   │   compress,backup-line, X-Resume-Params:window_kb=512)  │
   │ ─────────────────────────────────────────────────→  │
-  │                                    校验版本∩能力∩参数   │
+  │                       validate version ∩ caps ∩ params   │
   │  ←──────────────────────────────────────────────────  │
   │  200 X-Resume-Version:2, X-Resume-Caps:datagram,     │
   │   compress, X-Resume-Params:window_kb=256;idle=90,   │
   │   X-Resume-Ack:ok, X-Resume-Uplink:0                 │
-  │      │（客户端校验 ack=ok 且参数合法才继续）            │
-  │  ── HANDSHAKE 控制帧（回执哈希）──────────────────→   │
-  │  ←─ HANDSHAKE-ACK 控制帧（确认端到端活性）──────────  │
-  │      │ （收到 ACK 前不写业务数据）                     │
-  │  ═══ 业务数据（resume 帧）开始 ═══                     │
+  │      │ (client proceeds only after verifying ack=ok and valid params) │
+  │  ── HANDSHAKE control frame (receipt hash) ─────────→ │
+  │  ←─ HANDSHAKE-ACK control frame (confirms end-to-end liveness) ── │
+  │      │ (no business data written before ACK received) │
+  │  ═══ business data (resume frames) begins ═══          │
 ```
 
 ---
 
-## 2. 可扩展、向前兼容的标准信息交换格式
+## 2. Extensible, Forward-Compatible Standard Information-Exchange Format
 
-### 2.1 设计约束
-- **未知即忽略（软项）**：解析端对不认识的能力名/参数名，**跳过不报错**；但**版本号是硬约束**（见 2.4），未知版本直接报 `version-unsupported`。
-- **协商规则**：协议版本取 `min(双端)`（v2 唯一，非 2 即失败）；能力取交集（空则降级最小集，见 2.6）；参数按"服务端为准 + 非法回退默认"。
-- **有序性**：能力列表、参数列表**不依赖顺序**（解析为集合/映射）。
-- **字符安全**：能力名/参数名只用 `[a-z0-9-]`，值用 `[a-zA-Z0-9._-]`，避免与分隔符冲突。
+### 2.1 Design constraints
+- **Unknown fields are ignored (soft rule)**: the parser **skips without error** any capability/parameter name it does not recognize; but the **version number is a hard constraint** (see 2.4) — an unknown version yields `version-unsupported` directly.
+- **Negotiation rules**: protocol version = `min(both sides)` (v2 is the only version; anything but 2 fails); capabilities = the intersection (if empty, downgrade to the minimum set, see 2.6); parameters follow "server side wins + invalid values fall back to defaults".
+- **Ordering**: capability and parameter lists **do not depend on order** (they are parsed into sets/maps).
+- **Character safety**: capability/parameter names use only `[a-z0-9-]`, values use `[a-zA-Z0-9._-]`, avoiding collisions with separators.
 
-### 2.2 能力列表格式（`X-Resume-Caps`）
+### 2.2 Capability list format (`X-Resume-Caps`)
 ```
 datagram,compress,zstd,backup-line,stream-replay,...
 ```
-- 纯名称列表，逗号分隔。扩展能力只需追加名称。
-- 服务端回传的 = 客户端请求 ∩ 服务端支持（**交集**），客户端只启用交集。
+- A pure name list, comma-separated. Extending capabilities only requires appending names.
+- What the server echoes back = client request ∩ server support (the **intersection**); the client only enables the intersection.
 
-### 2.3 参数格式（`X-Resume-Params`）
+### 2.3 Parameter format (`X-Resume-Params`)
 ```
 window_kb=256;idle=90;attempts=16;handshake_ack_timeout=3000
 ```
-- `;` 分隔的 `k=v` 键值对。值统一用十进制整数（毫秒/字节/KB 等量纲由键名语义约定）。
-- 服务端回传**最终生效值**（已 clamp 到合法区间），客户端一律以响应值为准 → **双端参数必然对齐**。
+- `k=v` pairs separated by `;`. Values are always decimal integers (units such as ms/bytes/KB are conveyed by the key-name semantics).
+- The server echoes the **final effective values** (already clamped into legal ranges); the client always defers to the response values → **both sides' parameters are guaranteed aligned**.
 
-### 2.4 版本协商规则
+### 2.4 Version negotiation rules
 ```
 negotiated = min( clientMaxSupported, serverMaxSupported )
 ```
-- 版本用**单整数**（当前唯一版本 `2`）。
-- 客户端 `X-Resume-Version` 发"客户端支持的最高版本"，服务端回"协商版本"（min 两端）。
-- 因为 **v1 已移除、v2 是唯一版本**：只要一方不是 v2，`min()` 结果 ≠ 2 → 按 1.5 报 `version-unsupported` 并**终止**（无降级目标）。版本是**硬约束**，不参与"未知即忽略"。
+- The version is a **single integer** (currently the only version is `2`).
+- The client sends "the highest version it supports" in `X-Resume-Version`; the server replies with the "negotiated version" (min of the two sides).
+- Because **v1 has been removed and v2 is the only version**: if either side is not v2, the `min()` result ≠ 2 → report `version-unsupported` per 1.5 and **terminate** (no downgrade target). Version is a **hard constraint** and is not covered by "ignore what is unknown".
 
-### 2.5 版本策略：v2 唯一，v1 彻底移除
-- **服务端**：只接受 `X-Tunnel-Proto: resume/2`。收到 `resume/1` 或无版本头 → 直接 426 `version-unsupported`。旧 `handleH2StreamServer`、`executeHTTPTunnel`、`handleH2TCPClientConn`、`proxyStream`、`PaddingReader/Writer`、`grpcReader/Writer`、`copyWithHeartbeat` 全部删除。
-- **客户端**：只发 `resume/2`。不再提供 `resume:false` 逃生通道。
-- **WT 迁移**：WT 传输此前无法用 resume 数据面，现统一迁移到 v2 会话模型（见 §4.8），消除双实现。
+### 2.5 Version policy: v2 only, v1 fully removed
+- **Server side**: accepts only `X-Tunnel-Proto: resume/2`. If `resume/1` or no version header arrives → immediate 426 `version-unsupported`. The old `handleH2StreamServer`, `executeHTTPTunnel`, `handleH2TCPClientConn`, `proxyStream`, `PaddingReader/Writer`, `grpcReader/Writer`, `copyWithHeartbeat` are all deleted.
+- **Client side**: sends only `resume/2`. The `resume:false` escape hatch is gone.
+- **WT migration**: WT transport previously could not use the resume data plane; it is now unified onto the v2 session model (see §4.8), eliminating the dual implementation.
 
-### 2.6 最小能力集降级（`no-common-capability` 的缓解）
-- 当能力交集为空时，双方重试时使用**最小基准能力集** `{replay}`（仅字节流 + seq 重放，无 datagram/backup 等增强）。
-- 目的：能力是增强项，空交集不应直接杀死会话；回退到最小可用集再协商一次。若仍无交集才终止。
+### 2.6 Minimum capability-set downgrade (mitigation for `no-common-capability`)
+- When the capability intersection is empty, both sides retry using the **minimum baseline capability set** `{replay}` (byte stream + seq replay only, no datagram/backup enhancements).
+- Purpose: capabilities are enhancements; an empty intersection should not kill the session outright — fall back to the minimum usable set and negotiate once more. Only terminate if there is still no intersection.
 
-> 版本是**硬约束**（无交集即失败），能力/参数是**软约束**（无交集降级到最小集 / 参数回退默认）。这是本设计对"向前兼容"的精确边界。
+> Version is a **hard constraint** (no intersection = failure); capabilities/parameters are **soft constraints** (no intersection → downgrade to the minimum set / parameters fall back to defaults). This is the design's precise boundary of "forward compatibility".
 
-### 2.7 控制帧优先于数据帧（调度策略）
+### 2.7 Control frames outrank data frames (scheduling policy)
 
-**动机**：握手 ack、主备心跳、错误通知是**时延敏感**信号。若控制帧与业务数据帧在同一个发送 goroutine 里 FIFO 排队，数据面拥塞（如窗口满、TCP 慢启动）会让控制帧被堵住 → 握手超时、心跳误判、故障无法及时上报。
+**Motivation**: handshake acks, primary/backup heartbeats, and error notifications are **latency-sensitive** signals. If control frames and business data frames queue FIFO in the same sending goroutine, data-plane congestion (a full window, TCP slow start, etc.) blocks the control frames → handshake timeouts, false heartbeat judgments, and failures that cannot be reported in time.
 
-**实现（writer 互斥锁串行化，无独立调度器）**
-- 控制帧与 DATA 帧共用同一条 HTTP 流，写路径由各自 writer 的互斥锁串行化，保证「控制帧不拆裂、不饿死」：
-  - **服务端下行**：`downlinkPump` 经 `writeDownlink`→`resumeSessionWriter.writeFrame` 写 DATA；握手 ACK / KEEPALIVE-ACK 经 `writeControl` 写控制帧。两者都锁 `resumeSessionWriter.mu`，`downlinkPump` 每写出一帧即释放锁，控制帧在帧间隙插入。
-  - **客户端上行**：单条流仅一个 `resumeSendLoop` goroutine 写 `pw`（DATA + END），HANDSHAKE 在建流前单写一次，天然无并发写竞争。
-  - **备用线路**：`backupLine.keepaliveLoop` 独占一条流写 KEEPALIVE、读 KEEPALIVE-ACK。
-- 每个帧的写出在持锁区间内原子完成（整帧 header+body+flush），控制帧永不会被 DATA 帧拆裂；又因 `downlinkPump` 逐帧释放锁，控制帧也不会被一长串 DATA 饿死（最差等待一个 DATA 帧的写出+flush，远小于 KEEPALIVE 15s 预算）。
+**Implementation (serialization via the writer mutex; no separate scheduler)**
+- Control frames and DATA frames share the same HTTP stream; the write path is serialized by each writer's mutex, guaranteeing "control frames are never split and never starved":
+  - **Server-side downlink**: `downlinkPump` writes DATA via `writeDownlink`→`resumeSessionWriter.writeFrame`; handshake ACK / KEEPALIVE-ACK write control frames via `writeControl`. Both lock `resumeSessionWriter.mu`, and `downlinkPump` releases the lock after every frame it writes, so control frames slot into the gaps between frames.
+  - **Client-side uplink**: a single stream has only one `resumeSendLoop` goroutine writing to `pw` (DATA + END), and HANDSHAKE is written once before the stream is established — there is no concurrent write contention by nature.
+  - **Backup line**: `backupLine.keepaliveLoop` owns a dedicated stream to write KEEPALIVE and read KEEPALIVE-ACK.
+- Each frame's write-out completes atomically inside the lock-held region (whole header+body+flush), so a control frame can never be split by a DATA frame; and because `downlinkPump` releases the lock frame by frame, control frames are never starved by a long run of DATA frames (worst case: waiting out the write+flush of one DATA frame, far below the KEEPALIVE 15s budget).
 
-**帧类型分级**：
-| 优先级 | 帧类型 | 说明 |
+**Frame-type tiers**:
+| Priority | Frame type | Description |
 |---|---|---|
-| P0（最高） | `ERROR` / `END` | 必须立即送达，否则对端卡死 |
-| P1 | `HANDSHAKE` / `HANDSHAKE-ACK` / `KEEPALIVE` / `KEEPALIVE-ACK` | 握手/心跳，有超时预算 |
-| P2（最低） | `DATA` | 业务数据，可被前两级让行 |
+| P0 (highest) | `ERROR` / `END` | Must be delivered immediately, or the peer wedges |
+| P1 | `HANDSHAKE` / `HANDSHAKE-ACK` / `KEEPALIVE` / `KEEPALIVE-ACK` | Handshake/heartbeat, with a timeout budget |
+| P2 (lowest) | `DATA` | Business data; may yield to the two higher tiers |
 
-> 控制帧与数据帧**共用同一条 HTTP 流**（仍是顺序字节流），优先级由**写路径互斥锁串行化**保证（控制帧在 DATA 帧之间插入，不依赖 HTTP/2 的 stream priority，跨 h2/h3/grpc/masque/wt 统一生效）。`handshake_frame.go` 曾实现 `frameMux` 双队列调度器，但从未接入生产写路径，已作为死代码移除。
+> Control frames and data frames **share the same HTTP stream** (still an ordered byte stream); priority is guaranteed by **write-path mutex serialization** (control frames slot in between DATA frames, without relying on HTTP/2 stream priority, and it works uniformly across h2/h3/grpc/masque/wt). `handshake_frame.go` once implemented a `frameMux` dual-queue scheduler, but it was never wired into the production write path and has been removed as dead code.
 
 ---
 
-## 3. 主线路与备用线路在握手中的处理策略
+## 3. Handling of the Primary and Backup Lines in the Handshake
 
-### 3.1 概念区分（本期完整实现，非二期）
-- **主线路**：本次 resume 隧道的主数据通道。
-- **备用线路**：冗余/备份通道。当前统一实现为预建立并持续探活的热备，主线路断开时可直接升级接管。
-- 主/备由 `ConnectionPolicy` 决定：`backup_count=0` 为单线路，正数表示维持对应数量的热备。
+### 3.1 Concept distinction (fully implemented this iteration, not phase 2)
+- **Primary line**: the main data channel of this resume tunnel.
+- **Backup line**: the redundant/backup channel. Currently implemented uniformly as a pre-established, continuously probed hot standby, which can be promoted to take over directly when the primary line drops.
+- Primary/backup is decided by `ConnectionPolicy`: `backup_count=0` means a single line; a positive number means maintaining that many hot standbys.
 
-### 3.2 握手流程（主/备）
-- **主线路**：完整执行第 1 节握手（版本/能力/参数 + ack）。主握手成功 = `X-Resume-Ack:ok` + `HANDSHAKE-ACK` 收到。
-- **备用线路**：
-  - 客户端声明 `backup-line` 能力且服务端接受 → 客户端建立备用握手。
-  - 备用握手**也走同一套握手协议**（版本/能力/参数/ack + 控制帧），但：
-    - 用**独立 session id**（`<主id>+b`）避免与服务端会话表冲突；
-    - 备用**不传输业务数据**，只发周期性**存活控制帧**（`KEEPALIVE`，复用帧结构带 `role=backup`）；
-    - 服务端对备用线路**不启动 downlinkPump 的业务数据双写**，只维持 targetConn（热备）或仅登记元数据（冷备）。
+### 3.2 Handshake flow (primary/backup)
+- **Primary line**: executes the full section-1 handshake (version/capabilities/parameters + ack). Primary handshake success = `X-Resume-Ack:ok` received + `HANDSHAKE-ACK` received.
+- **Backup line**:
+  - If the client declares the `backup-line` capability and the server accepts it → the client sets up the backup handshake.
+  - The backup handshake **uses the same handshake protocol** (version/capabilities/parameters/ack + control frames), except:
+    - it uses a **dedicated session id** (`<primary id>+b`) to avoid colliding with the server's session table;
+    - the backup **carries no business data**, only periodic **liveness control frames** (`KEEPALIVE`, reusing the frame structure with `role=backup`);
+    - for the backup line the server **does not start downlinkPump business-data double-writing**; it only keeps the targetConn (hot standby) or merely registers metadata (cold standby).
 
-### 3.3 备用必须纳入握手确认 —— 本期实现决策（已确认）
-**结论：备用线路必须纳入握手确认，但采用"独立的备用握手 + KEEPALIVE 存活确认"，而非复用主线路握手。** 理由：
+### 3.3 The backup must be included in handshake confirmation — implementation decision for this iteration (confirmed)
+**Conclusion: the backup line must be included in handshake confirmation, but via a "dedicated backup handshake + KEEPALIVE liveness confirmation", not by reusing the primary handshake.** Reasons:
 
-| 方案 | 优点 | 缺点 | 结论 |
+| Option | Pros | Cons | Verdict |
 |---|---|---|---|
-| A. 主备共用同一条握手 | 简单 | 主备目标不同时无法区分；备用故障会污染主握手 | ✗ 否决 |
-| B. 备用完全独立握手 + 周期存活确认 | 主备隔离；备用真实可用性可验证 | 多一次握手往返 + 心跳开销 | ✅ **本期实现（热备）** |
-| C. 备用只在切换时握手（冷备） | 零常驻开销 | 接管慢；切换时才暴露备用不可用 | ✅ 本期实现（冷备） |
+| A. Primary and backup share one handshake | Simple | Cannot be told apart when primary/backup targets differ; a backup failure pollutes the primary handshake | ✗ Rejected |
+| B. Fully independent backup handshake + periodic liveness confirmation | Primary/backup isolation; the backup's real availability is verifiable | One extra handshake round trip + heartbeat overhead | ✅ **Implemented this iteration (hot standby)** |
+| C. Backup handshakes only at switchover (cold standby) | Zero standing overhead | Slow takeover; backup unavailability only surfaces at switchover | ✅ Implemented this iteration (cold standby) |
 
-**本期实现范围**：
-- 主线路：完整双向握手 + ack（第 1 节）。
-- 备用线路：**独立握手** + 周期性 `KEEPALIVE` 控制帧续期（默认 15s，可参数化 `keepalive_interval`）；连续 N 次（默认 3）`KEEPALIVE-ACK` 超时 → 判定备用失效 → 重建备用或**降级为仅主用**。
-- 控制帧优先：主备的 `KEEPALIVE`/`KEEPALIVE-ACK` 由 writer 互斥锁串行化保证插队于 DATA 之前（见 2.7），在拥塞下也**必达**，保证存活判定可靠。
-- 切换：主线路握手/数据失败 → 客户端**先本地切到已确认存活的备用**（热备秒切），同时后台尝试恢复主线路；冷备则先握手再切。
-- **关键点（铁律）**：只有**经过握手确认存活的备用**才允许被接管；未经确认的备用**禁止自动接管**（避免"盲切到死线"）。
+**Scope implemented this iteration**:
+- Primary line: full bidirectional handshake + ack (section 1).
+- Backup line: **independent handshake** + periodic `KEEPALIVE` control-frame renewal (default 15s, parameterizable via `keepalive_interval`); N consecutive (default 3) `KEEPALIVE-ACK` timeouts → the backup is judged dead → rebuild the backup or **downgrade to primary-only**.
+- Control-frame priority: the primary/backup `KEEPALIVE`/`KEEPALIVE-ACK` frames are guaranteed to cut in ahead of DATA by writer mutex serialization (see 2.7), so they are **always delivered** even under congestion, keeping liveness judgment reliable.
+- Switchover: when the primary handshake/data fails → the client **first switches locally to the backup confirmed alive** (hot standby switches in seconds) while a background task tries to restore the primary; for cold standby, handshake first, then switch.
+- **Key point (iron rule)**: only a backup whose liveness was **confirmed through the handshake** may be taken over; an unconfirmed backup is **forbidden from automatic takeover** (avoiding a "blind switchover to a dead line").
 
-### 3.4 主备握手时序
+### 3.4 Primary/backup handshake timeline
 ```
-主:  POST resume/2 (sid=abc)  → 200 ack=ok → HANDSHAKE→ACK → 业务数据(优先级P2)
-备:  POST resume/2 (sid=abc+b, caps=..., role=backup)
+Primary:  POST resume/2 (sid=abc)  → 200 ack=ok → HANDSHAKE→ACK → business data (priority P2)
+Backup:   POST resume/2 (sid=abc+b, caps=..., role=backup)
        → 200 ack=ok → HANDSHAKE(role=backup)→ACK → KEEPALIVE(15s,P1)↔ACK
-主断 → 客户端切到 sid=abc+b 的备用（已确认存活）→ 秒级接管
+Primary down → client switches to the backup at sid=abc+b (liveness confirmed) → takeover in seconds
 ```
 
 ---
 
-## 4. 现有代码修改点清单及改造步骤
+## 4. Inventory of Existing-Code Modification Points and Refactoring Steps
 
-> 所有改动**留在 working tree 不提交**（尊重铁律），每步跑 `go build` + 相关 `go test` + 跨编。
+> All changes **stay in the working tree, uncommitted** (respecting the iron rule); run `go build` + the relevant `go test` + cross-compilation at each step.
 
-### 4.1 新增文件
-| 文件 | 内容 |
+### 4.1 New files
+| File | Contents |
 |---|---|
-| `handshake.go` | 握手编解码：版本协商 `negotiateVersion`、能力交集 `intersectCaps`、参数对齐 `alignParams`、错误码表、`X-Resume-Caps/Params` 编解码 |
-| ~~`handshake_frame.go`~~ | （已移除）数据面控制帧本就在 `resumeframe.go` 的 `writeFrame` 中实现；曾含 `frameMux` 双队列调度器，因从未接入生产写路径，已作为死代码删除，控制帧优先改由 `resumeSessionWriter.mu` 串行化保证（见 §2.7）。 |
-| `backup.go` | 主备管理：客户端备用线路执行器（热备 `hotBackupRunner`/冷备 `coldBackup`）、接管逻辑 `takeoverIfConfirmed`、KEEPALIVE 心跳泵 |
-| `handshake_test.go` | **完整的握手协议测试**（见 §5） |
+| `handshake.go` | Handshake codec: version negotiation `negotiateVersion`, capability intersection `intersectCaps`, parameter alignment `alignParams`, error-code table, `X-Resume-Caps/Params` encoding/decoding |
+| ~~`handshake_frame.go`~~ | (removed) Data-plane control frames were already implemented in `resumeframe.go`'s `writeFrame`; it once contained the `frameMux` dual-queue scheduler, which, having never been wired into the production write path, was deleted as dead code — control-frame priority is now guaranteed by `resumeSessionWriter.mu` serialization (see §2.7). |
+| `backup.go` | Primary/backup management: client backup-line runners (hot standby `hotBackupRunner` / cold standby `coldBackup`), takeover logic `takeoverIfConfirmed`, KEEPALIVE heartbeat pump |
+| `handshake_test.go` | **Complete handshake-protocol tests** (see §5) |
 
-### 4.2 `resumeframe.go`（帧头扩展，v1 移除后无需兼容旧格式）
-- 帧头从 `[4B dataLen][2B padLen][8B seq]`（14B）扩展为 **`[1B type][1B ver][4B dataLen][2B padLen][8B seq]`（16B）**。
-- 帧类型：`0x01=DATA`、`0x02=END`、`0x03=ERROR`、`0x10=HANDSHAKE`、`0x11=HANDSHAKE-ACK`、`0x12=KEEPALIVE`、`0x13=KEEPALIVE-ACK`。`ver` 恒为 `0x02`。
-- `resumeFrameTypeResume` 改为 `"resume/2"`。
-- 旧 `writeResumeFrame`/`readResumeFrame` 改造为统一 `writeFrame(type, ver, seq, data)`/`readFrame()`，所有读写走新头。
-- **数据帧写入经 `resumeSessionWriter.writeFrame`**（内部持 `resumeSessionWriter.mu` 串行化，控制帧优先于 DATA 插入），不再直接裸写。
+### 4.2 `resumeframe.go` (frame-header extension; no legacy-format compatibility needed after v1 removal)
+- The frame header grows from `[4B dataLen][2B padLen][8B seq]` (14B) to **`[1B type][1B ver][4B dataLen][2B padLen][8B seq]` (16B)**.
+- Frame types: `0x01=DATA`, `0x02=END`, `0x03=ERROR`, `0x10=HANDSHAKE`, `0x11=HANDSHAKE-ACK`, `0x12=KEEPALIVE`, `0x13=KEEPALIVE-ACK`. `ver` is always `0x02`.
+- `resumeFrameTypeResume` changed to `"resume/2"`.
+- The old `writeResumeFrame`/`readResumeFrame` are refactored into a unified `writeFrame(type, ver, seq, data)`/`readFrame()`; all reads/writes use the new header.
+- **Data-frame writes go through `resumeSessionWriter.writeFrame`** (internally serializing on `resumeSessionWriter.mu`, with control frames inserted ahead of DATA); no more direct raw writes.
 
 ### 4.3 `server.go` — `handleH2StreamResumeServer`
-1. **握手处理（写在 `prepareResumeSession` 前）**：
-   - 校验 `X-Tunnel-Proto == "resume/2"`；否则 426。
-   - 解析 `X-Resume-Version`/`X-Resume-Caps`/`X-Resume-Params`；`role` 头（主/备）。
-   - 版本协商（v2 唯一）+ 能力交集 + 参数对齐。
-   - 写响应头 `X-Resume-Version/Caps/Params/Ack`；交集空/参数非法 → 按 §1.5 回错误码。
-2. **B 层确认**：业务数据循环前，等待并校验客户端 `HANDSHAKE` 控制帧，回 `HANDSHAKE-ACK`（经 `writeControl`，在 `resumeSessionWriter.mu` 保护下于 DATA 帧间隙插入）。
-3. **`role=backup`**：跳过业务 downlinkPump 双写，改为周期 `KEEPALIVE` 应答（P1）。
-4. 上行/下行读写统一经 `resumeSessionWriter` 串行化调度（控制帧优先，见 §2.7）。
-5. **删除**旧 `handleH2StreamServer`、`proxyStream`、`copyWithHeartbeat` 中与 resume 无关的旧路径（见 §4.9）。
+1. **Handshake handling (done before `prepareResumeSession`)**:
+   - Verify `X-Tunnel-Proto == "resume/2"`; otherwise 426.
+   - Parse `X-Resume-Version`/`X-Resume-Caps`/`X-Resume-Params`; the `role` header (primary/backup).
+   - Version negotiation (v2 only) + capability intersection + parameter alignment.
+   - Write response headers `X-Resume-Version/Caps/Params/Ack`; empty intersection / invalid parameters → return error codes per §1.5.
+2. **Layer-B confirmation**: before the business-data loop, wait for and verify the client's `HANDSHAKE` control frame, and reply with `HANDSHAKE-ACK` (via `writeControl`, inserted into the gaps between DATA frames under `resumeSessionWriter.mu` protection).
+3. **`role=backup`**: skip the business downlinkPump double-write; instead answer `KEEPALIVE` periodically (P1).
+4. Uplink/downlink reads and writes are serialized through `resumeSessionWriter` (control frames first, see §2.7).
+5. **Delete** the old `handleH2StreamServer`, `proxyStream`, `copyWithHeartbeat` legacy paths unrelated to resume (see §4.9).
 
 ### 4.4 `client_resume.go` / `client_resume_udp.go`
-- `buildResumeRequest`/`buildResumeUDPRequest`：`X-Tunnel-Proto: resume/2` + `X-Resume-Version/Caps/Params` + `role`（备用时）。
-- `runResumeAttempt`/`runOneStream`：读响应 `X-Resume-Ack`；非 `ok` → 按错误码处理；`ok` 后写 `HANDSHAKE`（P1），等 `HANDSHAKE-ACK`（超时 `handshake_ack_timeout`）；**ack 前零业务字节上发**。
-- 以服务端回传参数为准，更新本地 ring 窗口等。
-- 上行/下行读写经 `resumeSessionWriter`/`pw` 串行化（控制帧优先，见 §2.7）。
+- `buildResumeRequest`/`buildResumeUDPRequest`: `X-Tunnel-Proto: resume/2` + `X-Resume-Version/Caps/Params` + `role` (for the backup).
+- `runResumeAttempt`/`runOneStream`: read the response `X-Resume-Ack`; anything but `ok` → handle per error code; after `ok`, write `HANDSHAKE` (P1) and wait for `HANDSHAKE-ACK` (timeout `handshake_ack_timeout`); **zero business bytes go uplink before the ack**.
+- Defer to the parameters echoed back by the server and update the local ring window, etc.
+- Uplink/downlink reads and writes are serialized via `resumeSessionWriter`/`pw` (control frames first, see §2.7).
 
 ### 4.5 `main.go`
-- 协议版本与能力集合固定在内部协商层，不暴露无效配置开关；外部只保留实际生效的 `session_window_kb`、`handshake_ack_ms`、`keepalive_sec` 与连接策略字段。
-- `Resume bool`、`ResumeEnabled` 和 `backup_line` 均已删除；`resume:false` 分支（含 UDP 裸转发）不再存在，resume/2 恒启用且无降级目标。
-- `buildServerConfig/buildClientConfig` 只透传当前运行时真正使用的字段。
+- Protocol version and capability sets are fixed inside the internal negotiation layer; no ineffective configuration switches are exposed. Externally, only the actually effective `session_window_kb`, `handshake_ack_ms`, `keepalive_sec`, and connection-policy fields remain.
+- `Resume bool`, `ResumeEnabled`, and `backup_line` have all been deleted; the `resume:false` branch (including raw UDP forwarding) no longer exists — resume/2 is always enabled with no downgrade target.
+- `buildServerConfig/buildClientConfig` pass through only the fields actually used by the current runtime.
 
-### 4.6 `session.go` 控制帧优先（writer 互斥锁串行化）
-- `resumeSessionWriter` 持 `mu`：所有写路径（`writeFrame` / `writeControl` / `writeEnd` / `writeRaw`）都先锁 `mu` 再写整帧并 flush，保证帧原子性（控制帧永不被 DATA 拆裂）。
-- 服务端下行：`downlinkPump` 经 `writeDownlink`→`writeFrame` 写 DATA，每帧释放 `mu`；握手 ACK / KEEPALIVE-ACK 经 `writeControl` 在帧间隙插入 → 控制帧天然优先且不饿死（详见 §2.7）。
-- `replayDownlink` 重放期间整体持 `tunnelSession.mu` 并临时置空 `onClose`，避免与 `downlinkPump` 的实时下行写并发交错（否则帧交叠 + seq 乱序 → 客户端 `ErrGap` 断流）。
-- backup 会话不启动业务 downlinkPump，改走 `backupLine.keepaliveLoop`。
+### 4.6 `session.go` control-frame priority (writer mutex serialization)
+- `resumeSessionWriter` holds `mu`: every write path (`writeFrame` / `writeControl` / `writeEnd` / `writeRaw`) locks `mu` first, then writes the whole frame and flushes, guaranteeing frame atomicity (a control frame is never split by DATA).
+- Server-side downlink: `downlinkPump` writes DATA via `writeDownlink`→`writeFrame`, releasing `mu` per frame; handshake ACK / KEEPALIVE-ACK go through `writeControl` and insert into the frame gaps → control frames are naturally prioritized and never starved (details in §2.7).
+- During `replayDownlink` replay, `tunnelSession.mu` is held throughout and `onClose` is temporarily cleared, to avoid concurrent interleaving with `downlinkPump`'s real-time downlink writes (otherwise frames would overlap and seq would go out of order → the client hits `ErrGap` and breaks the stream).
+- A backup session does not start the business downlinkPump; it uses `backupLine.keepaliveLoop` instead.
 
-> 原设计的独立 `frameMux` 双队列调度器（§4.6 旧版）已移除：其「先 drain 控制队再写数据队」的语义已由「`resumeSessionWriter.mu` 逐帧串行化 + 控制帧在帧间隙插入」等价实现，且无额外 goroutine/队列复杂度。
+> The originally designed standalone `frameMux` dual-queue scheduler (old version of §4.6) has been removed: its "drain the control queue first, then write the data queue" semantics are now equivalently implemented by "`resumeSessionWriter.mu` per-frame serialization + control frames inserted into frame gaps", with no extra goroutine/queue complexity.
 
 ### 4.7 `sharecrypto.go` / `pool.go`
-- 若帧头扩展影响缓冲池尺寸计算，同步调整 `paddingWritePool`/`tcpBufPool` 的预算常量。
+- If the frame-header extension affects buffer-pool size calculations, adjust the budget constants of `paddingWritePool`/`tcpBufPool` accordingly.
 
-### 4.8 `client.go` — WT 迁移到 v2 会话模型 ✅ 已完成
-- WT 已从独立 `WTSessionManager` 业务模型收编进 `resume/2` 引擎：每隧道独立 `WTSessionManager`（headers 携带 A 层协商头 + `Protocol: webtransport`），服务端 `handleWebTransportServer` 把每条业务 stream 派发到 v2 会话表（`prepareResumeSession`）。
-- 因 WT stream 无 per-stream HTTP 头，`clientDownlink` 改为在 B 层 `HANDSHAKE` 帧 payload（十进制字符串）携带，服务端据此重放下行缺口。
-- 服务端 `resumeSessionWriter.w` 从 `http.ResponseWriter` 放宽为 `io.Writer`（`flusher` 可选），使 `webtransport.Stream` 可直接作为下行目标；h2/grpc/masque 调用点无需改动。
-- 断线续传由 `TestWTResumeReconnect` 验证（stream1 读部分下行后关闭，stream2 同 session id 从 clientDownlink 续传，整体无缺口无重复）。
-- 注：`activeWriter` 挂载必须等 B 层握手（HANDSHAKE-ACK 写出）后再进行，否则 downlinkPump 可能在握手前把 DATA 帧写进新流、客户端首帧读到 DATA 而握手失败（h2/wt 通用）。
+### 4.8 `client.go` — WT migrated to the v2 session model ✅ completed
+- WT has been folded from its standalone `WTSessionManager` business model into the `resume/2` engine: each tunnel gets its own `WTSessionManager` (headers carrying the layer-A negotiation headers + `Protocol: webtransport`), and the server's `handleWebTransportServer` dispatches every business stream into the v2 session table (`prepareResumeSession`).
+- Because WT streams carry no per-stream HTTP headers, `clientDownlink` is now carried in the layer-B `HANDSHAKE` frame payload (a decimal string), and the server replays the downlink gap accordingly.
+- The server's `resumeSessionWriter.w` was widened from `http.ResponseWriter` to `io.Writer` (`flusher` optional) so a `webtransport.Stream` can serve directly as the downlink target; the h2/grpc/masque call sites needed no changes.
+- Resume-after-disconnect is verified by `TestWTResumeReconnect` (stream1 closes after reading part of the downlink; stream2 resumes from clientDownlink under the same session id, with no gap and no duplication overall).
+- Note: attaching `activeWriter` must wait until the layer-B handshake completes (HANDSHAKE-ACK written out); otherwise downlinkPump may write DATA frames into the new stream before the handshake, and the client would read DATA as its first frame and fail the handshake (applies to both h2 and wt).
 
-### 4.9 删除清单（v1 彻底移除）— ✅ 已在 M5 全部落地
-| 删除对象 | 位置 | 状态 |
+### 4.9 Deletion inventory (v1 fully removed) — ✅ all landed in M5
+| Deleted item | Location | Status |
 |---|---|---|
-| `resumeFrameTypeResume` 旧值 `resume/1` | resumeframe.go | ✅ 已改 `resume/2` |
-| `handleH2StreamServer`（非 resume 旧 handler） | server.go | ✅ 已删除 |
-| `executeHTTPTunnel`（非 resume 客户端） | client.go | ✅ 已删除 |
-| `handleH2TCPClientConn` / `handleMasqueTCPClientConn` | client.go | ✅ 已删除，统一走 `executeResumableTunnel` |
-| `proxyStream` / `copyWithHeartbeat` | protocol.go | ✅ 已删除 |
-| `PaddingReader` / `PaddingWriter` / `pinger` | protocol.go | ✅ 已删除（WT 改用 `writeFrame/readFrame`） |
-| `grpcReader` / `grpcWriter` | protocol.go | ✅ 已删除，grpc 仅打 Content-Type |
-| `calculatePadding` | protocol.go | ✅ 已删除（仅 PaddingWriter 使用） |
-| `resume:false` 分支 | main.go | ✅ 已删除，resume 恒 true |
-| 依赖旧路径的测试（`TestPaddingPingFrameRoundTrip` 等） | heartbeat_test.go | ✅ 已改写/删除 |
-| WT 的 v1 Padding 路径 | client.go / server.go | ✅ 已迁移至 v2 帧数据面 |
+| `resumeFrameTypeResume` old value `resume/1` | resumeframe.go | ✅ changed to `resume/2` |
+| `handleH2StreamServer` (non-resume legacy handler) | server.go | ✅ deleted |
+| `executeHTTPTunnel` (non-resume client) | client.go | ✅ deleted |
+| `handleH2TCPClientConn` / `handleMasqueTCPClientConn` | client.go | ✅ deleted; unified through `executeResumableTunnel` |
+| `proxyStream` / `copyWithHeartbeat` | protocol.go | ✅ deleted |
+| `PaddingReader` / `PaddingWriter` / `pinger` | protocol.go | ✅ deleted (WT switched to `writeFrame/readFrame`) |
+| `grpcReader` / `grpcWriter` | protocol.go | ✅ deleted; grpc only sets Content-Type |
+| `calculatePadding` | protocol.go | ✅ deleted (only used by PaddingWriter) |
+| `resume:false` branch | main.go | ✅ deleted; resume is always true |
+| Tests depending on the legacy path (`TestPaddingPingFrameRoundTrip` etc.) | heartbeat_test.go | ✅ rewritten/deleted |
+| WT's v1 Padding path | client.go / server.go | ✅ migrated to the v2 frame data plane |
 
-### 4.10 测试（见下 §5 `handshake_test.go`）
+### 4.10 Tests (see §5 `handshake_test.go` below)
 
 ---
 
-## 5. test.go 完整规划（`handshake_test.go`）
+## 5. Complete test.go Plan (`handshake_test.go`)
 
-覆盖 5 个维度：单元（编解码/协商/参数）+ 帧头（v2 新头）+ 时序（握手）+ 控制帧优先 + 主备 + 版本拒绝。骨架如下：
+Covers 5 dimensions: unit (codec/negotiation/parameters) + frame header (new v2 header) + sequencing (handshake) + control-frame priority + primary/backup + version rejection. Skeleton:
 
 ```go
 package main
 
-// ================= 一、编解码单元测试 =================
+// ================= 1. Codec unit tests =================
 
-// TestFrameV2RoundTrip 新 16B 帧头 (type/ver/dataLen/padLen/seq) 编解码往返
-// TestFrameV2Types 各帧类型 (DATA/END/ERROR/HANDSHAKE/HANDSHAKE-ACK/KEEPALIVE/KEEPALIVE-ACK) 编解码
-// TestHandshakeCapsParse 能力列表解析：正常、空、未知项（应忽略）
-// TestHandshakeCapsIntersect 能力交集：全交/部分交/无交（应报 no-common-capability）
-// TestHandshakeParamsParse 参数解析：k=v 列表、非法值回退默认、未知键忽略
-// TestHandshakeParamsAlign 参数对齐：越界 clamp、服务端为准
-// TestHandshakeVersionNegotiate v2 唯一：min()==2 通过；非 2 → version-unsupported
+// TestFrameV2RoundTrip round-trip codec for the new 16B frame header (type/ver/dataLen/padLen/seq)
+// TestFrameV2Types codec for every frame type (DATA/END/ERROR/HANDSHAKE/HANDSHAKE-ACK/KEEPALIVE/KEEPALIVE-ACK)
+// TestHandshakeCapsParse capability-list parsing: normal, empty, unknown entries (should be ignored)
+// TestHandshakeCapsIntersect capability intersection: full / partial / empty (should report no-common-capability)
+// TestHandshakeParamsParse parameter parsing: k=v lists, invalid values fall back to defaults, unknown keys ignored
+// TestHandshakeParamsAlign parameter alignment: clamping out-of-range values, server side wins
+// TestHandshakeVersionNegotiate v2 only: min()==2 passes; anything but 2 → version-unsupported
 
-// ================= 二、控制帧优先级测试 =================
-// 注：`frameMux` 双队列调度器及其单测（TestPrioQueue*）已随死代码移除；
-// 控制帧优先现由 `resumeSessionWriter.mu` 串行化保证（见 §2.7），已有
-// `handshake_frame_test.go` 的 v2 帧编解码单测覆盖控制帧类型编解码。
-// 如需回归「控制帧在拥塞下必达」，可在 `connmanager_test.go` 的备份存活用例上
-// 叠加大流量 DATA 验证 KEEPALIVE-ACK 时延。
+// ================= 2. Control-frame priority tests =================
+// Note: the `frameMux` dual-queue scheduler and its unit tests (TestPrioQueue*) were removed as dead code;
+// control-frame priority is now guaranteed by `resumeSessionWriter.mu` serialization (see §2.7), and the
+// existing v2 frame-codec unit tests in `handshake_frame_test.go` already cover control-frame type encoding/decoding.
+// To regress "control frames are always delivered under congestion", layer a heavy DATA stream onto
+// the backup-liveness cases in `connmanager_test.go` and check KEEPALIVE-ACK latency.
 
-// ================= 三、握手时序测试 =================
+// ================= 3. Handshake sequencing tests =================
 
-// TestHandshakeAckRequired 无 ack=ok 时客户端禁止写业务数据（零字节上发门禁）
-// TestHandshakeVersionUnsupported 版本非 v2 → 426+version-unsupported，客户端终止
-// TestHandshakeNoCommonCapability 能力交集空→406，客户端降级最小集重试
-// TestHandshakeInvalidParams 参数非法→服务端回默认值，客户端用默认重试一次
-// TestHandshakeAckTimeout B层 HANDSHAKE-ACK 超时→重试建流
-// TestHandshakeFullRoundTrip 主线路完整握手：头 ack + HANDSHAKE→ACK → 业务数据
+// TestHandshakeAckRequired without ack=ok the client must not write business data (zero-uplink-byte gate)
+// TestHandshakeVersionUnsupported version not v2 → 426+version-unsupported, client terminates
+// TestHandshakeNoCommonCapability empty capability intersection → 406, client downgrades to the minimum set and retries
+// TestHandshakeInvalidParams invalid parameters → server returns defaults, client retries once with them
+// TestHandshakeAckTimeout layer-B HANDSHAKE-ACK timeout → retry stream establishment
+// TestHandshakeFullRoundTrip full primary-line handshake: header ack + HANDSHAKE→ACK → business data
 
-// ================= 四、主备线路测试 =================
+// ================= 4. Primary/backup line tests =================
 
-// TestBackupLineIndependentHandshake 备用独立 session id+握手，不与主冲突
-// TestBackupKeepaliveLiveness 备用 KEEPALIVE 续期；连续超时→判定失效
-// TestBackupTakeoverOnlyIfConfirmed 未确认存活的备用禁止接管；已确认可秒切
-// TestBackupHotStandby 热备：主断→秒切到已确认备用
-// TestBackupColdStandby 冷备：切换时才握手，接管较慢但成功
+// TestBackupLineIndependentHandshake backup uses its own session id + handshake, no clash with the primary
+// TestBackupKeepaliveLiveness backup KEEPALIVE renewal; consecutive timeouts → judged dead
+// TestBackupTakeoverOnlyIfConfirmed takeover forbidden for an unconfirmed backup; a confirmed one switches in seconds
+// TestBackupHotStandby hot standby: primary down → instant switch to the confirmed backup
+// TestBackupColdStandby cold standby: handshake only at switchover; slower takeover but succeeds
 
-// ================= 五、版本硬约束/移除 v1 测试 =================
+// ================= 5. Version hard-constraint / v1-removal tests =================
 
-// TestV1Rejected 旧客户端发 resume/1 → 服务端 426 version-unsupported（无降级）
-// TestNoVersionHeaderRejected 无 X-Tunnel-Proto 头 → 426
-// TestV1DataPathRemoved 旧 Padding/grpcReader/proxyStream 符号已不存在（编译期验证）
-// TestUnknownCapabilityIgnored 未知能力被忽略，会话仍工作（向前兼容）
+// TestV1Rejected legacy client sends resume/1 → server replies 426 version-unsupported (no downgrade)
+// TestNoVersionHeaderRejected missing X-Tunnel-Proto header → 426
+// TestV1DataPathRemoved the old Padding/grpcReader/proxyStream symbols no longer exist (compile-time verification)
+// TestUnknownCapabilityIgnored unknown capabilities are ignored and the session keeps working (forward compatibility)
 ```
 
-**关键断言**：
-- 协商后双端版本/参数**严格相等**（对齐正确性）。
-- 客户端在 ack 到达前**零业务字节上发**（确认门禁生效）。
-- 控制帧优先：构造"控制帧压数据帧"场景，断言控制帧先被写出。
-- 备用接管**仅在 keepalive 存活**时成功，否则断言拒绝接管。
-- **v1 被硬拒绝**（426），且旧数据路径符号已在编译期被移除（用 `//go:build` 或直接断言符号不存在）。
+**Key assertions**:
+- After negotiation, both sides' version/parameters are **strictly equal** (alignment correctness).
+- The client sends **zero business bytes uplink** before the ack arrives (the confirmation gate is in force).
+- Control-frame priority: construct a scenario where data frames would crowd out control frames, and assert the control frame is written out first.
+- Backup takeover succeeds **only while keepalive liveness holds**; otherwise assert the takeover is refused.
+- **v1 is hard-rejected** (426), and the legacy data-path symbols are gone at compile time (via `//go:build` or a direct assertion that the symbols do not exist).
 
 ---
 
-## 6. 实施里程碑
+## 6. Implementation Milestones
 
-| 阶段 | 内容 | 验证 | 状态 |
+| Phase | Content | Verification | Status |
 |---|---|---|---|
-| M1 | 帧头扩展为 v2 新 16B 头 + 编解码单测（`handshake_frame_test.go`） | 单元测试绿 | ✅ 完成（控制帧优先改由 `resumeSessionWriter.mu` 串行化，原 `frameMux` 调度器已移除） |
-| M2 | 服务端握手（版本/能力/参数/ack）+ B 层控制帧 + `role=backup` 分支 | e2e 握手成功 | ✅ 完成 |
-| M3 | 客户端握手（发起+校验 ack+等 HANDSHAKE-ACK）+ 控制帧优先上/下行 | 主线路 e2e 全绿 | ✅ 完成 |
-| M4 | 主备线路（热备/冷备 + KEEPALIVE + 接管） | 主备 e2e 绿 | ✅ 完成 |
-| M5 | **删除 v1 旧路径** + WT 迁移 + 全量回归 + gofmt/vet/跨编 | 全量绿 + v1 符号不在 | ✅ 完成 |
+| M1 | Frame header extended to the new v2 16B header + codec unit tests (`handshake_frame_test.go`) | Unit tests green | ✅ Done (control-frame priority moved to `resumeSessionWriter.mu` serialization; the original `frameMux` scheduler removed) |
+| M2 | Server-side handshake (version/capabilities/parameters/ack) + layer-B control frames + `role=backup` branch | e2e handshake succeeds | ✅ Done |
+| M3 | Client handshake (initiate + verify ack + wait for HANDSHAKE-ACK) + control-frame priority on uplink/downlink | Primary-line e2e all green | ✅ Done |
+| M4 | Primary/backup lines (hot standby/cold standby + KEEPALIVE + takeover) | Primary/backup e2e green | ✅ Done |
+| M5 | **Delete the v1 legacy path** + WT migration + full regression + gofmt/vet/cross-compile | Full suite green + v1 symbols gone | ✅ Done |
 
-### M5 实际落地（v1 彻底移除）
+### M5 as landed (v1 fully removed)
 
-已删除的 v1 符号（编译期验证不再存在）：
+v1 symbols deleted (verified absent at compile time):
 
-- 服务端：`handleH2StreamServer`（旧 H2 handler）、MASQUE-TCP/UDP 的 `proxyStream` 兜底分支。
-- 客户端：`executeHTTPTunnel`、`handleH2TCPClientConn`、`handleMasqueTCPClientConn`（TCP 统一走 `executeResumableTunnel`）。
-- `protocol.go`：`proxyStream`、`PaddingReader`、`PaddingWriter`、`grpcReader`、`grpcWriter`、`copyWithHeartbeat`、`pinger`、`calculatePadding`。
+- Server side: `handleH2StreamServer` (old H2 handler), the `proxyStream` fallback branches of MASQUE-TCP/UDP.
+- Client side: `executeHTTPTunnel`, `handleH2TCPClientConn`, `handleMasqueTCPClientConn` (TCP unified through `executeResumableTunnel`).
+- `protocol.go`: `proxyStream`, `PaddingReader`, `PaddingWriter`, `grpcReader`, `grpcWriter`, `copyWithHeartbeat`, `pinger`, `calculatePadding`.
 
-迁移与变更：
+Migrations and changes:
 
-- **WT 数据面**统一为 resume/2 帧协议：客户端 `handleWTTCPClientConn` 与服务端 `proxyWTStreamV2` 用 `writeFrame/readFrame`（TCP）承载 DATA/END 帧；UDP 走 `writeUDPPacket/readUDPPacket` 数据报分帧。
-- **客户端 TCP 分派**改为 resume-only：`runTCPClient` 只按 `Transport` 分派并直接进入 `executeResumableTunnel`（h2/h3/grpc/masque-tcp）。
-- **服务端分派**：POST/MASQUE-TCP/MASQUE-UDP 均要求 `X-Tunnel-Proto: resume/2`，否则 426 `resume/2 required`（无 v1 兜底）。
-- **UDP 流客户端**：非 WT UDP 全走 `connectResumeUDP`（v2），v1 的 `grpcWriter/grpcReader` POST 兜底分支删除。
-- **测试迁移**：`features_test.go`、`heartbeat_test.go` 全部客户端/服务端补 `ResumeEnabled: true`；删除已过时的 `TestPaddingPingFrameRoundTrip`/`TestPaddingReaderAcceptsConsecutivePings`（v1 Padding 单测）。*（后注：随 `ResumeEnabled` 字段彻底删除，测试中这批 `ResumeEnabled: true` 冗余赋值也已统一清除。）*
-- **端口冲突修复**：backup 测试 echo/server 端口基址从 `22000` 段迁到 `27000` 段，避免与 `TestH2Tunnel_StrictDemux`（`22001`/`22002`/`22003`）冲突——后台 `go startXxx` 协程不退出导致端口被长期占用。
+- The **WT data plane** is unified on the resume/2 frame protocol: the client's `handleWTTCPClientConn` and the server's `proxyWTStreamV2` carry DATA/END frames via `writeFrame/readFrame` (TCP); UDP uses `writeUDPPacket/readUDPPacket` datagram framing.
+- **Client TCP dispatch** becomes resume-only: `runTCPClient` dispatches purely on `Transport` and goes straight into `executeResumableTunnel` (h2/h3/grpc/masque-tcp).
+- **Server dispatch**: POST/MASQUE-TCP/MASQUE-UDP all require `X-Tunnel-Proto: resume/2`, otherwise 426 `resume/2 required` (no v1 fallback).
+- **UDP stream clients**: all non-WT UDP goes through `connectResumeUDP` (v2); the v1 `grpcWriter/grpcReader` POST fallback branch is deleted.
+- **Test migration**: in `features_test.go` and `heartbeat_test.go`, every client/server got `ResumeEnabled: true`; the obsolete `TestPaddingPingFrameRoundTrip`/`TestPaddingReaderAcceptsConsecutivePings` (v1 Padding unit tests) were deleted. *(Later note: once the `ResumeEnabled` field was fully removed, this batch of redundant `ResumeEnabled: true` assignments in tests was also purged.)*
+- **Port-conflict fix**: the echo/server port base for the backup tests moved from the `22000` range to the `27000` range to avoid colliding with `TestH2Tunnel_StrictDemux` (`22001`/`22002`/`22003`) — background `go startXxx` goroutines that never exit kept the ports occupied for a long time.
 
-回归验证：`go build`、`go vet`、`gofmt`、`go test ./...`（40 个测试全绿）、跨编 linux/amd64 + linux/arm64 + darwin/arm64 全部通过。
+Regression verification: `go build`, `go vet`, `gofmt`, `go test ./...` (all 40 tests green), and cross-compilation for linux/amd64 + linux/arm64 + darwin/arm64 all pass.
 
-> 每阶段改动留在 working tree；全部完成后再统一向用户汇报，由用户决定是否提交。
+> Each phase's changes stay in the working tree; once everything is done, report to the user as a whole and let the user decide whether to commit.

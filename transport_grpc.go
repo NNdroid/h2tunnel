@@ -1,24 +1,26 @@
-package main
+package h2tunnel
 
 import "net/http"
 
 // =========================================
-// gRPC 传输层 adapter
+// gRPC transport adapter
 //
-// gRPC 传输本身没有独立的流处理 handler：resume/2 帧作为内层数据面（raw
-// resume frames，不做 grpc 二次分帧），外层仅打 application/grpc 的
-// Content-Type 标记以取悦 CDN/反代与中间件（如 Cloudflare 需启用 gRPC）。
-// 因此服务端 gRPC 请求直接转派到 handleH2StreamResumeServer（见 transport_h2.go），
-// 本文件只负责 gRPC 特有的响应头。
+// The gRPC transport has no stream handler of its own: resume/2 frames are the
+// inner data plane (raw resume frames, no secondary gRPC framing), and the outer
+// layer only tags Content-Type application/grpc to keep CDNs / reverse proxies
+// and middleboxes happy (e.g. Cloudflare needs gRPC enabled). So server-side
+// gRPC requests are dispatched straight to handleH2StreamResumeServer (see
+// transport_h2.go), and this file only supplies the gRPC-specific response headers.
 //
-// 数据面流程图：
+// Data-plane flow:
 //   client  ── X-Tunnel-Proto: resume/2 (Content-Type: application/grpc) ──> server
-//   server  ── 同 h2 的 resume 数据面（A/B 握手 + ring seq 续传）───────> 目标服务
+//   server  ── same resume data plane as h2 (A/B handshake + ring seq replay) ──> target service
 // =========================================
 
-// setGRPCTunnelHeaders 是 gRPC 分支的变体：Content-Type 必须保持
-// application/grpc（resume 帧作为内层数据面，外层仅打 Content-Type 标记，
-// 不做 grpc 二次分帧），其余反缓冲头照常施加。
+// setGRPCTunnelHeaders is the gRPC-branch variant: Content-Type must stay
+// application/grpc (resume frames are the inner data plane; the outer layer only
+// tags Content-Type, no secondary gRPC framing), while the other anti-buffering
+// headers are applied as usual.
 func setGRPCTunnelHeaders(h http.Header) {
 	h.Set("Content-Type", "application/grpc")
 	h.Set("Cache-Control", "no-store, no-transform")

@@ -1,4 +1,4 @@
-package main
+package h2tunnel
 
 import (
 	"bytes"
@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// TestRingBufferBasic 验证环形缓冲的常规读写
+// TestRingBufferBasic verifies normal reads and writes of the ring buffer
 func TestRingBufferBasic(t *testing.T) {
 	rb := newRingBuffer(4) // 4KB
 	want := []byte("hello-world")
@@ -25,21 +25,21 @@ func TestRingBufferBasic(t *testing.T) {
 	}
 }
 
-// TestRingBufferRolling 测试覆盖最旧时的窗口滚动语义
+// TestRingBufferRolling tests window-rolling semantics when the oldest data is overwritten
 func TestRingBufferRolling(t *testing.T) {
 	rb := newRingBuffer(1) // 1KB
-	// 写入 2KB 触发窗口滚动
+	// write 2KB to trigger window rolling
 	rb.Append(make([]byte, 1024))
 	rb.Append(make([]byte, 1024))
-	// WindowStartSeq 应已推进到 1024
+	// WindowStartSeq should have advanced to 1024
 	if rb.WindowStartSeq() != 1024 {
 		t.Fatalf("WindowStartSeq=%d, want 1024", rb.WindowStartSeq())
 	}
-	// seq=512（被覆盖）应返回 ErrGap
-	if _, err := rb.ReadAt(512, make([]byte, 16)); !errors.Is(err, ErrGap) {
-		t.Fatalf("expected ErrGap, got %v", err)
+	// seq=512 (overwritten) should return errGap
+	if _, err := rb.ReadAt(512, make([]byte, 16)); !errors.Is(err, errGap) {
+		t.Fatalf("expected errGap, got %v", err)
 	}
-	// seq=1024 起还能读到 1024 字节
+	// from seq=1024 we can still read 1024 bytes
 	got := make([]byte, 1024)
 	n, err := rb.ReadAt(1024, got)
 	if err != nil || n != 1024 {
@@ -71,7 +71,7 @@ func TestRingBufferLargeAppend(t *testing.T) {
 	}
 }
 
-// TestResumeFrameRoundTrip 验证 resume 帧格式的读写
+// TestResumeFrameRoundTrip verifies read/write of the resume frame format
 func TestResumeFrameRoundTrip(t *testing.T) {
 	var wire bytes.Buffer
 	payload1 := []byte("first-chunk")
@@ -95,19 +95,19 @@ func TestResumeFrameRoundTrip(t *testing.T) {
 	}
 }
 
-// TestResumeEndFrame 验证 END 控制帧
+// TestResumeEndFrame verifies the END control frame
 func TestResumeEndFrame(t *testing.T) {
 	var wire bytes.Buffer
-	if err := writeResumeEndFrame(&wire); err != nil {
+	if err := writeResumeEndFrame(&wire, paddingPolicy{}); err != nil {
 		t.Fatalf("write end: %v", err)
 	}
 	_, _, err := readResumeFrame(&wire, make([]byte, 1024))
-	if !errors.Is(err, ErrResumeEndFrame) {
-		t.Fatalf("expected ErrResumeEndFrame, got %v", err)
+	if !errors.Is(err, errResumeEndFrame) {
+		t.Fatalf("expected errResumeEndFrame, got %v", err)
 	}
 }
 
-// TestResumeClientRingBufReplay 验证客户端 ring 的重放语义
+// TestResumeClientRingBufReplay verifies the replay semantics of the client ring
 func TestResumeClientRingBufReplay(t *testing.T) {
 	b := newResumeClientRingBuf(4)
 	b.Append([]byte("0123456789"))
@@ -121,14 +121,14 @@ func TestResumeClientRingBufReplay(t *testing.T) {
 	}
 }
 
-// io.AssignTo 把测试跑通后追加一些额外 sanity —— 强制 io 接口依赖
+// io.AssignTo: extra sanity once the tests pass — enforces the io interface dependency
 var _ io.Reader = (*bytes.Buffer)(nil)
 
-// TestResumeRequestBuilderTransports 验证 resume 请求构造器能覆盖
-// h2 / grpc / masque-tcp 三种传输，各自生成正确的 method / path / 头。
+// TestResumeRequestBuilderTransports verifies the resume request builder covers
+// the h2 / grpc / masque-tcp transports, each producing the correct method / path / headers.
 func TestResumeRequestBuilderTransports(t *testing.T) {
 	ring := newResumeClientRingBuf(256)
-	base := ClientConfig{
+	base := clientConfig{
 		ServerUrl:     "https://cdn.example.com",
 		Path:          "/tunnel",
 		TargetAddr:    "db.internal:5432",
@@ -140,7 +140,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 
 	cases := []struct {
 		name           string
-		mutate         func(*ClientConfig)
+		mutate         func(*clientConfig)
 		wantMethod     string
 		wantPathPrefix string
 		wantProto      string
@@ -148,7 +148,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 	}{
 		{
 			name:           "h2 POST",
-			mutate:         func(c *ClientConfig) {},
+			mutate:         func(c *clientConfig) {},
 			wantMethod:     "POST",
 			wantPathPrefix: "/tunnel",
 			wantProto:      "resume/2",
@@ -156,7 +156,7 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 		},
 		{
 			name:           "grpc POST",
-			mutate:         func(c *ClientConfig) { c.Transport = transportGRPC },
+			mutate:         func(c *clientConfig) { c.Transport = transportGRPC },
 			wantMethod:     "POST",
 			wantPathPrefix: "/tunnel",
 			wantProto:      "resume/2",
@@ -164,9 +164,9 @@ func TestResumeRequestBuilderTransports(t *testing.T) {
 		},
 		{
 			name:           "masque-tcp CONNECT",
-			mutate:         func(c *ClientConfig) { c.Transport = transportMasque },
+			mutate:         func(c *clientConfig) { c.Transport = transportMasque },
 			wantMethod:     "CONNECT",
-			wantPathPrefix: "/.well-known/masque/tcp/",
+			wantPathPrefix: "/tunnel/.well-known/masque/tcp/",
 			wantProto:      "resume/2",
 			wantCT:         "",
 		},

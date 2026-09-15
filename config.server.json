@@ -11,5 +11,9 @@
   "local_only": true,
   "session_window_kb": 256,
   "drain_timeout_sec": 30,
+  "padding": {
+    "min_record_bytes": 600,
+    "max_record_bytes": 1200
+  },
   "log_level": "info"
 }

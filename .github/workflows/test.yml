@@ -1,0 +1,114 @@
+name: Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      # MASQUE-over-h2 (the client MasqueALPN=h2/auto fallback leg) needs x/net
+      # extended CONNECT; without it the matching assertions are skipped. GODEBUG
+      # must take effect at process start, so it lives at the job level.
+      GODEBUG: http2xconnect=1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        shell: bash
+        run: go vet ./...
+
+      - name: Build
+        shell: bash
+        run: go build -v ./...
+
+      - name: Test (race)
+        # quic-go officially does not support Go's race detector on Windows:
+        # native crash (Exception 0xc0000005 / unknown pc, see the race
+        # detector limitation section in the quic-go README). Race detection on
+        # all pure-Go code is covered by linux/macos; Windows runs functional
+        # tests only.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: go test -v -timeout 15m -race -coverprofile=coverage.out ./...
+
+      - name: Test (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: go test -v -timeout 15m ./...
+
+      - name: Benchmark (Linux only)
+        # go test does not run Benchmark functions by default (needs -bench);
+        # run all benchmarks once on a single platform: confirm the benchmarks
+        # execute + emit throughput reference values. No -race (race distorts
+        # the numbers by orders of magnitude). Absolute values on shared CI
+        # runners are noisy, so judge performance regressions from local
+        # multi-round results; treat CI numbers as magnitudes / error presence.
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: go test -run '^$' -bench . -benchtime 1s -timeout 25m ./...
+
+      - name: Upload coverage (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  profile:
+    name: Profile (flamegraph)
+    runs-on: ubuntu-latest
+    needs: test
+    # Profiling is just an analysis artifact; infrastructure problems should
+    # not block merges.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install graphviz (go tool pprof -svg)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends graphviz
+
+      - name: Collect CPU + memory profiles from the throughput benchmark
+        shell: bash
+        run: |
+          go test -run '^$' -bench 'BenchmarkProtocolThroughput/(H2_TCP|H2C_TCP|gRPC_TCP|H3_TCP|WT_TCP|MASQUE_TCP)$' \
+            -benchtime 3s -timeout 20m -cpuprofile cpu.out -memprofile mem.out .
+
+      - name: Render flamegraphs and top reports
+        shell: bash
+        run: |
+          mkdir -p profile-out
+          go tool pprof -svg cpu.out > profile-out/cpu-flamegraph.svg
+          go tool pprof -top cpu.out </dev/null > profile-out/cpu-top.txt
+          go tool pprof -svg -sample_index=alloc_space mem.out > profile-out/alloc-flamegraph.svg
+          go tool pprof -top -sample_index=alloc_objects mem.out </dev/null > profile-out/alloc-top.txt || true
+
+      - name: Upload profiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiles
+          path: profile-out/
+          retention-days: 14

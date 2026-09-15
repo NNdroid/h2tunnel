@@ -1,125 +1,138 @@
-# h2tunnel 连接管理分层架构设计（resume v2 统一）
+# h2tunnel Layered Connection-Management Architecture (resume v2 Unification)
 
-> 状态：**已实施**（L3 `connmanager.go` + `backup.go` 泛化 + `main.go` 配置接线；全量可运行测试 `connmanager_test.go` 全绿；回归验证通过）。
-> 范围：客户端连接管理与主备切换的重构，统一到 resume v2；彻底去除 v1 时代所有旧连接管理路径。
-> 关联：`docs/resume-handshake-protocol.md`（resume/2 帧协议、握手、主备线路协议）。
-
----
-
-## 0. 设计目标与背景
-
-当前代码经过 M1–M5 已将 **数据面统一为 resume v2 帧协议**（v1 的 Padding/grpc/心跳路径全部删除）。但**连接管理层的组织仍是历史遗留的平铺结构**：
-
-- 传输选择（h2 / h3 / grpc / masque / wt）散落在 `client.go` 的 `runClient` 长函数里；
-- 池级热备 `standbyRoundTripper`（`standby.go`）与备用线路执行器 `backupLine`（`backup.go`）**是两套并行的、职责重叠的热备实现**；
-- 备用线路 `backupLine` 目前是「固定 1 条、只做心跳、不参与业务数据、由外部创建」的窄接口，未接入统一的生命周期管理；
-- 没有「主备数量」「拨号间隔」「建立间隔」这些可配置项；类型分流（多主连接按传输类型分流）完全没有。
-
-本设计的目标是给出**一套分层清晰的连接管理架构**，满足：
-
-1. **统一协议**：不保留 resume 之前任何旧版协议，全部统一到 resume v2。
-2. **分层解耦**：
-   - **基座层（必选/公共逻辑）**：会话恢复引擎、帧编解码、环形缓冲、握手协商、seq 管理、控制帧优先调度——所有协议共用的不可变核心。
-   - **传输实现层（最底层）**：各具体协议（h2 / h3 / grpc / masque-tcp / masque-udp / wt）只提供「建立一条字节管道 / 数据报管道」的最小实现，不掺业务。
-   - **连接管理层（构建在 resume 之上）**：在主备连接池之上做生命周期管理、健康探测、数量补足、切换升级、类型分流。
-3. **主备连接管理**：
-   - 主备数量**可配置**：默认主 1 条、备 1 条。
-   - 主连接 >1 条时按**类型分流**工作。
-   - 主连接每断一条，就用一条备用顶上（升级为主），并**重新拨号补足备用数量**。
-   - 保留主备各自的**拨号间隔**配置；主/备建立之间的间隔默认 **100 秒**。
+> Status: **Implemented** (L3 `connmanager.go` + generalized `backup.go` + `main.go` config wiring; the full runnable test suite `connmanager_test.go` is green; regression verification passed).
+> Scope: Refactor client connection management and primary/backup failover onto resume v2; completely remove all v1-era legacy connection-management paths.
+> Related: `docs/resume-handshake-protocol.md` (resume/2 frame protocol, handshake, primary/backup line protocol).
 
 ---
 
-## 1. 分层总览
+## 0. Design Goals and Background
+
+After M1–M5, the current code has already **unified the data plane on the resume v2 frame protocol** (all v1 Padding/grpc/heartbeat paths were deleted). However, **the connection-management layer is still organized as a flat, historically grown structure**:
+
+- Transport selection (h2 / h3 / grpc / masque / wt) is scattered inside the long `runClient` function in `client.go`;
+- The pool-level standby `standbyRoundTripper` (`standby.go`) and the backup-line executor `backupLine` (`backup.go`) **are two parallel, overlapping standby implementations**;
+- The backup line `backupLine` is currently a narrow interface — "fixed at 1 line, heartbeat only, no business data, created externally" — and is not wired into unified lifecycle management;
+- There are no configurable items such as "primary/backup counts", "dial interval", or "establish interval"; type-based sharding (splitting multiple primary connections by transport type) is entirely absent.
+
+The goal of this design is to provide **a cleanly layered connection-management architecture** that satisfies:
+
+1. **Unified protocol**: Keep none of the pre-resume legacy protocols; unify everything on resume v2.
+2. **Layered decoupling**:
+   - **Foundation layer (mandatory/common logic)**: session resume engine, frame codec, ring buffer, handshake negotiation, seq management, control-frame priority scheduling — the immutable core shared by all protocols.
+   - **Transport implementation layer (lowest layer)**: each concrete protocol (h2 / h3 / grpc / masque-tcp / masque-udp / wt) provides only the minimal "establish one byte-pipe / datagram-pipe" implementation, with no business logic mixed in.
+   - **Connection management layer (built on top of resume)**: lifecycle management, health probing, count replenishment, failover, and type-based sharding on top of the primary/backup connection pool.
+3. **Primary/backup connection management**:
+   - Primary/backup counts are **configurable**: defaults are 1 primary, 1 backup.
+   - When there is more than 1 primary connection, operate with **type-based sharding**.
+   - Whenever a primary connection drops, one backup is promoted to take its place (upgraded to primary), and **a new backup is dialed to replenish the backup count**.
+   - Keep separate **dial interval** configuration for primary and backup; the interval between primary and backup establishment defaults to **100 seconds**.
+
+---
+
+## 1. Layer Overview
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                    应用层（用户业务）                         │
-│   SSH / UDP / 任何 net.Conn —— 只关心「一条能用的隧道」        │
+│              Application layer (user business)             │
+│  SSH / UDP / any net.Conn — cares only about "one usable    │
+│  tunnel"                                                   │
 └───────────────▲────────────────────────────────────────────┘
-                │ 一致的 net.Conn 语义（读写 + 断线续传）         │
+                │  consistent net.Conn semantics (read/write + resume on disconnect)
 ┌───────────────┴────────────────────────────────────────────┐
-│  L3  连接管理层  ConnectionManager                          │
-│   · 主备连接池（主 1..N / 备 1..M，数量可配）                  │
-│   · 主连接断 → 备升级为主 → 重新拨号补备                        │
-│   · 多主 → 类型分流（tcp→h2/h3, udp→...）                     │
-│   · 健康探测 / 建立间隔错相 / 生命周期                         │
+│  L3  Connection management layer  ConnectionManager        │
+│   · primary/backup connection pool (primary 1..N /          │
+│     backup 1..M, counts configurable)                      │
+│   · primary drops → backup promotes to primary →           │
+│     redial to replenish the backup                         │
+│   · multiple primaries → type sharding (tcp→h2/h3, udp→...) │
+│   · health probing / establish-interval phase offset /     │
+│     lifecycle                                              │
 └───────────────▲────────────────────────────────────────────┘
-                │ 每一条连接 = 一个 ResumeSession 实例           │
+                │  every connection = one ResumeSession instance
 ┌───────────────┴────────────────────────────────────────────┐
-│  L2  会话层（resume v2 引擎 / 基座公共逻辑）  ResumeSession   │
-│   · 帧编解码 writeFrame/readFrame；控制帧由 writer 互斥锁串行化优先于 DATA │
-│   · 环形缓冲 seq 重放、会话表、A/B 双层握手                     │
-│   · 会话恢复（断线续传）—— 传输无关                         │
+│  L2  Session layer (resume v2 engine / foundation common   │
+│      logic)  ResumeSession                                 │
+│   · frame codec writeFrame/readFrame; control frames       │
+│     serialized by the writer mutex, ahead of DATA          │
+│   · ring buffer seq replay, session table,                 │
+│     A/B two-layer handshake                                │
+│   · session recovery (resume on disconnect) —              │
+│     transport-agnostic                                     │
 └───────────────▲────────────────────────────────────────────┘
-                │ 通过 Transport 建立一条流（字节 / 数据报）      │
+                │  establish one stream via Transport (byte / datagram)
 ┌───────────────┴────────────────────────────────────────────┐
-│  L1  传输实现层  TransportAdapter (h2/h3/grpc/masque/wt)     │
-│   · 只负责：拨号建连 + 建流 + 暴露 io.Reader/io.Writer/       │
-│     数据报收发 + 探活；不掺 resume/会话/业务                  │
+│  L1  Transport implementation layer                        │
+│      TransportAdapter (h2/h3/grpc/masque/wt)               │
+│   · responsible only for: dial + stream setup + exposing   │
+│     io.Reader/io.Writer / datagram send-recv + liveness    │
+│     probe; no resume/session/business logic                │
 └────────────────────────────────────────────────────────────┘
 ```
 
-**依赖方向（严格单向）**：`L3 → L2 → L1`。L1 不知道 L2/L3 的存在；L2 不知道 L3 的存在；L3 才拥有「哪些连接、哪些是主、哪些是备」的全部状态。
+**Dependency direction (strictly one-way)**: `L3 → L2 → L1`. L1 does not know L2/L3 exist; L2 does not know L3 exists; only L3 owns all state about "which connections there are, which are primary, which are backups".
 
 ---
 
-## 2. 层与职责细化
+## 2. Layers and Responsibilities in Detail
 
-### 2.1 L1 传输实现层（最底层）
+### 2.1 L1 Transport implementation layer (lowest layer)
 
-目标：把「用传输 X 建立一条到服务端的隧道流」抽象成**统一的接口**，抹平 h2/h3/grpc/masque/wt 的差异。
+Goal: abstract "establish a tunnel stream to the server using transport X" into **a unified interface**, flattening away the differences between h2/h3/grpc/masque/wt.
 
 ```go
-// transport.go —— 新增
-// 传输适配器：一条已建立的、可用的隧道底层通道。
+// transport.go —— new
+// Transport adapter: an established, usable low-level tunnel channel.
 type TunnelConn interface {
     io.Reader
     io.Writer
     io.Closer
-    // LocalAddr/RemoteAddr 供日志与健康判定
+    // LocalAddr/RemoteAddr for logging and health decisions
     NetType() string          // "tcp" | "udp"
     Proto() string            // "h2" | "h3" | "grpc" | "masque-tcp" | "masque-udp" | "wt"
-    // 一次建连（拨号）。实现方负责构造 http.Client / http3.Transport / wt dialer，
-    // 发起到服务端的请求并返回可用的流。
+    // One connection setup (dial). The implementation is responsible for
+    // constructing the http.Client / http3.Transport / wt dialer, initiating
+    // the request to the server, and returning a usable stream.
 }
 
-// 传输工厂：按配置生产一条 TunnelConn。
+// Transport factory: produces one TunnelConn according to configuration.
 type TransportFactory interface {
     Dial(ctx context.Context, cfg ClientConfig) (TunnelConn, error)
-    // DialInterval 该传输的拨号间隔（主/备各自可配，见 §5）
-    DialInterval() time.Duration
+    // DialInterval is the dial interval for this transport
+    // (primary/backup each configurable, see §5)
 }
 ```
 
-**每种协议一个实现**（放在 `transport_*.go`）：
+**One implementation per protocol** (placed in `transport_*.go`):
 
-| 协议 | 实现 | 通道形态 | 备注 |
+| Protocol | Implementation | Channel form | Notes |
 |------|------|----------|------|
-| h2 | `http2TransportAdapter` | 字节流（POST 流式 body/body） | |
-| h3 | `http3TransportAdapter` | 字节流（QUIC bidi stream） | |
-| grpc | `grpcTransportAdapter` | 字节流（POST + Content-Type: application/grpc） | 仅打标记，不套 grpc 分帧 |
-| masque-tcp | `masqueTCPTransportAdapter` | 字节流（CONNECT 流） | |
-| masque-udp | `masqueUDPTransportAdapter` | 数据报（CONNECT + capsule） | |
-| wt | `webtransportAdapter` | 字节流（WT bidi stream） | |
+| h2 | `http2TransportAdapter` | byte stream (POST streaming body/body) | |
+| h3 | `http3TransportAdapter` | byte stream (QUIC bidi stream) | |
+| grpc | `grpcTransportAdapter` | byte stream (POST + Content-Type: application/grpc) | marker only, no grpc framing layered on top |
+| masque-tcp | `masqueTCPTransportAdapter` | byte stream (CONNECT stream) | |
+| masque-udp | `masqueUDPTransportAdapter` | datagram (CONNECT + capsule) | |
+| wt | `webtransportAdapter` | byte stream (WT bidi stream) | |
 
-> **关键解耦点**：L1 只负责「建流 + 原始字节/数据报的读写」。它**不碰** resume 帧、seq、握手——这些是 L2 的事。当前代码里 `buildResumeRequest` 里揉杂的「masque 走 RoundTrip、h2 走 Do」等分支，全部下沉到各自 adapter 的 `Dial` 里。
+> **Key decoupling point**: L1 is only responsible for "stream setup + raw byte/datagram read-write". It does **not touch** resume frames, seq, or handshake — those are L2's job. The branches currently tangled inside `buildResumeRequest` ("masque goes through RoundTrip, h2 goes through Do", etc.) all move down into each adapter's `Dial`.
 
-### 2.2 L2 会话层（resume v2 引擎，基座公共逻辑）
+### 2.2 L2 Session layer (resume v2 engine, foundation common logic)
 
-目标：把 resume v2 引擎从「内嵌在 executeResumableTunnel 的单函数」提升为**独立的、可复用的会话对象**。
+Goal: promote the resume v2 engine from "a single function embedded in executeResumableTunnel" into **a standalone, reusable session object**.
 
 ```go
-// session.go —— 重构
-// 一条 resume v2 会话：对上层暴露「可读写的隧道」，内部承担全部 resume 语义。
+// session.go —— refactor
+// One resume v2 session: exposes a "readable/writable tunnel" to the layer
+// above, and carries all resume semantics internally.
 type ResumeSession struct {
     id        string
-    transport TunnelConn            // 底层 L1 通道
-    ring      *resumeClientRingBuf  // 上行环形缓冲（续传）
-    serverUplink atomic.Uint64      // 服务端已确认的续传位置
-    seq        atomic.Uint64        // 本会话上行 seq
-    mu         sync.Mutex          // 写互斥：控制帧与 DATA 串行化，控制帧优先于 DATA 插入
-    // 生命周期/状态
+    transport TunnelConn            // underlying L1 channel
+    ring      *resumeClientRingBuf  // uplink ring buffer (resume)
+    serverUplink atomic.Uint64      // resume position acknowledged by the server
+    seq        atomic.Uint64        // uplink seq of this session
+    mu         sync.Mutex          // write mutex: serialize control frames and
+                                    // DATA; control frames insert ahead of DATA
+    // Lifecycle/state
     mu       sync.Mutex
     state    SessionState           // idle/handshaking/active/draining/closed
     role     SessionRole            // primary / backup
@@ -127,350 +140,355 @@ type ResumeSession struct {
 }
 
 func NewResumeSession(id string, transport TunnelConn, cfg ClientConfig) *ResumeSession
-func (s *ResumeSession) Handshake(ctx context.Context) error     // A+B 双层握手
-func (s *ResumeSession) Read(p []byte) (int, error)              // 下行解帧→业务数据
-func (s *ResumeSession) Write(p []byte) (int, error)             // 业务数据→上行 seq 入 ring→写帧
-func (s *ResumeSession) Ping() error                             // 发 KEEPALIVE 控制帧（备用探活）
+func (s *ResumeSession) Handshake(ctx context.Context) error     // A+B two-layer handshake
+func (s *ResumeSession) Read(p []byte) (int, error)              // downlink frame decode → business data
+func (s *ResumeSession) Write(p []byte) (int, error)             // business data → uplink seq into ring → write frame
+func (s *ResumeSession) Ping() error                             // send a KEEPALIVE control frame (backup liveness probe)
 func (s *ResumeSession) Close() error
 func (s *ResumeSession) State() SessionState
-func (s *ResumeSession) UpgradeToPrimary()                       // 备用升级为主（改 role）
+func (s *ResumeSession) UpgradeToPrimary()                       // promote backup to primary (change role)
 ```
 
-> **从 executeResumableTunnel 迁移**：现有的 `runResumeAttempt` / `resumeSendLoop` / `resumeRecvLoop` 逻辑整体搬入 `ResumeSession`，`Read/Write` 即原 recv/send loop。断线续传的「重拨」职责从单函数循环，**上移到 L3**（由 ConnectionManager 决定「重拨新流」还是「切换备用」）。
+> **Migrating from executeResumableTunnel**: the existing `runResumeAttempt` / `resumeSendLoop` / `resumeRecvLoop` logic moves wholesale into `ResumeSession`; `Read/Write` are the old recv/send loops. The "redial" responsibility for resume-after-disconnect moves **up to L3** from the single-function loop (ConnectionManager decides whether to "redial a new stream" or "switch to a backup").
 
-### 2.3 控制帧优先（L2 公共核心约束）
+### 2.3 Control-Frame Priority (L2 common-core constraint)
 
-`resumeframe.go` 定义帧逻辑优先级（设计意图，非运行时强制）：
+`resumeframe.go` defines the logical frame priorities (design intent, not runtime enforcement):
 
 ```
-P0 = ERROR / END          （会话终止类，最高优先）
-P1 = HANDSHAKE/ACK、KEEPALIVE/ACK （控制/握手，次高）
-P2 = DATA                 （业务数据，最低）
+P0 = ERROR / END          (session-terminating class, highest priority)
+P1 = HANDSHAKE/ACK, KEEPALIVE/ACK (control/handshake, second highest)
+P2 = DATA                 (business data, lowest)
 ```
 
-**实际运行时保证（无独立调度器）**：控制帧与 DATA 帧共用同一条 HTTP 流，写路径由各自 writer 的互斥锁串行化，保证「控制帧不拆裂、不饿死」：
+**Actual runtime guarantee (no standalone scheduler)**: control frames and DATA frames share the same HTTP stream, and the write path is serialized by each writer's mutex, ensuring "control frames are never split and never starved":
 
-- **服务端下行**：`downlinkPump` 经 `writeDownlink` → `resumeSessionWriter.writeFrame` 写 DATA；握手 ACK / KEEPALIVE-ACK 经 `writeControl` 写控制帧。两者都锁 `resumeSessionWriter.mu`，`downlinkPump` 每写出一帧即释放锁，控制帧在帧间隙插入，绝不会被数据面拆裂，也不会被饿死。
-- **客户端上行**：单条流仅一个 `resumeSendLoop` goroutine 写 `pw`（DATA + END），HANDSHAKE 在建流前单写一次，天然无并发写竞争。
-- **备用线路**：`backupLine.keepaliveLoop` 独占一条流写 KEEPALIVE，读 KEEPALIVE-ACK，同样单写者。
+- **Server downlink**: `downlinkPump` writes DATA via `writeDownlink` → `resumeSessionWriter.writeFrame`; handshake ACK / KEEPALIVE-ACK write control frames via `writeControl`. Both lock `resumeSessionWriter.mu`, and `downlinkPump` releases the lock as soon as each frame is written out, so control frames slot into the gaps between data frames — they can never be split by the data plane, nor starved.
+- **Client uplink**: on a single stream only one `resumeSendLoop` goroutine writes to `pw` (DATA + END), and HANDSHAKE is written exactly once before the stream is established, so there is naturally no concurrent-write contention.
+- **Backup line**: `backupLine.keepaliveLoop` exclusively owns one stream to write KEEPALIVE and read KEEPALIVE-ACK — likewise a single writer.
 
-> 历史说明：`handshake_frame.go` 曾实现 `frameMux` 双队列调度器（ctrlQ 恒先于 dataQ），但**从未接入生产写路径**（仅其单测引用），已于代码审查中作为死代码移除。上述「writer 互斥锁串行化」即为当前真实生效的优先级保证，行为等价且更简单。
+> Historical note: `handshake_frame.go` once implemented a `frameMux` two-queue scheduler (ctrlQ always ahead of dataQ), but it was **never wired into the production write path** (only its unit tests referenced it), and was removed as dead code during code review. The "writer-mutex serialization" described above is the priority guarantee actually in effect today — behaviorally equivalent and simpler.
 
-### 2.4 L3 连接管理层（本设计的核心）
+### 2.4 L3 Connection management layer (the core of this design)
 
-目标：拥有全部连接状态，做主备池、分流、切换、补位。
+Goal: own all connection state, and handle the primary/backup pool, sharding, failover, and replenishment.
 
 ```go
-// connmanager.go —— 新增
-// 连接管理器：持有 N 条主连接 + M 条备用连接，按类型分流，断线切换+补位。
+// connmanager.go —— new
+// Connection manager: holds N primary + M backup connections, shards by type,
+// and switches over + replenishes on failure.
 type ConnectionManager struct {
-    cfg      ConnectionPolicy      // 主备数量/间隔/类型分流策略
-    factory  *TransportFactorySet  // 各传输的工厂
+    cfg      ConnectionPolicy      // primary/backup counts / intervals / type-sharding policy
+    factory  *TransportFactorySet  // factories for each transport
 
     mu       sync.RWMutex
-    primaries map[string]*ResumeSession  // key: 类型(proto) → 主连接（同一类型至多1条主）
-    backups   []*ResumeSession           // 备用连接池（不参与业务数据，只探活）
-    // 拨号/建立节流
+    primaries map[string]*ResumeSession  // key: type(proto) → primary connection (at most 1 primary per type)
+    backups   []*ResumeSession           // backup connection pool (no business data, liveness probe only)
+    // dial/establish throttling
     dialMu    sync.Mutex
     lastDial  map[string]time.Time
 }
 
-func (m *ConnectionManager) Start(ctx context.Context)        // 启动：按策略拨主 + 拨备
-func (m *ConnectionManager) Pick(proto string) *ResumeSession // 业务侧取一条主连接
-func (m *ConnectionManager) OnPrimaryLost(s *ResumeSession)   // 主断 → 触发切换+补位
-func (m *ConnectionManager) replenish()                       // 补足主/备数量
+func (m *ConnectionManager) Start(ctx context.Context)        // start: dial primaries + backups per policy
+func (m *ConnectionManager) Pick(proto string) *ResumeSession // business side picks one primary connection
+func (m *ConnectionManager) OnPrimaryLost(s *ResumeSession)   // primary lost → triggers switchover + replenishment
+func (m *ConnectionManager) replenish()                       // restore primary/backup counts
 func (m *ConnectionManager) dialOne(role SessionRole, proto string) *ResumeSession
 ```
 
 ---
 
-## 3. 类型分流（多主连接）
+## 3. Type-Based Sharding (Multiple Primary Connections)
 
-**触发条件**：`PrimaryCount > 1`。
+**Trigger**: `PrimaryCount > 1`.
 
-**核心思想**：主连接不是「N 条完全等价」的冗余，而是按网络类型分担流量。即一个客户端同时维持多条主连接，每条服务一类流量。
+**Core idea**: the primary connections are not "N fully equivalent" redundancies, but split traffic by network type — one client maintains multiple primary connections at the same time, each serving one class of traffic.
 
-分流维度（当前代码的两类网络）：
-- **TCP 类**：服务 SSH 等流式字节流业务。
-- **UDP 类**：服务 DNS 等数据报业务。
+Sharding dimensions (the two network classes in the current code):
+- **TCP class**: serves streaming byte traffic such as SSH.
+- **UDP class**: serves datagram traffic such as DNS.
 
 ```
-PrimaryCount=2 时：
-  primary["tcp"] → 当前 transport (ResumeSession, role=primary)
-  primary["udp"] → 当前 transport (ResumeSession, role=primary)
+With PrimaryCount=2:
+  primary["tcp"] → current transport (ResumeSession, role=primary)
+  primary["udp"] → current transport (ResumeSession, role=primary)
 
-业务流入：
-  TCP 业务 → Pick("tcp") → 走 TCP 主连接
-  UDP 业务 → Pick("udp") → 走 UDP 主连接
+Business traffic:
+  TCP traffic → Pick("tcp") → via the TCP primary connection
+  UDP traffic → Pick("udp") → via the UDP primary connection
 ```
 
-分流类型直接由 `network` 生成有序数组：`tcp`、`udp` 或 `[tcp, udp]`。
-传输协议不在此层重复配置，始终使用唯一的 `transport`。
+The sharding types are derived directly from `network` as an ordered array: `tcp`, `udp`, or `[tcp, udp]`.
+Transport protocols are not configured redundantly at this layer; the single `transport` is always used.
 
-> **注意**：这里的「类型分流」是**连接/通道级**分流，不是会话级（同一业务类型内部仍可并行多会话）。多条主连接之间**互不重复**——各自独占一个类型，避免 CDN 同时杀掉多条的问题退化为「N 条重复冗余」。
+> **Note**: this "type sharding" is **connection/channel-level** sharding, not session-level (multiple sessions can still run in parallel within the same business type). The primary connections **never duplicate one another** — each exclusively owns one type, preventing the "CDN kills several connections at once" problem from degenerating into "N duplicated redundancies".
 
 ---
 
-## 4. 主备切换与补位流程
+## 4. Primary/Backup Failover and Replenishment Flows
 
-### 4.1 状态机（单条连接）
+### 4.1 State machine (a single connection)
 
 ```
-                 dialOne() 成功握手
+                 dialOne() handshake succeeds
    ┌───────────► ┌────────────────┐
    │             │  handshaking    │
    │             └───────┬────────┘
-   │                     │  A+B 握手 ok
+   │                     │  A+B handshake ok
    │                     ▼
-   │             ┌────────────────┐   Pick() 命中   ┌────────────┐
+   │             ┌────────────────┐   Pick() hits   ┌────────────┐
    │             │  backupAlive    │ ─────────────► │  primary   │
-   │             │  (备用，可接管)   │   UpgradeTo    │  (主，承载业务)│
-   │             └───────┬────────┘                 └─────┬──────┘
-   │                     ▲                               │ 断/失效
-   │                     │ 补位拨新备                      ▼
-   │                     │                         ┌────────────┐
-   │                     │                         │  primaryLost │
-   └── 重新拨号 ──────────┘                         └────────────┘
+   │             │  (backup, ready │   UpgradeTo    │  (primary, │
+   │             │  to take over)  │                │  carrying  │
+   │             └───────┬────────┘                 │  business) │
+   │                     ▲                          └─────┬──────┘
+   │                     │ replenish: dial a new          │ lost/unhealthy
+   │                     │ backup                         ▼
+   │                     │                        ┌────────────┐
+   │                     │                        │primaryLost │
+   └── redial ───────────┘                        └────────────┘
 ```
 
-### 4.2 主连接断掉 → 切换 + 补位（核心流程）
+### 4.2 Primary connection drops → switchover + replenishment (core flow)
 
 ```
-① 业务读写失败 / 探测判定 primaryLost
+① Business read/write fails / probing judges primaryLost
         │
         ▼
-② ConnectionManager.OnPrimaryLost(断掉的 primary[type])
+② ConnectionManager.OnPrimaryLost(the dropped primary[type])
         │
         ▼
-③ 从 backups 池挑一条「已确认存活（backupAlive）」的备用
-        │  （有：进 ④；无：进 ⑤）
+③ Pick one backup from the backups pool that is
+   "confirmed alive (backupAlive)"
+        │  (found: go to ④; none: go to ⑤)
         ▼
-④ 升级：备用.UpgradeToPrimary() → primary[type] = 该备用
-   · 备用此前已握手 + KEEPALIVE 保活 → 升级后即可继续承载业务（秒级接管）
-   · 原 session id 不变，业务侧 Pick(type) 拿到的还是同一语义的隧道
+④ Promote: backup.UpgradeToPrimary() → primary[type] = that backup
+   · The backup previously completed handshake + KEEPALIVE keepalive →
+     right after promotion it can keep carrying business (second-level takeover)
+   · The original session id stays unchanged; the business side still gets a
+     tunnel with the same semantics from Pick(type)
         ▼
-⑤ 补位：replenish() 拨一条新的备用，补足 backupCount
-   · 遵循该备用拨号间隔（§5）节流
+⑤ Replenish: replenish() dials one new backup to restore backupCount
+   · Throttled by that backup's dial interval (§5)
         ▼
-⑥ 结束：主数量与备数量重新回到配置值
+⑥ Done: primary and backup counts return to the configured values
 ```
 
-**关键约束**：
-- **只有 `backupAlive` 的备用才允许接管**（继承 §3.3 设计，避免盲切死线）。
-- 若无可接管备用，`primary[type]` 保持空缺，`Pick(type)` 阻塞/返回重试；`replenish` 立即按拨号间隔补主（主优先于备）。
-- **主连接断的瞬间不丢会话**：resume v2 的 seq+环形缓冲保证升级后的主连接可续传断点（若该类型允许多会话，其它未断主连接暂时代管）。
+**Key constraints**:
+- **Only `backupAlive` backups are allowed to take over** (inheriting the §3.3 design, avoiding a blind switch onto a dead line).
+- If no backup can take over, `primary[type]` stays empty, and `Pick(type)` blocks/returns a retry; `replenish` immediately redials a primary per the dial interval (primary takes priority over backup).
+- **No session is lost at the instant the primary drops**: resume v2's seq + ring buffer guarantee the promoted primary can resume from the break point (if that type allows multiple sessions, other surviving primaries of the same type take temporary charge).
 
-### 4.3 备用补位流程
+### 4.3 Backup replenishment flow
 
 ```
-① replenish() 检查 backups 池数量 < BackupCount
+① replenish() checks: backups pool size < BackupCount
         │
         ▼
-② 是否已到该备用「拨号间隔」？ (lastDial + backupDialInterval <= now)
-        │ 否：等间隔到期（定时器）｜ 是：继续
+② Has that backup's "dial interval" come due? (lastDial + backupDialInterval <= now)
+        │  No: wait for the interval to elapse (timer) | Yes: continue
         ▼
-③ dialOne(role=backup, proto=按分流策略选)
-   · 构造独立 session id（<type>+b）、role=backup
-   · A+B 握手（datagram 类跳过 B 层，仅 A 层）
+③ dialOne(role=backup, proto=chosen per the sharding policy)
+   · Build an independent session id (<type>+b), role=backup
+   · A+B handshake (datagram class skips the B layer, A layer only)
         ▼
-④ 入池：backups = append(backups, 新备用)（state=backupAlive）
-   · 后台 KEEPALIVE 保活（§4.4）
+④ Enroll in pool: backups = append(backups, new backup) (state=backupAlive)
+   · Background KEEPALIVE keepalive (§4.4)
         ▼
-⑤ 结束
+⑤ Done
 ```
 
-### 4.4 备用保活（KEEPALIVE）
+### 4.4 Backup keepalive (KEEPALIVE)
 
-- 备用不承载业务数据，只做周期 `KEEPALIVE` 探测（沿用 `backupLine` 现有逻辑，但对象化进 `ResumeSession`）。
-- 连续 `BackupMaxMissedAcks=3` 次未收到 `KEEPALIVE-ACK` → 判定失效，移出池，触发补位。
-- KEEPALIVE 帧经 `backupLine.keepaliveLoop` 独占流写出，本就不与业务 DATA 争用；主线路 KEEPALIVE-ACK 经 `writeControl` 在 `resumeSessionWriter.mu` 保护下于 DATA 帧间隙插入，**必优先于任何 DATA 且不拆裂**。
+- Backups carry no business data; they only run periodic `KEEPALIVE` probes (reusing the existing `backupLine` logic, but objectified into `ResumeSession`).
+- `BackupMaxMissedAcks=3` consecutive `KEEPALIVE-ACK`s missed → judged dead, removed from the pool, replenishment triggered.
+- KEEPALIVE frames are written out on an exclusively owned stream via `backupLine.keepaliveLoop`, so they never contend with business DATA in the first place; main-line KEEPALIVE-ACK is written via `writeControl`, protected by `resumeSessionWriter.mu`, slotting into the gaps between DATA frames — **always ahead of any DATA and never split**.
 
 ---
 
-## 5. 配置项设计
+## 5. Configuration Design
 
-统一落在 `Config`（JSON 字段）与 `ClientConfig`（运行时）。
+Unified in `Config` (JSON fields) and `ClientConfig` (runtime).
 
 ```go
 type ConnectionPolicy struct {
-    PrimaryCount int               // 主连接数量，默认 1
-    BackupCount  int               // 备用连接数量，默认 1
-    PrimaryDialInterval  time.Duration // 主连接拨号间隔（§5.1）
-    BackupDialInterval   time.Duration // 备用连接拨号间隔（§5.1）
-    EstablishInterval    time.Duration // 主/备建立间隔（§5.2），默认 100s
-    BackoffMaxMissedAcks int          // 备用失效判定阈值，默认 3
-    PrimaryNetworks []string          // 启用的主线路网络类型，固定 tcp→udp 顺序
+    PrimaryCount int               // primary connection count, default 1
+    BackupCount  int               // backup connection count, default 1
+    PrimaryDialInterval  time.Duration // primary connection dial interval (§5.1)
+    BackupDialInterval   time.Duration // backup connection dial interval (§5.1)
+    EstablishInterval    time.Duration // primary/backup establish interval (§5.2), default 100s
+    BackoffMaxMissedAcks int          // backup failure threshold, default 3
+    PrimaryNetworks []string          // enabled primary-line network types, fixed tcp→udp order
 }
 ```
 
-### JSON 字段（新增到 `Config`）
+### JSON fields (added to `Config`)
 
 ```jsonc
 {
-  "primary_count": 1,          // 主连接数（>1 时启用类型分流），默认 1
-  "backup_count": 1,           // 备用连接数，默认 1
-  "primary_dial_interval_sec": 0,   // 主连接拨号间隔（秒），0=默认（见 §5.1）
-  "backup_dial_interval_sec": 0,    // 备用连接拨号间隔（秒），0=默认
-  "establish_interval_sec": 100     // 主/备建立间隔（秒），默认 100
+  "primary_count": 1,          // primary connection count (type sharding enabled when >1), default 1
+  "backup_count": 1,           // backup connection count, default 1
+  "primary_dial_interval_sec": 0,   // primary dial interval (seconds), 0=default (see §5.1)
+  "backup_dial_interval_sec": 0,    // backup dial interval (seconds), 0=default
+  "establish_interval_sec": 100     // primary/backup establish interval (seconds), default 100
 }
 ```
 
-分流不提供独立映射配置：`transport` 是唯一传输事实来源，`network` 决定启用
-`tcp`、`udp` 或两者，`primary_count > 1` 时按固定的 `tcp → udp` 顺序拆分主线路。
+Sharding provides no separate mapping configuration: `transport` is the single source of truth for the transport, `network` decides whether `tcp`, `udp`, or both are enabled, and when `primary_count > 1` the primary lines are split in the fixed `tcp → udp` order.
 
-### 5.0 上层协议唯一性（只保留 Resume v2）
+### 5.0 Upper-Layer Protocol Uniqueness (keep only Resume v2)
 
-- **数据面唯一**：`resume/2` 是唯一上层封装协议。h2 / h3 / grpc / masque-tcp / masque-udp / wt 全部作为 **L1 传输实现层**，只提供「建一条字节/数据报管道」，之上统一套 `resume/2` 帧 + A/B 握手。
-- **旧协议彻底移除**：v1 时代的所有数据面（Padding 帧、grpc 二次分帧、代理心跳 proxyStream/pinger 等）已全部删除（见 `resume-handshake-protocol.md` §4.9）。任何不带 `X-Tunnel-Proto: resume/2` 的隧道请求 → 服务端返回 426，无降级目标。
-- **传输层扩展性**：未来新增底层协议（如 QUIC-Raw、SCTP）只需新增一个 L1 adapter，**不触碰** L2 会话层与 L3 连接管理层。
+- **Single data plane**: `resume/2` is the only upper-layer framing protocol. h2 / h3 / grpc / masque-tcp / masque-udp / wt all act as the **L1 transport implementation layer**, providing only "establish one byte/datagram pipe"; above them, `resume/2` frames + A/B handshake are uniformly layered on.
+- **Old protocols fully removed**: all v1-era data planes (Padding frames, grpc secondary framing, proxy heartbeat proxyStream/pinger, etc.) have been deleted (see `resume-handshake-protocol.md` §4.9). Any tunnel request without `X-Tunnel-Proto: resume/2` → the server responds 426, with no fallback target.
+- **Transport-layer extensibility**: adding a low-level protocol in the future (e.g. QUIC-Raw, SCTP) only requires a new L1 adapter, **without touching** the L2 session layer or the L3 connection management layer.
 
-### 5.1 拨号间隔（DialInterval）
+### 5.1 Dial Interval (DialInterval)
 
-**含义**：对**同一连接**的两次拨号之间的最小间隔。作用是**资源节流**：避免主/备断线后风暴式重拨、以及备用补位在短时间内重复触发。
+**Meaning**: the minimum interval between two dial attempts for **the same connection**. Purpose: **resource throttling** — avoid storm-like redials after primary/backup disconnects, and repeated backup replenishment within a short window.
 
-- **主连接拨号间隔** `primary_dial_interval_sec`：主连接断后重拨的最小间隔。默认按类型区分——CDN 场景（h2/h3/grpc/masque）建议 `30s`，直连场景可 `0`（立即）。
-- **备用连接拨号间隔** `backup_dial_interval_sec`：备用补位的最小间隔。默认 `15s`（备用心跳周期同量级）。
-- 各自独立配置 → 「保留主备各自的拨号间隔配置」即此意。
-- 实现：`ConnectionManager` 内 `lastDial[role+proto]` + 节流；未到间隔时挂定时器，到期再拨。
+- **Primary dial interval** `primary_dial_interval_sec`: the minimum interval between redials after a primary connection drops. Defaults are differentiated by type — for CDN scenarios (h2/h3/grpc/masque) `30s` is recommended; for direct connections `0` (immediate) is fine.
+- **Backup dial interval** `backup_dial_interval_sec`: the minimum interval for backup replenishment. Default `15s` (same order of magnitude as the backup heartbeat period).
+- Each is configured independently → "keep separate dial-interval configuration for primary and backup" means exactly this.
+- Implementation: `lastDial[role+proto]` + throttling inside `ConnectionManager`; when the interval has not elapsed, arm a timer and dial when it fires.
 
-### 5.2 建立间隔（EstablishInterval）
+### 5.2 Establish Interval (EstablishInterval)
 
-**含义**：主连接与备用连接**建立（拨号）动作之间的错相间隔**，默认 **100 秒**。
+**Meaning**: the **phase-offset interval between the primary and backup establishment (dial) actions**, default **100 seconds**.
 
-- **目的**：让主备两条连接的「年龄」错开（错相），避免 CDN 因连接年龄相近而在同一时刻杀掉主备两条——这正是 `standbyRoundTripper` 里 `maxAge/2` 错相轮换想解决、但写死 200s 的问题。
-- **用法**：先拨主连接；等待 `establish_interval_sec`（默认 100s）后再拨备用连接。之后每次补位也遵循这个错相，使池内连接的年龄始终不同相。
-- **与拨号间隔的关系**：`EstablishInterval` 约束「主→备」之间的**启动相位**；`DialInterval` 约束「同一角色的重拨节流」。二者正交，可独立配置。
+- **Purpose**: offset (phase-shift) the "age" of the primary and backup connections, preventing the CDN from killing both at the same moment because their connection ages are similar — this is exactly the problem the `maxAge/2` phase-offset rotation in `standbyRoundTripper` tried to solve, but hard-coded at 200s.
+- **Usage**: dial the primary first; wait `establish_interval_sec` (default 100s), then dial the backup. Every subsequent replenishment follows the same phase offset, so the connection ages in the pool always stay out of phase.
+- **Relation to the dial interval**: `EstablishInterval` constrains the **startup phase** between "primary → backup"; `DialInterval` constrains "redial throttling for the same role". The two are orthogonal and independently configurable.
 
-### 5.3 校验与默认值
+### 5.3 Validation and Defaults
 
 ```go
-// 默认值
+// Defaults
 const (
     defaultPrimaryCount    = 1
     defaultBackupCount     = 1
-    defaultEstablishSec    = 100 // 主/备建立间隔默认 100 秒
-    primaryDialDefault     = 30 * time.Second // 主连接重拨节流默认
-    backupDialDefault      = 15 * time.Second // 备用补位节流默认
+    defaultEstablishSec    = 100 // primary/backup establish interval defaults to 100 seconds
+    primaryDialDefault     = 30 * time.Second // primary redial throttle default
+    backupDialDefault      = 15 * time.Second // backup replenishment throttle default
     defaultBackupMissedAck = 3
 )
 
-// backup_count 使用指针区分“未配置”和显式 0：
-// nil → 默认 1；0 → 关闭备用；正数 → 对应备用数量。
-// PrimaryNetworks 由 network 派生，不存在额外的 shard 配置。
+// backup_count uses a pointer to distinguish "unset" from an explicit 0:
+// nil → default 1; 0 → backups disabled; positive → that backup count.
+// PrimaryNetworks is derived from network; there is no extra shard config.
 ```
 
-**主备数量规则（用户需求逐条对应）**：
+**Primary/backup count rules (mapped one-by-one to the user requirements)**:
 
-| 配置 | 默认 | 规则 |
+| Config | Default | Rule |
 |------|------|------|
-| `primary_count` | 1 | 主连接条数；**>1 时启用类型分流**（每条主服务一类业务） |
-| `backup_count` | 1 | 备用连接条数；主阵亡时补足/升级 |
-| `primary_dial_interval_sec` | 0→30s | 主连接断后重拨的最小间隔（节流，防风暴） |
-| `backup_dial_interval_sec` | 0→15s | 备用补位的最小间隔（节流） |
-| `establish_interval_sec` | 100 | 主/备**建立动作之间的错相间隔**；先拨主、等 100s 再拨备 |
+| `primary_count` | 1 | number of primary connections; **type sharding enabled when >1** (each primary serves one business class) |
+| `backup_count` | 1 | number of backup connections; replenished/promoted when a primary dies |
+| `primary_dial_interval_sec` | 0→30s | minimum interval between redials after a primary drops (throttling, anti-storm) |
+| `backup_dial_interval_sec` | 0→15s | minimum interval for backup replenishment (throttling) |
+| `establish_interval_sec` | 100 | the **phase-offset interval between the primary and backup establish actions**; dial the primary first, wait 100s, then dial the backup |
 
-> **主备切换语义**：`primary_count=1` 时退化为「1 主 + 1 备」经典模式。`primary_count=2` 时 `tcp`/`udp` 各一条主（类型分流）；某条主阵亡 → 从备用池挑 `backupAlive` 的备用升级为主 → 再拨一条新备补足 `backup_count`。
-
----
-
-## 6. 模块/文件划分（实施建议）
-
-```
-client.go                 // 入口 runClient：组装 ConnectionPolicy + TransportFactorySet
-                           // 调用 ConnectionManager.Start()，然后按业务类型 Pick() 分发
-connmanager.go   (新增)    // L3 ConnectionManager：主备池 + 分流 + 切换 + 补位
-resumesession.go (重构)    // L2 ResumeSession：从 executeResumableTunnel 提炼
-resumeframe.go            // L2 帧编解码 + 写路径互斥串行化（控制帧优先于 DATA 已落地于 writer 层，无需独立 frameMux 文件）
-ring.go                   // L2 环形缓冲（保留）
-handshake.go              // L2 A/B 握手 + 能力/参数协商（保留，接口化）
-transport.go     (新增)    // L1 TunnelConn / TransportFactory 接口
-transport_h2.go  (新增)    // L1 h2 adapter
-transport_h3.go  (新增)    // L1 h3 adapter
-transport_grpc.go(新增)    // L1 grpc adapter
-transport_masque.go(新增)  // L1 masque-tcp / masque-udp adapter
-transport_wt.go  (新增)    // L1 wt adapter
-backup.go                 // 逻辑迁入 ResumeSession(role=backup) + connmanager 补位；backupLine 退役
-standby.go                // 退役：其「错相轮换」职责由 ConnectionPolicy.EstablishInterval 替代
-```
-
-> **退役声明**：`standbyRoundTripper` 与旧的独立热备入口，被 `ConnectionManager` + `ResumeSession(role)` 统一取代。配置仅保留 `backup_count` 与连接间隔策略。
+> **Primary/backup failover semantics**: with `primary_count=1` this degenerates into the classic "1 primary + 1 backup" mode. With `primary_count=2` there is one primary each for `tcp`/`udp` (type sharding); when a primary dies → pick a `backupAlive` backup from the pool and promote it to primary → dial a new backup to restore `backup_count`.
 
 ---
 
-## 7. 时序图（建立 + 分流 + 切换补位）
+## 6. Module/File Split (implementation suggestion)
 
-### 7.1 启动建立（PrimaryCount=1, BackupCount=1, EstablishInterval=100s）
+```
+client.go                 // entry runClient: assemble ConnectionPolicy + TransportFactorySet
+                           // call ConnectionManager.Start(), then dispatch by business type via Pick()
+connmanager.go   (new)     // L3 ConnectionManager: primary/backup pool + sharding + switchover + replenishment
+resumesession.go (refactor) // L2 ResumeSession: extracted from executeResumableTunnel
+resumeframe.go             // L2 frame codec + write-path mutex serialization (control-priority-over-DATA already landed at the writer layer, no separate frameMux file needed)
+ring.go                    // L2 ring buffer (kept)
+handshake.go               // L2 A/B handshake + capability/parameter negotiation (kept, interfaced)
+transport.go     (new)     // L1 TunnelConn / TransportFactory interfaces
+transport_h2.go  (new)     // L1 h2 adapter
+transport_h3.go  (new)     // L1 h3 adapter
+transport_grpc.go(new)     // L1 grpc adapter
+transport_masque.go(new)   // L1 masque-tcp / masque-udp adapter
+transport_wt.go  (new)     // L1 wt adapter
+backup.go                  // logic migrated into ResumeSession(role=backup) + connmanager replenishment; backupLine retired
+standby.go                 // retired: its "phase-offset rotation" role is replaced by ConnectionPolicy.EstablishInterval
+```
+
+> **Retirement note**: `standbyRoundTripper` and the old standalone standby entry points are uniformly replaced by `ConnectionManager` + `ResumeSession(role)`. Configuration keeps only `backup_count` and the connection-interval policy.
+
+---
+
+## 7. Sequence Diagrams (establish + shard + switchover/replenish)
+
+### 7.1 Startup establishment (PrimaryCount=1, BackupCount=1, EstablishInterval=100s)
 
 ```
 t=0s       Start()
-           ├─ dialOne(primary, tcp) ─► h2 握手 ─► primary["tcp"] = S1 (active)
+           ├─ dialOne(primary, tcp) ─► h2 handshake ─► primary["tcp"] = S1 (active)
            │
-t=100s     （establish_interval 到期）
-           ├─ dialOne(backup, tcp) ─► h2 握手 ─► backups += S2 (backupAlive)
-           │                               └─ S2 后台 KEEPALIVE 保活
+t=100s     (establish_interval elapsed)
+           ├─ dialOne(backup, tcp) ─► h2 handshake ─► backups += S2 (backupAlive)
+           │                               └─ S2 background KEEPALIVE keepalive
            │
-     就绪：primary=tcp(S1), backup=(S2)
+     Ready: primary=tcp(S1), backup=(S2)
 ```
 
-### 7.2 TCP 主连接断 → 备升级 + 补位
+### 7.2 TCP primary drops → backup promoted + replenished
 
 ```
-t1   S1 业务读失败 → OnPrimaryLost(S1)
-     ├─ 挑 backups 里 backupAlive 的 S2 → S2.UpgradeToPrimary()
-     │     primary["tcp"] = S2（秒级接管，resume 续传断点）
+t1   S1 business read fails → OnPrimaryLost(S1)
+     ├─ pick the backupAlive S2 from backups → S2.UpgradeToPrimary()
+     │     primary["tcp"] = S2 (second-level takeover, resume continues from the break point)
      └─ replenish()
-           ├─ 校验 backupDialInterval：t1-上次拨备 >= 15s？是
-           ├─ dialOne(backup, tcp) ─► S3（new, backupAlive）
+           ├─ check backupDialInterval: t1 - last backup dial >= 15s? yes
+           ├─ dialOne(backup, tcp) ─► S3 (new, backupAlive)
            └─ backups = [S3]
-     结束：primary=tcp(S2), backup=(S3)
+     Done: primary=tcp(S2), backup=(S3)
 ```
 
-### 7.3 多主类型分流（PrimaryCount=2, BackupCount=1）
+### 7.3 Multi-primary type sharding (PrimaryCount=2, BackupCount=1)
 
 ```
-t=0s       dialOne(primary, tcp) ─► primary["tcp"] = h2 会话
-t=100s     dialOne(primary, udp) ─► primary["udp"] = masque-udp 会话
+t=0s       dialOne(primary, tcp) ─► primary["tcp"] = h2 session
+t=100s     dialOne(primary, udp) ─► primary["udp"] = masque-udp session
 t=200s     dialOne(backup)      ─► backups += S3
-业务流：
-  SSH  → Pick("tcp") → h2 主
-  DNS  → Pick("udp") → masque-udp 主
-t=300s   h2 主断 → 备 S3 升级为主(role=tcp) → 补一条新备
+Business traffic:
+  SSH  → Pick("tcp") → h2 primary
+  DNS  → Pick("udp") → masque-udp primary
+t=300s   h2 primary drops → backup S3 promoted to primary(role=tcp) → dial a new backup
 ```
 
 ---
 
-## 8. 边界与注意事项
+## 8. Boundaries and Caveats
 
-1. **备用不承载业务**：备用 `ResumeSession` 只走 P1 控制帧（KEEPALIVE），业务侧 `Pick()` 永远只返回 primary；备用不对外暴露 `Read/Write` 业务路径。
-2. **会话续传与连接切换的关系**：主连接断时，resume 的 seq+ring 保证「同 session id」新流可续传。备用升级为「主」后，若备用 session id 与主不同（当前设计备份用 `<主>+b`），需要**决策**：
-   - 方案 A（推荐）：升级时**不换 session id**，备用接管后以原 session id 重建立流，天然续传断点。
-   - 方案 B：备用维持独立 id，接管时业务侧新建会话。放弃断点续传。
-   - 设计默认 **方案 A**：`UpgradeToPrimary` 时把备用连接重拨为原类型的原 session id（若无新断点，几乎零开销）。
-3. **类型分流 ≠ 无限扩容**：PrimaryCount 建议 ≤ 业务类型数（默认 2：tcp+udp）。PrimaryCount=1 时退化为「单主+单备」经典模式，不启用分流。
-4. **默认行为**：不配置连接策略时使用「1 主 + 1 备 + 错相轮换」。
-5. **datagram 会话**（UDP）：备用/UDP 跳过 B 层握手，仅 A 层；仍使用客户端选定的唯一 `transport`。
-6. **配置入口唯一**：主备策略只由 `primary_count` / `backup_count` / 两个拨号间隔 / `establish_interval_sec` 表达，其中 `backup_count=0` 表示关闭备用。
+1. **Backups carry no business**: a backup `ResumeSession` only exchanges P1 control frames (KEEPALIVE); the business-side `Pick()` always returns primaries only; backups do not expose a business `Read/Write` path.
+2. **Session resume vs. connection switchover**: when a primary drops, resume's seq + ring guarantee that a new stream with "the same session id" can continue. After a backup is promoted to "primary", if the backup's session id differs from the primary's (the current design uses `<primary>+b` for backups), a **decision** is needed:
+   - Option A (recommended): **do not change the session id** on promotion — after takeover, the backup re-establishes the stream under the original session id, naturally resuming from the break point.
+   - Option B: the backup keeps its own id; the business side starts a new session at takeover. Break-point resume is given up.
+   - The design defaults to **Option A**: on `UpgradeToPrimary`, redial the backup connection as the original type with the original session id (near-zero overhead when there is no new break point).
+3. **Type sharding ≠ unlimited scaling**: PrimaryCount is recommended to be ≤ the number of business types (default 2: tcp+udp). With PrimaryCount=1 it degenerates into the classic "single primary + single backup" mode, with no sharding.
+4. **Default behavior**: when no connection policy is configured, use "1 primary + 1 backup + phase-offset rotation".
+5. **Datagram sessions** (UDP): backups/UDP skip the B-layer handshake, A layer only; still use the single client-selected `transport`.
+6. **Single configuration entry**: the primary/backup policy is expressed only via `primary_count` / `backup_count` / the two dial intervals / `establish_interval_sec`, where `backup_count=0` disables backups.
 
 ---
 
-## 9. 验收建议（测试清单）
+## 9. Acceptance Suggestions (test checklist)
 
-> 对应可运行测试文件：`connmanager_test.go`（基于真实 echo target + 隧道服务端，`go test -run ConnManager ./...`）。**已全部实现并通过。**
+> Corresponding runnable test file: `connmanager_test.go` (built on a real echo target + tunnel server, `go test -run ConnManager ./...`). **All implemented and passing.**
 
-| 编号 | 实现测试 | 用例 | 断言 |
+| ID | Implemented test | Case | Assertions |
 |------|----------|------|------|
-| T1 | `TestConnManagerEstablishInterval` | PrimaryCount=1, BackupCount=1，建立间隔 | 启动即拨主；establish_interval 错相后才拨备；备不承载业务 |
-| T2 | `TestConnManagerSwitchoverReplenish` | 主断，备 alive | 备升级为主（原 id 续传）；自动补一条新备 |
-| T3 | `TestConnManagerAuthFailureNoTakeover` | 主断，备未 alive / 鉴权失败 | 不接管；按 primaryDialInterval 补主；备按 backupDialInterval 补备 |
-| T4 | `TestConnManagerTypeSharding` | PrimaryCount=2 | tcp/udp 各一条主，类型分流各走各的 |
-| T5 | `TestConnManagerDialIntervalThrottle` | 连续断主 | 拨号间隔节流生效，不风暴重拨 |
-| T6 | `TestConnManagerBackupKeepaliveFailure` | 备用连续 KEEPALIVE 丢 ACK | 判失效，移出池，触发补位 |
-| T7 | `TestConnManagerEstablishInterval` | establish_interval 配置生效 | 主备建立时间差 ≈ 配置值 |
-| T8 | `handshake_frame_test`（帧编解码） | resume v2 帧编解码 | DATA/END/ERROR/HANDSHAKE/HANDSHAKE-ACK/KEEPALIVE/KEEPALIVE-ACK 编解码往返 + 版本/类型校验正确（控制帧优先由 writer 互斥锁串行化保证，见 §2.3） |
-| T9 | `TestConnManagerTransportResumeMatrix` | 传输×resume 矩阵 | h2/grpc/masque-tcp/wt/h3 TCP + h2-udp/masque-udp 各在 resume/2 之上全双工回显通过 |
-| T10 | `TestConnManagerVersionUnsupported` / `TestConnManagerAuthFailureNoTakeover` | 异常处理 | 握手超时 / 鉴权失败 / 版本不匹配 → 优雅拒绝，备用不接管 |
-| T11 | `TestConnectionPolicyDefaults` / `TestConnectionPolicyBoundary` | 边界 | primary_count=0 回退默认；backup_count=0 关闭备用；程序化调用会安全归一；外部配置超出已启用网络数时直接拒绝 |
+| T1 | `TestConnManagerEstablishInterval` | PrimaryCount=1, BackupCount=1, establish interval | primary dialed at startup; backup dialed only after the establish_interval phase offset; backups carry no business |
+| T2 | `TestConnManagerSwitchoverReplenish` | primary drops, backup alive | backup promoted to primary (resumes under the original id); one new backup dialed automatically |
+| T3 | `TestConnManagerAuthFailureNoTakeover` | primary drops, backup not alive / auth failure | no takeover; replenish the primary per primaryDialInterval; replenish the backup per backupDialInterval |
+| T4 | `TestConnManagerTypeSharding` | PrimaryCount=2 | one primary each for tcp/udp, type sharding routes each class on its own |
+| T5 | `TestConnManagerDialIntervalThrottle` | repeated primary failures | dial-interval throttling in effect, no redial storm |
+| T6 | `TestConnManagerBackupKeepaliveFailure` | backup loses consecutive KEEPALIVE ACKs | judged dead, removed from the pool, replenishment triggered |
+| T7 | `TestConnManagerEstablishInterval` | establish_interval takes effect | time gap between primary and backup establishment ≈ configured value |
+| T8 | `handshake_frame_test` (frame codec) | resume v2 frame encode/decode | DATA/END/ERROR/HANDSHAKE/HANDSHAKE-ACK/KEEPALIVE/KEEPALIVE-ACK encode/decode round-trip + version/type validation correct (control-frame priority is guaranteed by writer-mutex serialization, see §2.3) |
+| T9 | `TestConnManagerTransportResumeMatrix` | transport × resume matrix | h2/grpc/masque-tcp/wt/h3 TCP + h2-udp/masque-udp each pass full-duplex echo on top of resume/2 |
+| T10 | `TestConnManagerVersionUnsupported` / `TestConnManagerAuthFailureNoTakeover` | error handling | handshake timeout / auth failure / version mismatch → graceful rejection, backups do not take over |
+| T11 | `TestConnectionPolicyDefaults` / `TestConnectionPolicyBoundary` | boundaries | primary_count=0 falls back to the default; backup_count=0 disables backups; programmatic calls are safely normalized; external configuration exceeding the number of enabled networks is rejected outright |
 
 ---
 
-*本文档为架构设计稿；确认后按 `docs/resume-handshake-protocol.md` §6 的里程碑节奏分阶段实施（L1 → L2 重构 → L3 → 配置迁移 → 回归）。*
+*This document is an architecture design draft; once confirmed, implement in phases following the milestone cadence in `docs/resume-handshake-protocol.md` §6 (L1 → L2 refactor → L3 → config migration → regression).*
