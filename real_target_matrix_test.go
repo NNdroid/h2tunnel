@@ -288,6 +288,14 @@ func newProtocolClient(t testing.TB, env *protocolEnv, transport h2tunnel.Transp
 }
 
 func newProtocolClientWithPadding(t testing.TB, env *protocolEnv, transport h2tunnel.Transport, padding h2tunnel.PaddingTuning) *h2tunnel.Client {
+	return newProtocolClientWithPaddingALPN(t, env, transport, padding, "")
+}
+
+// newProtocolClientWithPaddingALPN is like newProtocolClientWithPadding but lets
+// callers pin the MASQUE carrier (""=auto, "h2", "h3") so benchmarks can measure
+// each MASQUE leg (over-h2 extended CONNECT vs over-h3 QUIC) independently
+// instead of only whatever the auto selector lands on for the environment.
+func newProtocolClientWithPaddingALPN(t testing.TB, env *protocolEnv, transport h2tunnel.Transport, padding h2tunnel.PaddingTuning, masqueALPN string) *h2tunnel.Client {
 	t.Helper()
 	var credentials h2tunnel.CredentialProvider
 	credentials, err := h2tunnel.NewTokenCredentials(protocolMatrixToken)
@@ -306,7 +314,7 @@ func newProtocolClientWithPadding(t testing.TB, env *protocolEnv, transport h2tu
 		Transport:   transport,
 		TLSConfig:   tlsConfig,
 		Credentials: credentials,
-		Tuning:      h2tunnel.ClientTuning{Padding: padding},
+		Tuning:      h2tunnel.ClientTuning{Padding: padding, MasqueALPN: masqueALPN},
 	})
 	if err != nil {
 		t.Fatal(err)

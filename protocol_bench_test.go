@@ -57,31 +57,46 @@ func benchmarkProtocolThroughput(b *testing.B, padding h2tunnel.PaddingTuning) {
 		name      string
 		transport h2tunnel.Transport
 		udp       bool
+		alpn      string // MASQUE carrier pin: ""=auto (h3-first, pin h2 on failure), "h2", "h3"
 	}{
-		{"H2_TCP", h2tunnel.TransportH2, false},
-		{"H2_UDP", h2tunnel.TransportH2, true},
-		{"H2C_TCP", h2tunnel.TransportH2C, false},
-		{"H2C_UDP", h2tunnel.TransportH2C, true},
-		{"gRPC_TCP", h2tunnel.TransportGRPC, false},
-		{"gRPC_UDP", h2tunnel.TransportGRPC, true},
-		{"H3_TCP", h2tunnel.TransportH3, false},
-		{"H3_UDP", h2tunnel.TransportH3, true},
-		{"WT_TCP", h2tunnel.TransportWebTransport, false},
-		{"WT_UDP", h2tunnel.TransportWebTransport, true},
-		{"MASQUE_TCP", h2tunnel.TransportMASQUE, false},
-		{"MASQUE_UDP", h2tunnel.TransportMASQUE, true},
+		{"H2_TCP", h2tunnel.TransportH2, false, ""},
+		{"H2_UDP", h2tunnel.TransportH2, true, ""},
+		{"H2C_TCP", h2tunnel.TransportH2C, false, ""},
+		{"H2C_UDP", h2tunnel.TransportH2C, true, ""},
+		{"gRPC_TCP", h2tunnel.TransportGRPC, false, ""},
+		{"gRPC_UDP", h2tunnel.TransportGRPC, true, ""},
+		{"H3_TCP", h2tunnel.TransportH3, false, ""},
+		{"H3_UDP", h2tunnel.TransportH3, true, ""},
+		{"WT_TCP", h2tunnel.TransportWebTransport, false, ""},
+		{"WT_UDP", h2tunnel.TransportWebTransport, true, ""},
+		// MASQUE: keep the auto case (backward-compat with historical numbers
+		// and the profile job) plus explicit per-carrier legs so each is
+		// measured deterministically instead of only whichever carrier the auto
+		// selector lands on for the CI runner's UDP reachability.
+		{"MASQUE_TCP", h2tunnel.TransportMASQUE, false, ""},
+		{"MASQUE_UDP", h2tunnel.TransportMASQUE, true, ""},
+		{"MASQUE_H2_TCP", h2tunnel.TransportMASQUE, false, "h2"},
+		{"MASQUE_H2_UDP", h2tunnel.TransportMASQUE, true, "h2"},
+		{"MASQUE_H3_TCP", h2tunnel.TransportMASQUE, false, "h3"},
+		{"MASQUE_H3_UDP", h2tunnel.TransportMASQUE, true, "h3"},
 	}
 
 	for _, c := range cases {
 		c := c
 		b.Run(c.name, func(b *testing.B) {
-			client := newProtocolClientWithPadding(b, env, c.transport, padding)
+			client := newProtocolClientWithPaddingALPN(b, env, c.transport, padding, c.alpn)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
 
 			if !c.udp {
 				conn, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "bench-tcp")
 				if err != nil {
+					// Pinned MASQUE carrier (h2/h3) may be unavailable in a given
+					// environment (e.g. UDP-blocked CI for h3); skip rather than
+					// fail so the rest of the matrix still runs.
+					if c.alpn != "" {
+						b.Skipf("masque carrier %q unavailable in this environment: %v", c.alpn, err)
+					}
 					b.Fatal(err)
 				}
 				defer conn.Close()
@@ -108,6 +123,9 @@ func benchmarkProtocolThroughput(b *testing.B, padding h2tunnel.PaddingTuning) {
 
 			packetConn, err := client.DialPacketContext(ctx, h2tunnel.NetworkUDP, "bench-udp")
 			if err != nil {
+				if c.alpn != "" {
+					b.Skipf("masque carrier %q unavailable in this environment: %v", c.alpn, err)
+				}
 				b.Fatal(err)
 			}
 			defer packetConn.Close()
