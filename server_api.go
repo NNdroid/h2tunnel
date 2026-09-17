@@ -83,15 +83,17 @@ func NewServer(options ServerOptions) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cfg := serverConfig{
-		Path:               normalizeTunnelPath(options.Path),
-		Transport:          transportList,
-		Network:            networkList,
-		SessionWindow:      windowKB,
-		SessionIdleTimeout: options.Tuning.SessionIdleTimeout,
-		Padding:            padding,
-		Authenticator:      options.Authenticator,
-		TargetDialer:       options.Dialer,
-		ServerContext:      ctx,
+		Path:                   normalizeTunnelPath(options.Path),
+		Transport:              transportList,
+		Network:                networkList,
+		SessionWindow:          windowKB,
+		SessionIdleTimeout:     options.Tuning.SessionIdleTimeout,
+		SessionMax:             options.Tuning.SessionMax,
+		SessionMaxPerPrincipal: options.Tuning.SessionMaxPerPrincipal,
+		Padding:                padding,
+		Authenticator:          options.Authenticator,
+		TargetDialer:           options.Dialer,
+		ServerContext:          ctx,
 	}
 	if options.TLSConfig != nil {
 		cfg.TLSConfig = options.TLSConfig.Clone()
@@ -124,11 +126,14 @@ func NewServer(options ServerOptions) (*Server, error) {
 		httpConns:  make(map[net.Conn]struct{}),
 	}
 	s.sessions = &sessionTable{
-		events:      &s.events,
-		sessions:    make(map[string]*tunnelSession),
-		logger:      s.log,
-		idleTimeout: cfg.SessionIdleTimeout,
-		padding:     cfg.Padding,
+		events:          &s.events,
+		sessions:        make(map[string]*tunnelSession),
+		perPrincipal:    make(map[string]int),
+		logger:          s.log,
+		idleTimeout:     cfg.SessionIdleTimeout,
+		maxSessions:     resolveSessionMax(cfg.SessionMax),
+		maxPerPrincipal: resolveSessionMaxPerPrincipal(cfg.SessionMaxPerPrincipal),
+		padding:         cfg.Padding,
 	}
 	if s.sessions.idleTimeout <= 0 {
 		s.sessions.idleTimeout = sessionIdleTimeout

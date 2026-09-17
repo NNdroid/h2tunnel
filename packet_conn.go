@@ -25,7 +25,7 @@ type virtualPacketConn struct {
 
 	ctx      context.Context
 	cancel   context.CancelFunc
-	incoming chan []byte
+	incoming chan udpData
 	done     chan struct{}
 
 	// Tunnel data-plane ingress, injected per transport by DialPacketContext:
@@ -54,19 +54,27 @@ func newVirtualPacketConn(target string, cancel context.CancelFunc) *virtualPack
 		remote:       tunnelAddr{network: networkUDP, value: target},
 		ctx:          ctx,
 		cancel:       func() { localCancel(); cancel() },
-		incoming:     make(chan []byte, 256),
+		incoming:     make(chan udpData, 256),
 		done:         make(chan struct{}),
 		readChanged:  make(chan struct{}),
 		writeChanged: make(chan struct{}),
 	}
 }
 
+// deliver hands an inbound UDP packet to the reader (ReadFrom) using a pooled
+// buffer so the hot inbound path stays allocation-free. ReadFrom returns the
+// buffer to udpBufPool once it has copied the bytes into the application's
+// buffer, so there is no per-packet heap allocation on the receive path.
 func (c *virtualPacketConn) deliver(packet []byte) error {
-	copyOfPacket := append([]byte(nil), packet...)
+	bufPtr := udpBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	n := copy(buf, packet)
+	d := udpData{BufPtr: bufPtr, Data: buf[:n]}
 	select {
 	case <-c.done:
+		udpBufPool.Put(bufPtr)
 		return net.ErrClosed
-	case c.incoming <- copyOfPacket:
+	case c.incoming <- d:
 		return nil
 	}
 }
@@ -88,9 +96,12 @@ func (c *virtualPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		case <-c.done:
 			stopTimer(timer)
 			return 0, nil, c.endError()
-		case packet := <-c.incoming:
+		case d := <-c.incoming:
 			stopTimer(timer)
-			n := copy(p, packet)
+			n := copy(p, d.Data)
+			if d.BufPtr != nil {
+				udpBufPool.Put(d.BufPtr)
+			}
 			return n, c.remote, nil
 		case <-changed:
 			stopTimer(timer)

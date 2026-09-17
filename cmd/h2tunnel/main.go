@@ -337,6 +337,9 @@ func runUDPForwarder(ctx context.Context, listener net.PacketConn, client *h2tun
 					current.conn = remote
 					close(current.ready)
 					defer remote.Close()
+					// Wake the blocking Read on process shutdown so this per-session
+					// goroutine exits instead of leaking until the peer closes.
+					go func() { <-ctx.Done(); _ = remote.Close() }()
 					downlink := make([]byte, 64*1024)
 					for {
 						n, err := remote.Read(downlink)

@@ -233,6 +233,7 @@ func (b *backupLine) doHandshake() bool {
 	if reqErr != nil {
 		b.setError(reqErr)
 		lgWarnf(b.cfg.lg(), "[Backup:%s] ❌ failed to build backup credentials: %v", b.backupID, reqErr)
+		pw.Close()
 		return false
 	}
 
@@ -247,18 +248,21 @@ func (b *backupLine) doHandshake() bool {
 	if err != nil {
 		b.setError(err)
 		lgWarnf(b.cfg.lg(), "[Backup:%s] ❌ backup handshake stream setup failed: %v", b.backupID, err)
+		pw.Close()
 		return false
 	}
 	if resp.StatusCode != http.StatusOK {
 		b.setError(newTunnelHTTPError(resp.StatusCode))
 		lgWarnf(b.cfg.lg(), "[Backup:%s] ❌ backup handshake rejected: HTTP %d", b.backupID, resp.StatusCode)
 		resp.Body.Close()
+		pw.Close()
 		return false
 	}
 	if resp.Header.Get("X-Resume-Ack") != "ok" {
 		b.setError(errors.New("h2tunnel: transport readiness handshake was not acknowledged"))
 		lgWarnf(b.cfg.lg(), "[Backup:%s] ❌ backup handshake not confirmed: %s", b.backupID, resp.Header.Get("X-Resume-Error"))
 		resp.Body.Close()
+		pw.Close()
 		return false
 	}
 

@@ -356,6 +356,9 @@ func (m *connectionManager) dialPrimaryLocked(typ string) {
 	if bl == nil {
 		return
 	}
+	if old, ok := m.primaries[typ]; ok && old != bl {
+		old.close() // defensive: a prior primary is being replaced; never happens on the first dial
+	}
 	m.primaries[typ] = bl
 	m.lastDial[key] = time.Now()
 }
@@ -433,11 +436,16 @@ func (m *connectionManager) monitor() {
 // reconcile does one pass reconciling primary/backup counts and states.
 func (m *connectionManager) reconcile() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return
 	}
 	now := time.Now()
+	// Lanes to close are collected under m.mu but closed only AFTER releasing it:
+	// bl.close() cancels the keepalive stream context and tears down the transport,
+	// which must not block every other operation (WaitClient, FailPrimary, …) that
+	// needs m.mu.
+	var toClose []*backupLine
 
 	// 1. primary dead/missing -> promote a backup / dial a new primary
 	for _, typ := range m.primaryKinds {
@@ -447,7 +455,7 @@ func (m *connectionManager) reconcile() {
 			continue
 		}
 		if cur != nil {
-			cur.close()
+			toClose = append(toClose, cur)
 		}
 		// try promoting a live backup to primary
 		if idx := m.indexOfAliveBackup(); idx >= 0 {
@@ -472,7 +480,7 @@ func (m *connectionManager) reconcile() {
 	for _, bl := range m.backups {
 		st := bl.State()
 		if st == backupFailed || st == backupIdle || bl.IsClosed() {
-			bl.close()
+			toClose = append(toClose, bl)
 			continue
 		}
 		kept = append(kept, bl)
@@ -492,6 +500,10 @@ func (m *connectionManager) reconcile() {
 				}
 			}
 		}
+	}
+	m.mu.Unlock()
+	for _, bl := range toClose {
+		bl.close()
 	}
 }
 
@@ -544,11 +556,17 @@ func (m *connectionManager) PrimaryState(typ string) backupLineState {
 // It closes that primary immediately, prompting the monitor's promote + refill.
 func (m *connectionManager) FailPrimary(typ string) {
 	m.mu.Lock()
-	if bl, ok := m.primaries[typ]; ok {
-		bl.close()
+	var bl *backupLine
+	if b, ok := m.primaries[typ]; ok {
+		bl = b
 		delete(m.primaries, typ)
 	}
 	m.mu.Unlock()
+	// Close outside m.mu: bl.close() cancels the keepalive stream and tears down
+	// the transport, which must not serialize with other m.mu holders.
+	if bl != nil {
+		bl.close()
+	}
 }
 
 // Close stops the connection manager and closes all lanes.
@@ -559,14 +577,20 @@ func (m *connectionManager) Close() {
 		return
 	}
 	m.closed = true
+	// Collect all lanes under the lock, but close them only after releasing it:
+	// bl.close() cancels the keepalive stream context and tears down the transport.
+	var toClose []*backupLine
 	for _, bl := range m.primaries {
-		bl.close()
+		toClose = append(toClose, bl)
 	}
 	for _, bl := range m.backups {
-		bl.close()
+		toClose = append(toClose, bl)
 	}
 	m.primaries = nil
 	m.backups = nil
 	m.mu.Unlock()
 	close(m.closeCh)
+	for _, bl := range toClose {
+		bl.close()
+	}
 }

@@ -413,7 +413,15 @@ func (c *Client) DialContext(ctx context.Context, network, target string) (net.C
 		return nil, err
 	}
 	if !c.cfg.usesWT() {
-		if _, err := c.mgr.WaitClient(ctx, networkTCP); err != nil {
+		// c.mgr is written under c.mu by the Start goroutine (and cleared on
+		// failure/close), so read it under the lock to avoid a data race.
+		c.mu.Lock()
+		mgr := c.mgr
+		c.mu.Unlock()
+		if mgr == nil {
+			return nil, net.ErrClosed
+		}
+		if _, err := mgr.WaitClient(ctx, networkTCP); err != nil {
 			return nil, err
 		}
 	}
@@ -538,7 +546,15 @@ func (c *Client) DialPacketContext(ctx context.Context, network, target string) 
 		return packet, nil
 	}
 
-	httpClient, err := c.mgr.WaitClient(ctx, networkUDP)
+	// c.mgr is written under c.mu by the Start goroutine; read it under the lock.
+	c.mu.Lock()
+	mgr := c.mgr
+	c.mu.Unlock()
+	if mgr == nil {
+		_ = packet.Close()
+		return nil, net.ErrClosed
+	}
+	httpClient, err := mgr.WaitClient(ctx, networkUDP)
 	if err != nil {
 		_ = packet.Close()
 		return nil, err

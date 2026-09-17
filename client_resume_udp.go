@@ -214,6 +214,9 @@ func (s *udpSession) runOneStream() error {
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(s.context())
 	defer cancel()
+	// The uplink goroutine also closes pw (idempotent); this defensive close releases
+	// the pipe writer on every early-return path.
+	defer pw.Close()
 
 	// RedialBudget bounds only the stream-open phase; the timer stops at ready, so
 	// established streams are unaffected (matching the TCP/WT side).
@@ -371,8 +374,9 @@ func buildResumeUDPRequestChecked(ctx context.Context, body io.Reader, sessID, r
 	if cfg.usesMasque() {
 		req.Header.Set("Protocol", protocolConnectUDP)
 		req.Header.Set("Capsule-Protocol", "?1")
-		// http3.Transport needs an explicit HTTP/3 declaration, or the CONNECT target path may be rewritten to empty
-		req.Proto = "HTTP/3"
+		// same as the TCP leg: quic-go reads req.Proto as the extended-CONNECT
+		// :protocol value, so it must be the upgrade token, not "HTTP/3".
+		req.Proto = protocolConnectUDP
 	}
 	if cfg.usesGRPC() {
 		req.Header.Set("Content-Type", "application/grpc")

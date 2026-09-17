@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-var buildVersion = "1.1.0"
+var buildVersion = "v1.0.0-dev"
 
 // Version returns the build version embedded by the release workflow.
 func Version() string { return buildVersion }
@@ -72,6 +72,12 @@ func lgErrorf(l *slog.Logger, format string, args ...any) {
 
 func logfAt(l *slog.Logger, level slog.Level, format string, args ...any) {
 	if l == nil {
+		return
+	}
+	// Skip the allocation + format work entirely when this level is disabled.
+	// The data-plane log calls fire on every record/frame, so an unconditional
+	// fmt.Sprintf on a disabled level is a measurable hot-path cost.
+	if !l.Enabled(context.Background(), level) {
 		return
 	}
 	l.Log(context.Background(), level, fmt.Sprintf(format, args...))
@@ -130,6 +136,11 @@ type fileConfig struct {
 	// EstablishIntervalSec is the primary/backup establish interval (s); default
 	// 100s. Primary dials first; the backup dials out of phase afterward.
 	EstablishIntervalSec int `json:"establish_interval_sec"`
+	// SessionMax is the global cap on concurrent resume sessions; default 4096.
+	SessionMax int `json:"session_max"`
+	// SessionMaxPerPrincipal is the per-principal cap on concurrent resume
+	// sessions; default 256.
+	SessionMaxPerPrincipal int `json:"session_max_per_principal"`
 }
 
 // applyEnvOverrides overrides fileConfig fields with H2TUNNEL_* environment variables.
@@ -206,6 +217,8 @@ func applyEnvOverrides(cfg *fileConfig) error {
 		{"H2TUNNEL_PRIMARY_DIAL_INTERVAL_SEC", &cfg.PrimaryDialIntervalSec},
 		{"H2TUNNEL_BACKUP_DIAL_INTERVAL_SEC", &cfg.BackupDialIntervalSec},
 		{"H2TUNNEL_ESTABLISH_INTERVAL_SEC", &cfg.EstablishIntervalSec},
+		{"H2TUNNEL_SESSION_MAX", &cfg.SessionMax},
+		{"H2TUNNEL_SESSION_MAX_PER_PRINCIPAL", &cfg.SessionMaxPerPrincipal},
 	} {
 		if err := setInt(field.key, field.dst); err != nil {
 			return err
@@ -362,6 +375,10 @@ type serverConfig struct {
 	TLSConfig          *tls.Config      `json:"-"`
 	ServerContext      context.Context  `json:"-"`
 	SessionIdleTimeout time.Duration    `json:"-"`
+	// SessionMax / SessionMaxPerPrincipal are the resolved global / per-principal
+	// session caps (0 from config means "use default", resolved in server_api.go).
+	SessionMax             int `json:"-"`
+	SessionMaxPerPrincipal int `json:"-"`
 
 	// routingPolicy is compiled at startup so the request hot path does only
 	// allocation-free bitmask checks.
@@ -489,6 +506,35 @@ func resolveSessionWindow(kb int) int {
 	return kb
 }
 
+// Session-table caps: bounds memory / per-principal resource use under a flood
+// of distinct (never-resumed) session IDs. 0 or an invalid value → default;
+// values above the hard cap are clamped.
+const (
+	sessionMaxDefault             = 4096
+	sessionMaxPerPrincipalDefault = 256
+	sessionMaxHardCap             = 1_000_000
+)
+
+func resolveSessionMax(n int) int {
+	if n <= 0 {
+		return sessionMaxDefault
+	}
+	if n > sessionMaxHardCap {
+		return sessionMaxHardCap
+	}
+	return n
+}
+
+func resolveSessionMaxPerPrincipal(n int) int {
+	if n <= 0 {
+		return sessionMaxPerPrincipalDefault
+	}
+	if n > sessionMaxHardCap {
+		return sessionMaxHardCap
+	}
+	return n
+}
+
 // resolveKeepaliveSec returns the session/backup KEEPALIVE interval (s); 0 or
 // invalid → default 15s.
 func resolveKeepaliveSec(sec int) int {
@@ -532,18 +578,20 @@ func buildServerConfigChecked(cfg *fileConfig) (serverConfig, error) {
 	}
 
 	return serverConfig{
-		ListenAddr:    listen,
-		TLSCert:       cfg.Cert,
-		TLSKey:        cfg.Key,
-		EnableTLS:     cfg.TLS,
-		Path:          path,
-		LocalOnly:     cfg.LocalOnly,
-		LogLevel:      logLevel,
-		Transport:     transport,
-		Network:       netMode,
-		DrainTimeout:  resolveDrainTimeout(cfg.DrainTimeoutSec),
-		SessionWindow: resolveSessionWindow(cfg.SessionWindowKB),
-		Padding:       padding,
+		ListenAddr:             listen,
+		TLSCert:                cfg.Cert,
+		TLSKey:                 cfg.Key,
+		EnableTLS:              cfg.TLS,
+		Path:                   path,
+		LocalOnly:              cfg.LocalOnly,
+		LogLevel:               logLevel,
+		Transport:              transport,
+		Network:                netMode,
+		DrainTimeout:           resolveDrainTimeout(cfg.DrainTimeoutSec),
+		SessionWindow:          resolveSessionWindow(cfg.SessionWindowKB),
+		Padding:                padding,
+		SessionMax:             resolveSessionMax(cfg.SessionMax),
+		SessionMaxPerPrincipal: resolveSessionMaxPerPrincipal(cfg.SessionMaxPerPrincipal),
 	}, nil
 }
 

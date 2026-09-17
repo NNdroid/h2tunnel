@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -78,11 +78,16 @@ func init() {
 // fastRand returns a non-cryptographic random int in [0, max). It is used only
 // for traffic-obfuscation padding (never for secrets/nonces), so a fast PRNG is
 // both safe and dramatically cheaper than crypto/rand per call.
+//
+// It uses math/rand/v2's top-level functions, which draw from a lock-free
+// runtime source (unlike math/rand/v1's global locked source). This matters on
+// the padding hot path: fillPadding is called once per frame, so a locked
+// global PRNG would serialize every concurrently active tunnel's framing.
 func fastRand(max int) int {
 	if max <= 1 {
 		return 0
 	}
-	return mrand.Intn(max)
+	return mrand.IntN(max)
 }
 
 // normalizeTargetAddr normalizes a target address (supports IP:Port and

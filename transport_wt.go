@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -220,9 +221,9 @@ func executeResumeWTWithManagerContext(ctx context.Context, localConn net.Conn, 
 			return nil // normal end (EOF / peer END)
 		}
 		if err != nil {
-			// AutoRedial semantics match the TCP side: when on, even
-			// "permanent" errors keep redialing.
-			if (!cfg.AutoRedial && isPermanentTunnelError(err)) || ctx.Err() != nil {
+			// Fail-fast on fatal (never-recoverable) errors regardless of
+			// AutoRedial (bad token / policy / protocol version mismatch).
+			if ctx.Err() != nil || isFatalTunnelError(err) || (!cfg.AutoRedial && isPermanentTunnelError(err)) {
 				notifyReady(err)
 				return err
 			}
@@ -234,6 +235,8 @@ func executeResumeWTWithManagerContext(ctx context.Context, localConn net.Conn, 
 		if delay > resumeBackoffMax {
 			delay = resumeBackoffMax
 		}
+		// Up to +100% jitter to desynchronize a reconnecting fleet (avoid avalanche).
+		delay += time.Duration(rand.Int64N(int64(delay)))
 		lgInfof(cfg.lg(), "[Resume/WT] 🔁 WT stream reopen #%d (resuming same session), waiting %v", attempt, delay)
 		select {
 		case <-ctx.Done():
@@ -493,6 +496,7 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 		// Each WT stream is an independent resume data plane, resumed with the
 		// same X-Session-ID.
 		go func(s *webtransport.Stream, sID string) {
+			defer s.Close()
 			// Backup (probe) line: no target dial, no business session, only
 			// the A+B handshake + KEEPALIVE.
 			if isBackup {
@@ -795,6 +799,8 @@ func backoffWTUDP(ctx context.Context, cfg clientConfig, done <-chan struct{}, a
 	if delay > resumeBackoffMax {
 		delay = resumeBackoffMax
 	}
+	// Up to +100% jitter to desynchronize a reconnecting fleet (avoid avalanche).
+	delay += time.Duration(rand.Int64N(int64(delay)))
 	lgInfof(cfg.lg(), "[WT-UDP:%s] 🔁 stream died, reopen #%d (server UDP socket retained), waiting %v", cfg.TargetAddr, attempt, delay)
 	select {
 	case <-done:

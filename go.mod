@@ -1,6 +1,13 @@
 module github.com/NNdroid/h2tunnel
 
-go 1.27
+// NOTE: keep the language version at 1.26 — do NOT bump to 1.27+ yet.
+// The //go:build go1.27 release tag on x/net's "wrapping" http2
+// implementation (which delegates to net/http and rejects the RFC 8441
+// ":protocol" pseudo-header at its front-door validation) is gated by this
+// directive; staying at 1.26 keeps x/net's original http2 implementation,
+// which is required for the MASQUE-over-h2 (extended CONNECT) carrier.
+// See transport_masque_client.go for details.
+go 1.26.0
 
 require (
 	github.com/quic-go/quic-go v0.62.0

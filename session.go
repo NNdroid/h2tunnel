@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,16 +57,30 @@ const (
 type tunnelSession struct {
 	id        string
 	createdAt time.Time
-	lastSeen  time.Time // last activity (for timeout reaping)
-	datagram  bool      // true = UDP datagram mode (no seq replay)
-	network   string    // "tcp" / "udp" (shown in events and logs)
-	events    *serverEventSink
-	logger    *slog.Logger // instance logger (from Server options, nil → discard)
-	binding   sessionBinding
+	// lastSeen is the last-activity timestamp (unix nano) used by the idle reaper.
+	// Stored atomically so the per-packet hot paths (downlinkPump, acceptUplinkSeq)
+	// can update it without taking s.mu, and so the reaper can read it lock-free.
+	// The previous design wrote a time.Time under s.mu: that both contended on
+	// every packet and was a data race (reapIdle read it under t.mu, a different
+	// lock than touch()'s s.mu).
+	lastSeen atomic.Int64
+	datagram bool   // true = UDP datagram mode (no seq replay)
+	network  string // "tcp" / "udp" (shown in events and logs)
+	events   *serverEventSink
+	logger   *slog.Logger // instance logger (from Server options, nil → discard)
+	binding  sessionBinding
 
 	mu              sync.Mutex
 	targetConn      net.Conn
 	targetCloseOnce sync.Once
+	// writeMu serializes writes to targetConn so concurrent uplink frames don't
+	// interleave bytes on the target stream. It is taken WITHOUT s.mu held: the
+	// seq bookkeeping in acceptUplinkSeq happens under s.mu (fast, no I/O), then
+	// the actual (potentially blocking) targetConn.Write happens only under
+	// writeMu. This keeps a slow/blocked target write from stalling the session's
+	// control plane (downlink pump, reaper, close) which would otherwise wait on
+	// s.mu.
+	writeMu sync.Mutex
 
 	// downlink: server targetConn → HTTP stream / ring buffer
 	downlinkSent uint64 // bytes written to the client, cumulative
@@ -279,19 +294,20 @@ func (s *tunnelSession) attachAndReplay(writer *resumeSessionWriter, fromSeq uin
 // with no seq check.
 func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return net.ErrClosed
 	}
 	if s.targetConn == nil {
+		s.mu.Unlock()
 		return net.ErrClosed
 	}
 	if s.datagram {
-		if _, err := s.targetConn.Write(data); err != nil {
-			return err
-		}
-		s.lastSeen = time.Now()
-		return nil
+		// No ordering in datagram mode: validate liveness, then write under
+		// writeMu (released s.mu first so the socket write can't stall s.mu).
+		s.lastSeen.Store(time.Now().UnixNano())
+		s.mu.Unlock()
+		return s.writeTarget(data)
 	}
 	expected := s.uplinkRecv
 	switch {
@@ -300,31 +316,54 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 		// trim the duplicated head as expected.
 		skip := int(expected - seq)
 		if skip >= len(data) {
-			s.lastSeen = time.Now()
+			s.lastSeen.Store(time.Now().UnixNano())
+			s.mu.Unlock()
 			return nil
 		}
 		data = data[skip:]
 	case seq > expected:
 		// The client skipped seq: the gap is unrecoverable.
+		s.mu.Unlock()
 		return errResumeBadSeq
+	}
+	s.uplinkRecv += uint64(len(data))
+	s.lastSeen.Store(time.Now().UnixNano())
+	s.mu.Unlock()
+	return s.writeTarget(data)
+}
+
+// writeTarget serializes the (potentially blocking) targetConn.Write without
+// holding s.mu, so a congested upstream cannot stall the session's control plane
+// (downlink pump / reaper / close all serialize on s.mu). writeMu is taken so
+// concurrent uplink frames don't interleave bytes on the target stream.
+func (s *tunnelSession) writeTarget(data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return net.ErrClosed
 	}
 	if _, err := s.targetConn.Write(data); err != nil {
 		return err
 	}
-	s.uplinkRecv += uint64(len(data))
-	s.lastSeen = time.Now()
+	s.lastSeen.Store(time.Now().UnixNano())
 	return nil
 }
 
 // sessionTable is the server-side session table (instance-level, owned by a
 // Server; embedded libraries do not share tables across Servers).
 type sessionTable struct {
-	events      *serverEventSink
-	logger      *slog.Logger
-	padding     paddingPolicy
-	mu          sync.Mutex
-	sessions    map[string]*tunnelSession
-	idleTimeout time.Duration
+	events          *serverEventSink
+	logger          *slog.Logger
+	padding         paddingPolicy
+	mu              sync.Mutex
+	sessions        map[string]*tunnelSession
+	perPrincipal    map[string]int // active session count per principal (for the per-principal cap)
+	idleTimeout     time.Duration
+	maxSessions     int // global cap on concurrent sessions (0 = unlimited)
+	maxPerPrincipal int // per-principal cap (0 = unlimited)
 }
 
 type sessionBinding struct {
@@ -338,6 +377,11 @@ func (b sessionBinding) matches(other sessionBinding) bool {
 }
 
 var errSessionIDRequired = errors.New("resume session id is required")
+
+// errSessionLimitExceeded is returned when admitting a new resume session would
+// exceed the configured global or per-principal cap. It is a server-side
+// backpressure signal: the client should back off rather than spin redials.
+var errSessionLimitExceeded = errors.New("resume session limit exceeded")
 
 func newSessionID() string {
 	var b [16]byte
@@ -361,15 +405,25 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 	// Do not hold the table lock while dialing: a slow/unreachable target must
 	// not serialize all unrelated new sessions behind its DialTimeout.
 	t.mu.Lock()
+	// Enforce the global / per-principal session caps *before* dialing the
+	// target: a rejected new session must not waste an upstream connection, and
+	// the cap bounds memory under a flood of distinct (never-resumed) session
+	// IDs. Resuming an already-present session is unaffected (it does not add one).
+	if !t.canAdmit(binding.principalID) {
+		t.mu.Unlock()
+		return nil, false, errSessionLimitExceeded
+	}
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
 		bindingMatches := existing.binding.matches(binding)
 		alive := !existing.closed && existing.targetConn != nil
 		if !bindingMatches {
+			existing.mu.Unlock()
+			t.mu.Unlock()
 			return nil, false, fmt.Errorf("%w: resume session identity changed", ErrForbidden)
 		}
 		if alive {
-			existing.lastSeen = time.Now()
+			existing.lastSeen.Store(time.Now().UnixNano())
 		}
 		existing.mu.Unlock()
 		t.mu.Unlock()
@@ -390,7 +444,6 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 		createdAt:    time.Now(),
 		network:      binding.network,
 		events:       t.events,
-		lastSeen:     time.Now(),
 		targetConn:   tconn,
 		datagram:     datagram,
 		binding:      binding,
@@ -398,6 +451,7 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 		frameR:       frameR,
 		downlinkRing: newRingBuffer(sizeKB),
 	}
+	s.lastSeen.Store(time.Now().UnixNano())
 
 	// A competing request may have installed the same ID while this one dialed.
 	// Keep the established session and close the losing connection immediately.
@@ -407,10 +461,13 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 		bindingMatches := existing.binding.matches(binding)
 		alive := !existing.closed && existing.targetConn != nil
 		if !bindingMatches {
+			existing.mu.Unlock()
+			t.mu.Unlock()
+			_ = tconn.Close()
 			return nil, false, fmt.Errorf("%w: resume session identity changed", ErrForbidden)
 		}
 		if alive {
-			existing.lastSeen = time.Now()
+			existing.lastSeen.Store(time.Now().UnixNano())
 		}
 		existing.mu.Unlock()
 		t.mu.Unlock()
@@ -420,18 +477,51 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 		}
 		return nil, false, errors.New("session exists but target is dead")
 	}
+	if t.perPrincipal == nil {
+		t.perPrincipal = make(map[string]int)
+	}
 	t.sessions[id] = s
+	t.perPrincipal[binding.principalID]++
 	t.mu.Unlock()
 
 	go s.downlinkPump()
 	return s, true, nil
 }
 
+// canAdmit reports whether a new session for principalID may be admitted under
+// the configured global and per-principal caps. Caller must hold t.mu.
+func (t *sessionTable) canAdmit(principalID string) bool {
+	if t.maxSessions > 0 && len(t.sessions) >= t.maxSessions {
+		return false
+	}
+	if t.maxPerPrincipal > 0 && t.perPrincipal[principalID] >= t.maxPerPrincipal {
+		return false
+	}
+	return true
+}
+
+// deleteSessionLocked removes a session from the table and keeps the
+// per-principal counter in sync. Caller must hold t.mu.
+func (t *sessionTable) deleteSessionLocked(id string) (*tunnelSession, bool) {
+	s, ok := t.sessions[id]
+	if !ok {
+		return nil, false
+	}
+	delete(t.sessions, id)
+	if s.binding.principalID != "" && t.perPrincipal != nil {
+		t.perPrincipal[s.binding.principalID]--
+		if t.perPrincipal[s.binding.principalID] <= 0 {
+			delete(t.perPrincipal, s.binding.principalID)
+		}
+	}
+	return s, true
+}
+
 // remove clears a session explicitly (ended or timed out).
 func (t *sessionTable) remove(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.sessions, id)
+	t.deleteSessionLocked(id)
 }
 
 // reapIdle periodically reaps sessions that exceeded the idle timeout
@@ -446,9 +536,9 @@ func (t *sessionTable) reapIdle() {
 	var toRemove []string
 	for id, s := range t.sessions {
 		s.mu.Lock()
-		idle := now.Sub(s.lastSeen)
 		dead := s.closed || s.targetConn == nil
 		s.mu.Unlock()
+		idle := now.Sub(time.Unix(0, s.lastSeen.Load()))
 		if dead || idle > idleTimeout {
 			toRemove = append(toRemove, id)
 		}
@@ -464,11 +554,7 @@ func (t *sessionTable) reapIdle() {
 func (t *sessionTable) removeLocked(id string) *tunnelSession {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	s, ok := t.sessions[id]
-	if !ok {
-		return nil
-	}
-	delete(t.sessions, id)
+	s, _ := t.deleteSessionLocked(id)
 	return s
 }
 
@@ -484,11 +570,10 @@ func (s *tunnelSession) close() {
 	})
 }
 
-// touch updates the last-activity time.
+// touch records last activity (lock-free: uses an atomic timestamp so the
+// per-packet hot paths don't contend on s.mu).
 func (s *tunnelSession) touch() {
-	s.mu.Lock()
-	s.lastSeen = time.Now()
-	s.mu.Unlock()
+	s.lastSeen.Store(time.Now().UnixNano())
 }
 
 // downlinkPump is the background pump: it reads from targetConn and writes
@@ -502,11 +587,13 @@ func (s *tunnelSession) downlinkPump() {
 	defer tcpBufPool.Put(bufPtr)
 	defer s.close()
 
+	// Give targetConn a 5-minute read deadline backstop. The idle reaper closes
+	// the session after 60s without activity, so a continuously-reading session
+	// still needs a live deadline — but we only refresh it as it approaches
+	// expiry rather than paying a SetReadDeadline syscall on every packet.
+	readDeadline := time.Now().Add(5 * time.Minute)
+	_ = s.targetConn.SetReadDeadline(readDeadline)
 	for {
-		// Give targetConn a 5-minute read deadline; when the session idle
-		// timeout (60s) hits, sessionTable.reapIdle closes the session
-		// proactively → Read returns an error and the pump exits.
-		_ = s.targetConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		// Datagram reads preserve one complete UDP message. Stream shaping is
 		// centralized in resumeSessionWriter, so live and replayed bytes follow
 		// the same record policy without increasing target read syscalls.
@@ -514,6 +601,10 @@ func (s *tunnelSession) downlinkPump() {
 		if n > 0 {
 			s.writeDownlink(buf[:n])
 			s.touch()
+			if time.Until(readDeadline) < time.Minute {
+				readDeadline = time.Now().Add(5 * time.Minute)
+				_ = s.targetConn.SetReadDeadline(readDeadline)
+			}
 		}
 		if err != nil {
 			// targetConn died or timed out: stop the pump.

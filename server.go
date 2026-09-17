@@ -404,13 +404,13 @@ func serveBackupKeepaliveOnly(up io.Reader, writer *resumeSessionWriter, params 
 	if keepaliveTimeout <= 0 {
 		keepaliveTimeout = 45 * time.Second
 	}
-	payloadBuf := make([]byte, 64*1024)
 	for {
 		type readResult struct {
 			typ byte
 			err error
 		}
 		done := make(chan readResult, 1)
+		payloadBuf := make([]byte, 64*1024)
 		go func() {
 			typ, _, _, err := readFrame(up, payloadBuf)
 			done <- readResult{typ, err}

@@ -11,6 +11,16 @@ package h2tunnel
 //   h2 ── x/net http2.Transport (TCP/TLS, ALPN "h2"), with CONNECT carried via
 //          RFC 8441 extended CONNECT (the :protocol pseudo-header)
 //
+// The two carriers read the upgrade token from different places, which is why
+// every masque request sets both:
+//   - h2 reads the rewritten ":protocol" pseudo-header (masqueExtendedConnectTransport
+//     below converts the plain Protocol header into it).
+//   - quic-go's h3 client reads **req.Proto** as the :protocol value (CONNECT with a
+//     non-empty, non-HTTP/1.1 Proto counts as extended CONNECT) and validates it as a
+//     token. It must therefore be the real upgrade token ("connect-tcp" /
+//     "connect-udp"); a placeholder like "HTTP/3" is not a token and makes the h3 leg
+//     stall until the auto-mode grace expires instead of failing fast.
+//
 // Why a parameter rather than pure auto: on a UDP-blocked path, the first h3
 // dial must burn the whole QUIC handshake timeout before falling back, adding
 // 1–2s to the first connection; explicit h2 skips that cost and makes behavior
@@ -23,6 +33,20 @@ package h2tunnel
 // is too late). The CLI logs a WARN when MASQUE is enabled but the flag is
 // absent; without it, the peer advertises no SETTINGS_ENABLE_CONNECT_PROTOCOL
 // and this side fails clearly with "extended connect not supported by peer".
+//
+// Go 1.27 constraint: as of Go 1.27 the http2 source of truth moved into
+// net/http, and x/net ships a "wrapping implementation" that delegates
+// RoundTrip to a stdlib http.Transport — whose front-door validateHeaders
+// rejects the ":protocol" pseudo-header outright (it has no RFC 8441
+// exemption), killing every masque-over-h2 dial with
+// "net/http: invalid header field name \":protocol\"". The original
+// implementation (which does accept :protocol) is selected by the
+// //go:build !(go1.27 && !http2legacy) tag on x/net's side, which is gated by
+// the MAIN MODULE's language version. This module therefore pins `go 1.26` in
+// go.mod (see the comment there). When a consumer's own main module declares
+// go >= 1.27, the wrapping implementation is compiled instead and masque-over-h2
+// breaks — consumers must keep their go directive at 1.26 or build with
+// -tags http2legacy until net/http grows a client-side extended-CONNECT API.
 // =========================================
 
 import (

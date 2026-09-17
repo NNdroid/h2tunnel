@@ -6,9 +6,16 @@ BIN_DIR="${PROJECT_ROOT}/bin"
 mkdir -p "${BIN_DIR}"
 
 APP_NAME="h2tunnel"
-VERSION="1.1.0"
 
-LDFLAGS="-s -w -X 'main.Version=${VERSION}'"
+# Canonical build version per project rule:
+#   v1.0.yyyyMMdd.<git commit count>-<latest commit short hash (7)>
+# Injected into github.com/NNdroid/h2tunnel.buildVersion (see README).
+BUILD_DATE="$(date -u +%Y%m%d)"
+GIT_COUNT="$(git -C "${PROJECT_ROOT}" rev-list --count HEAD 2>/dev/null || echo 0)"
+GIT_HASH="$(git -C "${PROJECT_ROOT}" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
+VERSION="v1.0.${BUILD_DATE}.${GIT_COUNT}-${GIT_HASH}"
+
+LDFLAGS="-s -w -X 'github.com/NNdroid/h2tunnel.buildVersion=${VERSION}'"
 
 PLATFORMS=(
   "linux/amd64"

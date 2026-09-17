@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -91,10 +92,13 @@ func executeResumableTunnelContext(ctx context.Context, sessionID string, localC
 			return nil // normal end (EOF / peer closed)
 		}
 		if err != nil {
-			// AutoRedial semantics: even "permanent" errors (auth / target denied / gap) keep redialing —
-			// after a network change these are usually transient (new IP re-authenticates, target recovers);
-			// with AutoRedial off the old behavior is kept (terminate immediately).
-			if (!cfg.AutoRedial && isPermanentTunnelError(err)) || ctx.Err() != nil {
+			// Fail-fast on fatal (never-recoverable) errors regardless of AutoRedial:
+			// bad credentials / policy rejection / protocol version mismatch are
+			// configuration problems, not transient network blips, so redialing
+			// forever would just storm the server. Transient-looking errors (5xx,
+			// gap) still redial; with AutoRedial on they retry indefinitely (wait
+			// for the network to return), with AutoRedial off they terminate.
+			if ctx.Err() != nil || isFatalTunnelError(err) || (!cfg.AutoRedial && isPermanentTunnelError(err)) {
 				notifyReady(err)
 				return err
 			}
@@ -114,6 +118,10 @@ func executeResumableTunnelContext(ctx context.Context, sessionID string, localC
 		if delay > resumeBackoffMax {
 			delay = resumeBackoffMax
 		}
+		// Add up to +100% jitter so synchronized tunnels (a fleet coming back
+		// from the same outage) don't reconnect in lockstep and avalanche the
+		// server.
+		delay += time.Duration(rand.Int64N(int64(delay)))
 		lgInfof(cfg.lg(), "[Resume] 🔁 redial #%d (same-session resume), waiting %v", attempt, delay)
 		if cfg.events != nil {
 			cfg.events.dispatch(ClientEvent{
@@ -198,6 +206,24 @@ func isPermanentTunnelError(err error) bool {
 	return errors.As(err, &statusErr) || errors.Is(err, errGap) || errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrForbidden)
 }
 
+// isFatalTunnelError reports errors that redialing can never recover from, so the
+// tunnel must fail-fast even when AutoRedial is enabled. The only such case is a
+// resume protocol version mismatch (HTTP 426): the client and server speak
+// different resume versions, and a retry will never interoperate — it is a
+// build/version problem, not a transient network blip.
+//
+// Auth / target-denied (401/403) / 5xx errors intentionally do NOT fail-fast with
+// AutoRedial on: the product design keeps redialing through them because a network
+// change can re-authenticate or bring the target back (see isPermanentTunnelError
+// for the AutoRedial-off semantics).
+func isFatalTunnelError(err error) bool {
+	var statusErr *TunnelError
+	if errors.As(err, &statusErr) && statusErr.status == http.StatusUpgradeRequired {
+		return true // 426 resume version unsupported: never recoverable by redialing
+	}
+	return false
+}
+
 // buildResumeRequest builds a resume session request per transport type.
 // body is the io.Pipe reader (upstream resume frames are written to pw by the send goroutine).
 func buildResumeRequest(ctx context.Context, body io.Reader, sessID string, clientDownlink *uint64, ringBuf *resumeClientRingBuf, reqUrl string, cfg clientConfig) *http.Request {
@@ -249,8 +275,13 @@ func buildResumeRequestChecked(ctx context.Context, body io.Reader, sessID strin
 
 	if cfg.usesMasque() {
 		req.Header.Set("Protocol", protocolConnectTCP)
-		// http3.Transport needs an explicit HTTP/3 declaration, or the CONNECT target path may be rewritten to empty
-		req.Proto = "HTTP/3"
+		// quic-go's http3 client treats req.Proto as the RFC 8441 :protocol value for
+		// extended CONNECT (CONNECT with a non-empty, non-HTTP/1.1 Proto), so it must
+		// carry the real upgrade token. The old "HTTP/3" placeholder is not a token at
+		// all ('/' is illegal in token grammar): the h3 leg then stalls instead of
+		// completing the CONNECT, and auto mode only gives up after masqueH3ProbeGrace.
+		// The h2 leg reads the Protocol header instead (masqueExtendedConnectTransport).
+		req.Proto = protocolConnectTCP
 	}
 	if cfg.usesGRPC() {
 		// gRPC is only an outer Content-Type tag; resume frames are not wrapped in gRPC framing
@@ -279,6 +310,10 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	// The send goroutine also closes pw (idempotent); this defensive close releases
+	// the pipe writer on every early-return path so the request-body reader (inside
+	// the http client) never blocks on pr.Read() after a failed attempt.
+	defer pw.Close()
 
 	// RedialBudget bounds only the connect+handshake phase; the timer stops at ready
 	// (layer-B confirmation), so established streams are unaffected (otherwise a healthy

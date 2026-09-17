@@ -216,6 +216,13 @@ type ServerTuning struct {
 	// Session idle reclaim time. 0 = default 60s (a session with no active stream
 	// closes after this timeout).
 	SessionIdleTimeout time.Duration
+	// SessionMax caps the total number of concurrent resume sessions on the
+	// server (0 = default 4096). A global cap bounds memory under a flood of
+	// distinct (never-resumed) session IDs.
+	SessionMax int
+	// SessionMaxPerPrincipal caps concurrent sessions per principal (0 = default
+	// 256). It stops a single principal from consuming the entire global budget.
+	SessionMaxPerPrincipal int
 	// Padding controls server-to-client application-layer tunnel records.
 	// Configure both client and server to shape both traffic directions.
 	Padding PaddingTuning
