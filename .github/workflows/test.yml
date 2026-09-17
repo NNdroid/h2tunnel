@@ -94,7 +94,7 @@ jobs:
       - name: Collect CPU + memory profiles from the throughput benchmark
         shell: bash
         run: |
-          go test -run '^$' -bench 'BenchmarkProtocolThroughput/(H2_TCP|H2C_TCP|gRPC_TCP|H3_TCP|WT_TCP|MASQUE_TCP|MASQUE_H2_TCP|MASQUE_H3_TCP)$' \
+          go test -run '^$' -bench 'BenchmarkProtocolThroughput/(H2_TCP|H2C_TCP|gRPC_TCP|H3_TCP|WT_TCP|MASQUE_TCP|MASQUE_H2_TCP|MASQUE_H3_TCP|MASQUE_H2_UDP|MASQUE_H3_UDP)$' \
             -benchtime 3s -timeout 20m -cpuprofile cpu.out -memprofile mem.out .
 
       - name: Render flamegraphs and top reports
