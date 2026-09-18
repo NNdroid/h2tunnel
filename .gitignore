@@ -36,5 +36,6 @@ bin/
 
 .workbuddy/
 .codebuddy/docs/
+.zcode/
 *.pem
 docs/

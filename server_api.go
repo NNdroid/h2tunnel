@@ -53,6 +53,12 @@ type Server struct {
 const (
 	h2UploadBufferPerStream     = 8 << 20  // 8MB
 	h2UploadBufferPerConnection = 32 << 20 // 32MB
+	// h2MaxConcurrentStreams caps how many streams one peer can hold open. The
+	// tunnel opens at most main + standby + session-per-target streams per
+	// connection (tens, not thousands), so 256 is a headroom that still stops a
+	// single peer from pinning one goroutine and one resumeSessionWriter per
+	// stream with no cap.
+	h2MaxConcurrentStreams = 256
 )
 
 // NewServer validates options and creates a server without opening sockets or
@@ -100,6 +106,10 @@ func NewServer(options ServerOptions) (*Server, error) {
 		Authenticator:          options.Authenticator,
 		TargetDialer:           options.Dialer,
 		ServerContext:          ctx,
+		// Shared across the server's lifetime so a resume session's many requests
+		// over one leg configure that socket exactly once. Empty when Brutal is
+		// off, which is the common case.
+		brutalSockets: &brutalSockets{},
 	}
 	if options.TLSConfig != nil {
 		cfg.TLSConfig = options.TLSConfig.Clone()
@@ -155,8 +165,13 @@ func NewServer(options ServerOptions) (*Server, error) {
 	// backpressure at the tunnel session layer (the ring is bounded) instead of
 	// letting h2 flow control stall first. The client downlink uses x/net's
 	// default 4MB/stream, no change needed.
+	// x/net's http2.Server has no MaxHeaderListSize knob: the advertised value is
+	// the built-in default and only the peer's setting is read back. net/http
+	// still enforces a 1MiB total header size, so an oversized header list is
+	// rejected either way.
 	h2srv := &http2.Server{
 		IdleTimeout:                  time.Hour,
+		MaxConcurrentStreams:         h2MaxConcurrentStreams,
 		MaxUploadBufferPerStream:     h2UploadBufferPerStream,
 		MaxUploadBufferPerConnection: h2UploadBufferPerConnection,
 	}
@@ -171,10 +186,11 @@ func NewServer(options ServerOptions) (*Server, error) {
 		ConnState:         s.trackHTTPConnection,
 	}
 	if cfg.Brutal.enabled {
-		// ConnContext is the only hook that still holds the accepted socket:
-		// net/http calls it in the accept loop with the raw conn, h2c hijacks the
-		// conn before any handler runs, and x/net/http2 builds each request context
-		// from the handler's BaseContext rather than from the conn.
+		// ConnContext is the only hook that still holds the accepted socket, and
+		// the value it attaches reaches the tunnel handler on both delivery paths
+		// (ALPN via http2.BaseContext, h2c via the hijacked conn's request
+		// context). It is skipped entirely when Brutal is off, so a disabled
+		// deployment pays no per-accept context allocation.
 		s.httpServer.ConnContext = s.brutalConnContext
 	}
 	if cfg.TLSConfig != nil {
@@ -443,6 +459,7 @@ func (s *Server) trackHTTPConnection(conn net.Conn, state http.ConnState) {
 	switch state {
 	case http.StateClosed:
 		delete(s.httpConns, conn)
+		s.cfg.brutalSockets.forget(conn)
 	default:
 		if s.closing || s.closed {
 			closeNow = true
@@ -456,20 +473,24 @@ func (s *Server) trackHTTPConnection(conn net.Conn, state http.ConnState) {
 	}
 }
 
-// brutalConnContext enables TCP Brutal on the just-accepted socket. It runs
-// before authentication, which is why it applies the ungrouped form: group_id 0
-// (the default) caps each accepted connection individually, so an unauthenticated
-// client cannot buy itself more than one connection's worth of the configured
-// rate. The operator's static GroupID override is honored here too, which is the
-// "share one egress budget across all accepted connections" mode; a per-client
-// group cannot be used at this point because the token has not been presented
-// yet.
+// brutalConnContext publishes the just-accepted socket on the request context.
+//
+// net/http calls ConnContext in the accept loop with the raw conn, and the value
+// survives both delivery paths into the tunnel handler: over TLS ALPN, net/http
+// forwards it through http2.BaseContext, and over h2c, h2c.NewHandler passes the
+// request context (and the hijacked conn keeps it) into http2.ServeConn. That is
+// what makes the per-client group applicable at all — see the apply in
+// routeTunnelRequest.
+//
+// The socket is deliberately NOT configured here. Enabling it pre-auth would hand
+// an unauthenticated peer the configured rate, and the per-client group cannot be
+// derived before the token is presented. Unauthenticated requests therefore run
+// on the kernel's default controller, which is the safe default.
 func (s *Server) brutalConnContext(ctx context.Context, conn net.Conn) context.Context {
-	if !s.cfg.Brutal.enabled {
+	if conn == nil {
 		return ctx
 	}
-	applyBrutalBestEffort(conn, decideBrutal(s.cfg.Brutal), s.log)
-	return ctx
+	return context.WithValue(ctx, brutalConnKey{}, conn)
 }
 
 func (s *Server) closeTrackedHTTPConnections() error {

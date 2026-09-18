@@ -33,11 +33,13 @@ package h2tunnel
 // with min() and 0 means "no local preference", so either side may stay silent
 // and the other wins.
 //
-// The exchange is deliberately NOT version-gated: it rides the existing resume/2
-// capability list (`brutal` in X-Resume-Caps, which parseCaps already ignores
-// forward-compatibly), so an older server drops the offer and nothing breaks.
-// The sentinel target _BrutalBwExchange is the explicit form of the same
-// exchange for callers that want to negotiate without opening a business tunnel.
+// The exchange is deliberately NOT version-gated and adds no capability flag:
+// the offer must be sent on the first request of a leg, before the client has
+// seen any server capabilities, so a cap could never gate it. The wire stays
+// inert without versioning because an older peer simply ignores the unknown
+// headers — it neither echoes nor acts on them. The sentinel target
+// _BrutalBwExchange is the explicit form of the same exchange for callers that
+// want to negotiate without opening a business tunnel.
 //
 // Nonce: a fresh random value per exchange on X-Brutal-Offer, echoed back on
 // X-Brutal-Params; the client applies the decision only on a match, so a cached
@@ -110,20 +112,29 @@ type brutalDecision struct {
 	nonce string
 }
 
+// brutalUnwrapDepth bounds the wrapper chain followed by tcpConnFrom. A user
+// supplied ClientDialer may hand back its own wrapper; one that unwraps into a
+// cycle must not be able to hang a dial, so the walk stops after this many hops
+// rather than following the chain forever. Two hops covers every wrapper this
+// package produces.
+const brutalUnwrapDepth = 32
+
 // tcpConnFrom unwraps a connection to its underlying *net.TCPConn. Only plain
-// Unwrap chains are followed — tls.Conn has NetConn instead, which is why every
-// call site applies Brutal before wrapping the raw socket.
+// Unwrap chains are followed — tls.Conn exposes NetConn instead, which is why
+// every call site applies Brutal before wrapping the raw socket.
 func tcpConnFrom(conn net.Conn) (*net.TCPConn, bool) {
-	for {
+	for depth := 0; depth < brutalUnwrapDepth; {
 		switch c := conn.(type) {
 		case *net.TCPConn:
 			return c, true
 		case interface{ Unwrap() net.Conn }:
 			conn = c.Unwrap()
+			depth++
 		default:
 			return nil, false
 		}
 	}
+	return nil, false
 }
 
 // tuning converts back to the exported form, mirroring paddingPolicy.tuning so
@@ -191,6 +202,18 @@ func setBrutalOfferHeaders(h http.Header, p brutalPolicy, group string) {
 	}
 }
 
+// clampPeerGain bounds a peer-declared gain to the range this side would accept
+// for its own config. Both parsers read a remote header, and an absurd value must
+// not reach the peer cache, the decision NegotiateBrutal reports, or the kernel —
+// the socket is already bounded by min() against a locally validated policy, this
+// closes the rest of the path. 0 keeps its "no local preference" meaning.
+func clampPeerGain(gain uint32) uint32 {
+	if gain == 0 || gain <= brutalMaxCwndGain {
+		return gain
+	}
+	return 0
+}
+
 // parseBrutalOffer reads a peer's X-Brutal-Offer. Missing or malformed keys read
 // as zero (no preference), which is the intended lenient shape for a header.
 func parseBrutalOffer(s string) (rateBytes uint64, cwndGain uint32, nonce string) {
@@ -207,7 +230,7 @@ func parseBrutalOffer(s string) (rateBytes uint64, cwndGain uint32, nonce string
 			}
 		case paramBrutalGain:
 			if n, err := strconv.ParseUint(v, 10, 32); err == nil {
-				cwndGain = uint32(n)
+				cwndGain = clampPeerGain(uint32(n))
 			}
 		case paramBrutalNonce:
 			nonce = v
@@ -217,13 +240,11 @@ func parseBrutalOffer(s string) (rateBytes uint64, cwndGain uint32, nonce string
 }
 
 // applyOffer merges a peer's declared values into the local policy with min()
-// semantics: either side may declare 0 ("no local preference") and the other
-// side's value wins. Returns the local policy when nothing was offered.
+// semantics, axis by axis: either side may declare 0 ("no local preference") and
+// the other side's value wins for that axis. The axes are independent, so a peer
+// that declares a gain but no rate still contributes its gain.
 func applyOffer(local brutalPolicy, peerRate uint64, peerGain uint32) brutalPolicy {
-	if peerRate == 0 {
-		return local
-	}
-	if local.rateBytes == 0 || peerRate < local.rateBytes {
+	if peerRate != 0 && (local.rateBytes == 0 || peerRate < local.rateBytes) {
 		local.rateBytes = peerRate
 	}
 	if peerGain != 0 && peerGain < local.cwndGain {
@@ -245,32 +266,38 @@ func decideBrutal(p brutalPolicy) brutalDecision {
 	}
 }
 
-// brutalReply is the server side of one exchange: merge the client's offer into
-// the local policy with min() semantics, derive the group id from the presented
-// token and client seed, and render the X-Brutal-Params value (echoing the
-// client's nonce so it can verify the answer belongs to this exchange).
+// resolveBrutalExchange is the server side of one exchange: merge the client's
+// offer into the local policy with min() semantics, then resolve the group id
+// from the presented token and client seed. It returns the effective policy
+// together with the nonce the client sent, so the caller can both configure the
+// socket and render the X-Brutal-Params value from the same computation.
 //
-// The server deliberately does not apply the reply's per-client group to this
-// connection. http.Server exposes the accepted socket only through ConnContext,
-// and x/net/http2 builds each request context from the handler's BaseContext
-// rather than from the conn, so no handle on the socket survives into the
-// handler — the per-client group cannot be written here. The value returned is
-// what the client verifies and applies to its own socket; the server's socket is
-// enabled per-connection at accept time instead (see server_api.go).
-func brutalReply(p brutalPolicy, r *http.Request) string {
-	if !p.enabled || !p.negotiate {
-		return ""
-	}
+// Resolving the group needs the token, which is why it runs after
+// authentication. A request that never authenticates never produces a group.
+func resolveBrutalExchange(p brutalPolicy, r *http.Request) (brutalPolicy, string) {
 	offer := strings.TrimSpace(r.Header.Get(brutalHeaderOffer))
 	if offer == "" {
-		return ""
+		return p, ""
 	}
 	peerRate, peerGain, nonce := parseBrutalOffer(offer)
 	if peerRate != 0 || peerGain != 0 {
 		p = applyOffer(p, peerRate, peerGain)
 	}
 	p.groupID = resolveBrutalGroupID(p, brutalTokenFromHeaders(r.Header), brutalGroupSeed(r))
-	return formatBrutalReply(decideBrutal(p), nonce)
+	return p, nonce
+}
+
+// brutalReply renders the X-Brutal-Params value for one exchange, echoing the
+// client's nonce so it can verify the answer belongs to this exchange.
+func brutalReply(p brutalPolicy, r *http.Request) string {
+	if !p.enabled || !p.negotiate {
+		return ""
+	}
+	eff, nonce := resolveBrutalExchange(p, r)
+	if nonce == "" {
+		return ""
+	}
+	return formatBrutalReply(decideBrutal(eff), nonce)
 }
 
 // handleBrutalReply processes the server's answer on the client: a reply whose
@@ -281,10 +308,12 @@ func brutalReply(p brutalPolicy, r *http.Request) string {
 //
 // http2 keeps no reference to the dialer's conn, so the socket carrying this
 // stream cannot be reached from here and the reply does not reconfigure it. The
-// cache is what makes negotiation still take effect: negotiation only ever
-// lowers the rate, so recording the server's value and merging it at the next
-// dial is monotone, and every later leg (standby lanes, migrations, reconnects)
-// starts already bounded by the negotiated value.
+// server applies the same decision to its own accepted socket in
+// routeTunnelRequest, so this cache only affects the client's side. The cache is
+// what makes negotiation still take effect: negotiation only ever lowers the
+// rate, so recording the server's value and merging it at the next dial is
+// monotone, and every later leg (standby lanes, migrations, reconnects) starts
+// already bounded by the negotiated value.
 func handleBrutalReply(req *http.Request, reply string, peer *brutalPeerCache, lg *slog.Logger) {
 	if reply == "" {
 		return
@@ -365,7 +394,7 @@ func parseBrutalReply(s string) (brutalDecision, string) {
 			}
 		case paramBrutalGain:
 			if n, err := strconv.ParseUint(v, 10, 32); err == nil {
-				d.cwndGain = uint32(n)
+				d.cwndGain = clampPeerGain(uint32(n))
 			}
 		case paramBrutalGroup:
 			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
@@ -472,6 +501,56 @@ func applyBrutalBestEffort(conn net.Conn, d brutalDecision, lg *slog.Logger) {
 			warnBrutalDegraded(lg, err.Error())
 		}
 	}
+}
+
+// applyBrutalOnce applies a decision to the server's accepted socket at most once
+// per connection. A resume session runs many requests over one TCP leg, and the
+// decision does not change between them, so configuring the socket per request
+// would be pure syscall cost. The first request to see the conn wins.
+func applyBrutalOnce(done *brutalSockets, conn net.Conn, d brutalDecision, lg *slog.Logger) {
+	if conn == nil || !done.mark(conn) {
+		return
+	}
+	applyBrutalBestEffort(conn, d, lg)
+}
+
+// brutalSockets remembers which accepted connections already had their socket
+// configured. Connections are tracked for the lifetime of the Server that owns
+// the set, which is one extra interface-sized entry per live TCP leg — bounded
+// by the session table anyway.
+type brutalSockets struct {
+	applied sync.Map // net.Conn -> struct{}
+}
+
+func (b *brutalSockets) mark(c net.Conn) bool {
+	if b == nil {
+		return false
+	}
+	_, dup := b.applied.LoadOrStore(c, struct{}{})
+	return !dup
+}
+
+func (b *brutalSockets) forget(c net.Conn) {
+	if b == nil {
+		return
+	}
+	b.applied.Delete(c)
+}
+
+// brutalConnKey carries the accepted socket into the request context so the
+// handler can configure it.
+type brutalConnKey struct{}
+
+// brutalConnFromRequest returns the accepted socket attached by the server's
+// ConnContext. It is nil when Brutal is disabled, when the request did not come
+// in over the tracked HTTP listener, or when a handler rebuilt the request
+// without copying its context.
+func brutalConnFromRequest(r *http.Request) net.Conn {
+	if r == nil {
+		return nil
+	}
+	c, _ := r.Context().Value(brutalConnKey{}).(net.Conn)
+	return c
 }
 
 // warnBrutalDegraded reports a degraded Brutal outcome at most once per process,

@@ -146,7 +146,7 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 	}
 	sess, isNew, err := sessions.prepareResumeSession(r, dialTarget, cfg.SessionWindow)
 	if err != nil {
-		if errors.Is(err, errSessionIDRequired) {
+		if errors.Is(err, errSessionIDRequired) || errors.Is(err, errSessionIDTooLong) {
 			w.Header().Set("X-Resume-Error", resumeErrInvalidParams.String())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return

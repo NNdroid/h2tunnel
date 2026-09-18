@@ -1,10 +1,13 @@
 package h2tunnel
 
 import (
+	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestCompileBrutalPolicy(t *testing.T) {
@@ -64,6 +67,19 @@ func TestApplyOfferTakesTheMinimum(t *testing.T) {
 	}
 	if got := applyOffer(base(100, 20), 400, 5); got.rateBytes != 100 || got.cwndGain != 5 {
 		t.Fatalf("higher rate / lower gain: got %+v, want rate 100 gain 5", got)
+	}
+
+	// The axes are independent: a peer that declares a gain but no rate still
+	// contributes its gain, and one that declares a rate but no gain still
+	// contributes its rate.
+	if got := applyOffer(base(100, 20), 0, 5); got.rateBytes != 100 || got.cwndGain != 5 {
+		t.Fatalf("peer gain without a rate dropped the gain: got %+v, want rate 100 gain 5", got)
+	}
+	if got := applyOffer(base(100, 20), 40, 0); got.rateBytes != 40 || got.cwndGain != 20 {
+		t.Fatalf("peer rate without a gain dropped the rate: got %+v, want rate 40 gain 20", got)
+	}
+	if got := applyOffer(base(100, 20), 0, 40); got.rateBytes != 100 || got.cwndGain != 20 {
+		t.Fatalf("peer gain higher than the local one must not apply: got %+v, want rate 100 gain 20", got)
 	}
 
 	// A local rate of 0 adopts whatever the peer declares.
@@ -192,6 +208,19 @@ func TestParseBrutalOfferToleratesMalformedInput(t *testing.T) {
 	}
 	if rate, _, _ = parseBrutalOffer("rate=-1"); rate != 0 {
 		t.Fatalf("a negative rate must read as zero, got %d", rate)
+	}
+
+	// An absurd peer gain is dropped rather than passed through: this side would
+	// reject the same value in its own config, so it must not reach the peer
+	// cache or the value NegotiateBrutal reports. The upper bound is inclusive.
+	if rate, gain, _ = parseBrutalOffer("rate=5,gain=4294967295"); rate != 5 || gain != 0 {
+		t.Fatalf("an out-of-range peer gain was accepted: (%d,%d)", rate, gain)
+	}
+	if _, gain, _ = parseBrutalOffer("gain=1000"); gain != brutalMaxCwndGain {
+		t.Fatalf("the gain upper bound must be inclusive, got %d", gain)
+	}
+	if d, _ := parseBrutalReply("rate=5,gain=4294967295"); d.cwndGain != 0 {
+		t.Fatalf("the reply parser accepted an out-of-range gain: %d", d.cwndGain)
 	}
 }
 
@@ -464,5 +493,138 @@ func TestFormatBrutalKVIsDeterministic(t *testing.T) {
 	}
 	if got := formatBrutalKV(map[string]string{"unknown": "1"}); got != "" {
 		t.Fatalf("an unknown key must be dropped: %q", got)
+	}
+}
+
+func TestResolveBrutalExchangeMergesAndDerivesTheGroup(t *testing.T) {
+	p := brutalPolicy{enabled: true, rateBytes: 200, cwndGain: 20, negotiate: true}
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", nil)
+	req.Header.Set("X-Auth-Token", "shared-token")
+	req.Header.Set(brutalHeaderClientGrp, "client-group-1")
+	req.Header.Set(brutalHeaderOffer, "rate=100,gain=5,nonce=abc")
+
+	eff, nonce := resolveBrutalExchange(p, req)
+	if nonce != "abc" {
+		t.Fatalf("nonce = %q, want the client's", nonce)
+	}
+	if eff.rateBytes != 100 || eff.cwndGain != 5 {
+		t.Fatalf("merged policy = rate %d gain %d, want 100/5", eff.rateBytes, eff.cwndGain)
+	}
+	if want := deriveBrutalGroupID("shared-token", "client-group-1"); eff.groupID != want {
+		t.Fatalf("group_id = %d, want the derived %d", eff.groupID, want)
+	}
+
+	// The offer's group must not be trusted: only rate and gain cross the wire.
+	req2 := httptest.NewRequest(http.MethodPost, "/tunnel", nil)
+	req2.Header.Set("X-Auth-Token", "shared-token")
+	req2.Header.Set(brutalHeaderClientGrp, "client-group-1")
+	req2.Header.Set(brutalHeaderOffer, "rate=1,gain=1,nonce=n,group_id=999")
+	eff2, _ := resolveBrutalExchange(p, req2)
+	if eff2.groupID == 999 {
+		t.Fatal("a client-supplied group_id was accepted")
+	}
+}
+
+func TestResolveBrutalExchangeLeavesTheGroupUnresolvedWithoutAnOffer(t *testing.T) {
+	p := brutalPolicy{enabled: true, rateBytes: 100, cwndGain: 15, groupID: 77, negotiate: true}
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", nil)
+	req.Header.Set("X-Auth-Token", "token")
+	req.Header.Set(brutalHeaderClientGrp, "seed")
+
+	eff, nonce := resolveBrutalExchange(p, req)
+	if nonce != "" {
+		t.Fatalf("no offer must not report a nonce: %q", nonce)
+	}
+	if eff.groupID != 77 {
+		t.Fatalf("the static override must survive: got %d, want 77", eff.groupID)
+	}
+
+	// Without a static override and without an offer, no group is derived: the
+	// server cannot learn a client's group id without reading its offer.
+	p2 := brutalPolicy{enabled: true, rateBytes: 100, cwndGain: 15, negotiate: true}
+	eff2, _ := resolveBrutalExchange(p2, req)
+	if eff2.groupID != 0 {
+		t.Fatalf("group derived without an offer: %d", eff2.groupID)
+	}
+}
+
+func TestBrutalSocketsMarksEachConnOnce(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	s := &brutalSockets{}
+	if !s.mark(a) {
+		t.Fatal("the first mark of a conn must succeed")
+	}
+	if s.mark(a) {
+		t.Fatal("the same conn was marked twice")
+	}
+	if !s.mark(b) {
+		t.Fatal("a distinct conn must be markable")
+	}
+	s.forget(a)
+	if !s.mark(a) {
+		t.Fatal("a forgotten conn must be markable again")
+	}
+
+	// A nil tracker is the disabled-feature shape and must not panic.
+	var none *brutalSockets
+	if none.mark(a) {
+		t.Fatal("a nil tracker must never mark")
+	}
+	none.forget(a)
+}
+
+// cyclicUnwrapConn unwraps into itself, so an unbounded walk never terminates.
+type cyclicUnwrapConn struct {
+	net.Conn
+}
+
+func (cyclicUnwrapConn) Unwrap() net.Conn {
+	var self cyclicUnwrapConn
+	return self
+}
+
+func TestTcpConnFromBoundedAgainstACyclicWrapper(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	// The wrapper must be reached quickly, and the walk must stop rather than
+	// hang a dial forever.
+	done := make(chan struct{})
+	go func() {
+		_, ok := tcpConnFrom(cyclicUnwrapConn{Conn: b})
+		if ok {
+			t.Error("a cyclic Unwrap chain resolved to a TCPConn")
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tcpConnFrom did not return from a cyclic Unwrap chain")
+	}
+}
+
+func TestBrutalConnFromRequestCarriesTheAcceptedSocket(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", nil)
+	if got := brutalConnFromRequest(req); got != nil {
+		t.Fatalf("a bare request must not carry a socket: %v", got)
+	}
+	ctx := context.WithValue(req.Context(), brutalConnKey{}, b)
+	if got := brutalConnFromRequest(req.WithContext(ctx)); got != b {
+		t.Fatalf("the attached socket was not returned: %v", got)
+	}
+	if got := brutalConnFromRequest(req.WithContext(context.WithValue(ctx, brutalConnKey{}, a))); got != a {
+		t.Fatalf("a later override must win: %v", got)
+	}
+	if got := brutalConnFromRequest(nil); got != nil {
+		t.Fatalf("nil request must return nil: %v", got)
 	}
 }

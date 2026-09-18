@@ -378,6 +378,31 @@ func (b sessionBinding) matches(other sessionBinding) bool {
 
 var errSessionIDRequired = errors.New("resume session id is required")
 
+// errSessionIDTooLong is returned for a client-supplied X-Session-ID above
+// sessionIDMaxBytes. It is rejected before the ID becomes a map key, so a
+// single request cannot park megabytes of key material in the table.
+var errSessionIDTooLong = errors.New("resume session id exceeds the maximum length")
+
+// sessionIDMaxBytes bounds the client-supplied X-Session-ID. Generated IDs are
+// 32 hex chars, so this leaves room for prefixed IDs without opening the door
+// to a header-sized key: net/http allows a 1 MiB header, which would be
+// stored verbatim in t.sessions and in every resume of it.
+const sessionIDMaxBytes = 128
+
+// validateSessionID applies the same rule everywhere an ID is accepted: the
+// handlers call it before the handshake so a bad ID is answered with 400, and
+// getOrCreateBound calls it as the last line of defence for library callers.
+func validateSessionID(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errSessionIDRequired
+	}
+	if len(id) > sessionIDMaxBytes {
+		return errSessionIDTooLong
+	}
+	return nil
+}
+
 // errSessionLimitExceeded is returned when admitting a new resume session would
 // exceed the configured global or per-principal cap. It is a server-side
 // backpressure signal: the client should back off rather than spin redials.
@@ -398,9 +423,10 @@ func (t *sessionTable) getOrCreate(id string, dialTarget func() (net.Conn, error
 }
 
 func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialTarget func() (net.Conn, error), sizeKB int, datagram bool, frameW func(io.Writer, []byte) error, frameR func(io.Reader, []byte) (int, error)) (*tunnelSession, bool, error) {
-	if strings.TrimSpace(id) == "" {
-		return nil, false, errSessionIDRequired
+	if err := validateSessionID(id); err != nil {
+		return nil, false, err
 	}
+	id = strings.TrimSpace(id)
 
 	// Do not hold the table lock while dialing: a slow/unreachable target must
 	// not serialize all unrelated new sessions behind its DialTimeout.

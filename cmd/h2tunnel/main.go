@@ -146,7 +146,9 @@ func runServer(cfg *config, logger *slog.Logger) error {
 		Authenticator: auth,
 		Dialer:        directTargetDialer(cfg.LocalOnly),
 		Tuning: h2tunnel.ServerTuning{
-			SessionWindowBytes: cfg.SessionWindowKB * 1024,
+			SessionWindowBytes:     cfg.SessionWindowKB * 1024,
+			SessionMax:             cfg.SessionMax,
+			SessionMaxPerPrincipal: cfg.SessionMaxPerPrincipal,
 			Padding: h2tunnel.PaddingTuning{
 				MinRecordBytes: cfg.Padding.MinRecordBytes,
 				MaxRecordBytes: cfg.Padding.MaxRecordBytes,

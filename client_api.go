@@ -547,6 +547,12 @@ func (c *Client) DialContext(ctx context.Context, network, target string) (net.C
 		})
 		_ = engineSide.Close()
 		managed.finishWith(cause)
+		// The engine is gone, so the tunnel is terminal. finishWith only records
+		// the error and signals Done(); without finish() the conn would stay in
+		// c.active forever and Shutdown's activeWG.Wait() could never return if
+		// the application never closed the conn it was handed. The engine side is
+		// already closed, so the app sees a clean EOF rather than a reset.
+		managed.finish()
 	}()
 
 	select {

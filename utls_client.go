@@ -117,7 +117,15 @@ func (c *Client) utlsTLSConfig(addr string) *utls.Config {
 }
 
 // adaptVerifyConnection adapts a crypto/tls VerifyConnection callback to utls's
-// ConnectionState type; the mapping covers every field a pinning callback reads.
+// ConnectionState type. It covers every field both versions of ConnectionState
+// share. Channel binding matters here: TLSUnique is the tls-unique value a
+// binding-aware callback reads, and dropping it silently makes every
+// VerifyConnection callback that checks it see a nil value and accept.
+//
+// No counterpart in utls v1.8.2, so not copied: CurveID and HelloRetryRequest
+// (utls keeps only an unexported testingOnlyDidHRR). utls has no
+// peer-signature fields, but neither does crypto/tls on Go 1.26, so nothing is
+// lost there.
 func adaptVerifyConnection(fn func(tls.ConnectionState) error) func(utls.ConnectionState) error {
 	if fn == nil {
 		return nil
@@ -135,6 +143,8 @@ func adaptVerifyConnection(fn func(tls.ConnectionState) error) func(utls.Connect
 			VerifiedChains:              cs.VerifiedChains,
 			SignedCertificateTimestamps: cs.SignedCertificateTimestamps,
 			OCSPResponse:                cs.OCSPResponse,
+			TLSUnique:                   cs.TLSUnique,
+			ECHAccepted:                 cs.ECHAccepted,
 		})
 	}
 }

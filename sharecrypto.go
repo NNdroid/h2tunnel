@@ -61,13 +61,25 @@ func gzipData(b []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// shareGzipMaxBytes bounds the decompressed size of a shared profile. The
+// limit is on the output, not the input: a gzip stream can expand thousands of
+// times, so without it a small "stun://" payload can ask for gigabytes of RAM.
+const shareGzipMaxBytes = 8 << 20
+
 func gunzipData(b []byte) ([]byte, error) {
 	r, err := gzip.NewReader(bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	out, err := io.ReadAll(io.LimitReader(r, shareGzipMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(out)) > shareGzipMaxBytes {
+		return nil, fmt.Errorf("shared profile expands to %d bytes, the limit is %d", int64(len(out)), shareGzipMaxBytes)
+	}
+	return out, nil
 }
 
 // encryptStunURI encrypts plaintext profile JSON with the PIN and returns the full "stun://" URI

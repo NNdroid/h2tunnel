@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +18,12 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 )
+
+// wtMaxStreamsPerSession caps the concurrently served streams of one WebTransport
+// session (see the semaphore in handleWebTransportServer). A client opens a few
+// streams per WT session (one per tunnel lane), so the headroom here is far
+// above real use and still finite.
+const wtMaxStreamsPerSession = 256
 
 // =========================================
 // WebTransport (WT) transport adapter
@@ -444,9 +449,9 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 		http.Error(w, "resume/2 required", http.StatusUpgradeRequired)
 		return
 	}
-	if strings.TrimSpace(r.Header.Get("X-Session-ID")) == "" {
+	if err := validateSessionID(r.Header.Get("X-Session-ID")); err != nil {
 		w.Header().Set("X-Resume-Error", resumeErrInvalidParams.String())
-		http.Error(w, errSessionIDRequired.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -484,6 +489,13 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 	datagram := network == "udp"
 	isBackup := r.Header.Get("X-Resume-Role") == "backup"
 
+	// Each accepted stream costs one goroutine, one 64KB frame buffer and, on a
+	// primary stream, a target dial. The session caps bound sessions, not
+	// streams, so without this a peer holding MaxIncomingStreams open on many
+	// QUIC connections gets an unbounded goroutine fan-out. Refuse at the limit
+	// rather than queue: a queued stream only enlarges the queue a flood feeds.
+	streams := make(chan struct{}, wtMaxStreamsPerSession)
+
 	for {
 		stream, err := session.AcceptStream(r.Context())
 		if err != nil {
@@ -491,11 +503,20 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 			break
 		}
 
+		select {
+		case streams <- struct{}{}:
+		default:
+			lgWarnf(sessions.lg(), "[%s] ❌ WT stream limit reached (%d), resetting the stream", sessionID, wtMaxStreamsPerSession)
+			stream.CancelWrite(1)
+			continue
+		}
+
 		streamID := fmt.Sprintf("%s-ST%d", sessionID, time.Now().UnixNano()%10000)
 
 		// Each WT stream is an independent resume data plane, resumed with the
 		// same X-Session-ID.
 		go func(s *webtransport.Stream, sID string) {
+			defer func() { <-streams }()
 			defer s.Close()
 			// Backup (probe) line: no target dial, no business session, only
 			// the A+B handshake + KEEPALIVE.

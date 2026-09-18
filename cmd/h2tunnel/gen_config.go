@@ -61,6 +61,8 @@ func RunGenSystemd(args []string) {
   "path": %q,
   "token": %q,
   "transport": %q,
+  "session_max": 4096,
+  "session_max_per_principal": 256,
   "padding": {
     "min_record_bytes": 600,
     "max_record_bytes": 1200

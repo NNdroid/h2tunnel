@@ -21,6 +21,13 @@ func handleMasqueTCPServer(w http.ResponseWriter, r *http.Request, sessionID str
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
+	// The session table reads the network and target back out of the request
+	// headers, and the network decides whether the session is datagram-framed.
+	// A CONNECT-TCP stream is byte-oriented regardless of what the client wrote
+	// in X-Network, so pin both to the classification here; otherwise a
+	// "X-Network: udp" CONNECT-TCP would create a UDP-framed session over a TCP
+	// dial and lose packet boundaries on both sides.
+	masqueSessionHeaders(r, tr)
 	lgDebugf(sessions.lg(), "[%s] -> MASQUE-TCP dispatched to RESUME engine (target=%s)", sessionID, tr.target)
 	handleH2StreamResumeServer(w, r, sessionID, tr, cfg, sessions)
 }
@@ -32,13 +39,19 @@ func handleMasqueUDPServer(w http.ResponseWriter, r *http.Request, sessionID str
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
-	// The session table decides datagram mode and target from request headers;
-	// standard MASQUE clients only carry the target in the URI path, so
-	// normalize the classification back into headers for prepareResumeSession.
-	r.Header.Set("X-Network", networkUDP)
-	if tr.target != "" {
-		r.Header.Set("X-Target", tr.target)
-	}
+	// Standard MASQUE clients only carry the target in the URI path, so
+	// normalize the classification back into the headers the session table reads.
+	masqueSessionHeaders(r, tr)
 	lgDebugf(sessions.lg(), "[%s] -> MASQUE-UDP dispatched to RESUME engine (target=%s)", sessionID, tr.target)
 	handleH2StreamResumeServer(w, r, sessionID, tr, cfg, sessions)
+}
+
+// masqueSessionHeaders pins the request headers the session table reads back for
+// a MASQUE request: the classified network and target, never the client's own
+// values. prepareResumeSession decides datagram framing from X-Network, so the
+// classification has to win here or a peer could pick the framing of its
+// sessions.
+func masqueSessionHeaders(r *http.Request, tr tunnelRequest) {
+	r.Header.Set("X-Network", tr.network)
+	r.Header.Set("X-Target", tr.target)
 }

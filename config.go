@@ -401,6 +401,10 @@ type serverConfig struct {
 	Padding paddingPolicy `json:"-"`
 	// Brutal is the validated TCP Brutal policy (brutal_linux.go applies it).
 	Brutal brutalPolicy `json:"-"`
+	// brutalSockets dedupes the per-connection socket configuration; nil only for
+	// configs built without NewServer (white-box tests). A pointer so the
+	// per-request cfg copy shares it.
+	brutalSockets *brutalSockets `json:"-"`
 
 	// DialTarget is a custom upstream dial function (for library embedding). When
 	// nil, the default net.Dialer{Timeout: 10s} dials the target directly. External

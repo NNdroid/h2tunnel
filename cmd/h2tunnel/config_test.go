@@ -145,6 +145,44 @@ func TestConfigBrutalSectionAndValidation(t *testing.T) {
 	write(t, `{"mode":"client","server":"https://example.com","target":"echo","brutal":{"enabled":true,"rate_bytes":1,"cwnd_gain":15}}`)
 }
 
+func TestConfigSessionCapsValidationAndEnvironment(t *testing.T) {
+	t.Setenv("H2TUNNEL_SESSION_MAX", "2048")
+	t.Setenv("H2TUNNEL_SESSION_MAX_PER_PRINCIPAL", "64")
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"mode":"server"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionMax != 2048 || cfg.SessionMaxPerPrincipal != 64 {
+		t.Fatalf("env-derived caps = %d/%d, want 2048/64", cfg.SessionMax, cfg.SessionMaxPerPrincipal)
+	}
+
+	// 0 is valid: it selects the library's built-in default rather than "no cap".
+	for _, caps := range []struct{ max, perPrincipal int }{{0, 0}, {-1, 0}, {0, -1}} {
+		cfg := config{Mode: "server", SessionMax: caps.max, SessionMaxPerPrincipal: caps.perPrincipal}
+		err := cfg.validate()
+		if caps.max < 0 || caps.perPrincipal < 0 {
+			if err == nil {
+				t.Fatalf("validate accepted %d/%d", caps.max, caps.perPrincipal)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("validate rejected the default form %d/%d: %v", caps.max, caps.perPrincipal, err)
+		}
+	}
+
+	// The caps only govern the server's session table, so a client config that
+	// carries them is a misconfiguration rather than an ignored knob.
+	client := config{Mode: "client", Server: "https://example.com", Target: "echo", SessionMax: 1}
+	if err := client.validate(); err == nil {
+		t.Fatal("client config accepted server-only session caps")
+	}
+}
+
 func TestConfigBrutalEnvironment(t *testing.T) {
 	t.Setenv("H2TUNNEL_BRUTAL_ENABLED", "true")
 	t.Setenv("H2TUNNEL_BRUTAL_RATE_BYTES", "100000000")
@@ -289,6 +327,11 @@ func TestGeneratedProxyAndServiceConfigsMatchCurrentCLI(t *testing.T) {
 	// operators find the knob by reading their own generated config.
 	if !strings.Contains(systemd, `"brutal": {`) || !strings.Contains(systemd, `"enabled": false`) {
 		t.Fatalf("generated systemd config no longer advertises the brutal section:\n%s", systemd)
+	}
+	// The session caps are the server's flood valve, so the generated sample must
+	// keep advertising them too.
+	if !strings.Contains(systemd, `"session_max": 4096`) || !strings.Contains(systemd, `"session_max_per_principal": 256`) {
+		t.Fatalf("generated systemd config no longer advertises the session caps:\n%s", systemd)
 	}
 }
 

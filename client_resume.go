@@ -350,13 +350,18 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 
 	// On attempt end, interrupt the send goroutine that may be blocked in localConn.Read,
 	// so the old sendLoop and the next attempt's sendLoop never read the same conn concurrently
-	// (see resumeSendLoop's done parameter).
+	// (see resumeSendLoop's done parameter). Once-guarded: endAttempt also runs from the
+	// recv-side teardown below, and a second close(done) would panic.
 	done := make(chan struct{})
-	defer func() {
-		close(done)
-		// make a blocked Read return immediately: this attempt's sendLoop exits on it.
-		_ = localConn.SetReadDeadline(time.Now())
-	}()
+	var doneOnce sync.Once
+	endAttempt := func() {
+		doneOnce.Do(func() {
+			close(done)
+			// make a blocked Read return immediately: this attempt's sendLoop exits on it.
+			_ = localConn.SetReadDeadline(time.Now())
+		})
+	}
+	defer endAttempt()
 	// clear any stale read deadline left by the previous round, back to "wait forever".
 	_ = localConn.SetReadDeadline(time.Time{})
 
@@ -439,6 +444,7 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var sendErr, recvErr error
+	recvDone := make(chan struct{})
 
 	go func() {
 		defer wg.Done()
@@ -447,7 +453,22 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	}()
 	go func() {
 		defer wg.Done()
+		defer close(recvDone)
 		recvErr = resumeRecvLoop(resp.Body, localConn, clientDownlink, cfg.lg(), cfg.stats)
+	}()
+	// A normal recv end is the peer's END frame. The send loop may still be parked
+	// reading an application conn nobody closes (a read-only tunnel, or an app
+	// blocked in Read), so wg.Wait would never return, the engine would never exit,
+	// and the tunnel would stay in the active set for the life of the client.
+	// Interrupt it, and close pw as a backstop in case it is parked writing into a
+	// back-pressured stream. A recv error means the stream broke: the send loop's
+	// own write then fails, which is the redial signal, so leave it to run out.
+	go func() {
+		<-recvDone
+		if recvErr == nil {
+			endAttempt()
+			_ = pw.Close()
+		}
 	}()
 
 	wg.Wait()

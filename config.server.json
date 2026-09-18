@@ -10,6 +10,8 @@
   "key": "",
   "local_only": true,
   "session_window_kb": 256,
+  "session_max": 4096,
+  "session_max_per_principal": 256,
   "drain_timeout_sec": 30,
   "padding": {
     "min_record_bytes": 600,

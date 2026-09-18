@@ -135,6 +135,8 @@ func main() {
         Authenticator: auth,
         Dialer:        dialer,
         Tuning: h2tunnel.ServerTuning{
+            SessionMax:             4096,
+            SessionMaxPerPrincipal: 256,
             Padding: h2tunnel.PaddingTuning{
                 MinRecordBytes: 600,
                 MaxRecordBytes: 1200,
@@ -152,6 +154,11 @@ func main() {
 ```
 
 `TransportH2` is allowed here instead of `TransportH2C` because client-to-CDN uses H2; even if CDN-to-origin degrades to HTTP/1.1, it still belongs to the H2 POST-stream transport family. The origin must listen only on a trusted network or the loopback address.
+
+Server-side resource bounds (`ServerTuning`, 0 = built-in default):
+
+- `SessionMax` / `SessionMaxPerPrincipal` — cap on concurrent resume sessions, in total and per principal. A flood of distinct never-resumed session ids would otherwise grow the session table without limit; values above the hard cap are clamped rather than rejected.
+- Fixed, untunable: `X-Session-ID` must be 1-128 bytes (checked before any target dial), the HTTP/2 server advertises at most 256 concurrent streams, a WebTransport session serves at most 256 concurrent streams, and shared profiles decompress to at most 8 MiB.
 
 ### 2. Create a client and dial a logical service
 
@@ -463,6 +470,8 @@ The heartbeat interval must be smaller than the shortest idle timeout on the pat
   "key": "/usr/local/etc/h2tunnel/server.key",
   "local_only": true,
   "session_window_kb": 256,
+  "session_max": 4096,
+  "session_max_per_principal": 256,
   "drain_timeout_sec": 30,
   "padding": {
     "min_record_bytes": 600,
@@ -559,13 +568,15 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `brutal.negotiate` | shared | `true` | when `false`, skip the bandwidth exchange and apply this side's own values only |
 | `heartbeat_sec` | client | `25` | CDN bidirectional heartbeat; negative disables it |
 | `session_window_kb` | shared | `256` | bounded ring window per resumable session |
+| `session_max` | server | `4096` | cap on concurrent resume sessions. Bounds memory under a flood of distinct (never-resumed) session ids. `0` selects the built-in default; values above the hard cap are clamped, not rejected |
+| `session_max_per_principal` | server | `256` | per-principal session cap, so one principal cannot consume the whole table. `0` selects the built-in default |
 | `handshake_ack_ms` | client | `3000` | data-plane handshake ack timeout |
 | `keepalive_sec` | client | `15` | session/backup-line keepalive interval |
 | `standby_connections` | client | `0` | number of hot standby connections |
 | `drain_timeout_sec` | shared | `30` | seconds to wait for existing sessions at exit |
 | `log_level` | shared | `info` | `debug`, `info`, `warn`, `error` |
 
-Every field can be overridden by an uppercased env var of the same name, e.g. `H2TUNNEL_SERVER`, `H2TUNNEL_TRANSPORT`, `H2TUNNEL_STANDBY_CONNECTIONS`, `H2TUNNEL_UTLS`, `H2TUNNEL_MASQUE_ALPN`, `H2TUNNEL_PADDING_MIN_RECORD_BYTES`, `H2TUNNEL_PADDING_MAX_RECORD_BYTES`, `H2TUNNEL_PPROF`, `H2TUNNEL_BRUTAL_ENABLED`, `H2TUNNEL_BRUTAL_RATE_BYTES`, `H2TUNNEL_BRUTAL_CWND_GAIN`, `H2TUNNEL_BRUTAL_GROUP_ID`, `H2TUNNEL_BRUTAL_NEGOTIATE`. Malformed boolean or integer env values also fail at startup.
+Every field can be overridden by an uppercased env var of the same name, e.g. `H2TUNNEL_SERVER`, `H2TUNNEL_TRANSPORT`, `H2TUNNEL_STANDBY_CONNECTIONS`, `H2TUNNEL_UTLS`, `H2TUNNEL_MASQUE_ALPN`, `H2TUNNEL_PADDING_MIN_RECORD_BYTES`, `H2TUNNEL_PADDING_MAX_RECORD_BYTES`, `H2TUNNEL_PPROF`, `H2TUNNEL_BRUTAL_ENABLED`, `H2TUNNEL_BRUTAL_RATE_BYTES`, `H2TUNNEL_BRUTAL_CWND_GAIN`, `H2TUNNEL_BRUTAL_GROUP_ID`, `H2TUNNEL_BRUTAL_NEGOTIATE`, `H2TUNNEL_SESSION_MAX`, `H2TUNNEL_SESSION_MAX_PER_PRINCIPAL`. Malformed boolean or integer env values also fail at startup.
 
 ### MASQUE dual carriers (h3 / h2)
 
@@ -587,9 +598,11 @@ The scope is the tunnel leg itself (client↔server) and the server's accepted c
 
 If the inline exchange ever needs to be separated, dial the sentinel target `_BrutalBwExchange`: it is recognized before any target substitution, never dials an origin, never opens a session, and answers with the negotiation headers plus an END frame.
 
-**Connection groups.** Kernel-side rate limiting is per connection group: every socket with the same non-zero `group_id` (same user, same netns) shares `rate_bytes` as a *total*, so adding more links cannot multiply the allowance. The id is derived as `u64le(HMAC-SHA256(token, seed)[:8]) | 1` on both sides, independently — the shared token is the key and the seed is what differs per client. The seed is `X-Client-Group`, a random 128-bit value generated once per client instance, so it survives connection migration (the remote IP changes, the id does not), falling back to `X-Session-ID` for older clients. `brutal.group_id` overrides the derivation to merge several distinct clients into one bucket on purpose.
+**Connection groups.** Kernel-side rate limiting is per connection group: every socket with the same non-zero `group_id` (same user, same netns) shares `rate_bytes` as a *total*, so adding more links cannot multiply the allowance. The id is derived as `u64le(HMAC-SHA256(token, seed)[:8]) | 1` on both sides, independently — the shared token is the key and the seed is what differs per client. The seed is `X-Client-Group`, a random 128-bit value generated once per client instance, so it survives connection migration (the remote IP changes, the id does not), falling back to `X-Session-ID` for older clients. `brutal.group_id` overrides the derivation to merge several distinct clients into one bucket on purpose. The server reads the token it derives from out of `X-Auth-Token` or `Authorization: Bearer` — the same sources the built-in token authenticator accepts — so a custom `Authenticator` that reads the token from another header still authenticates the request but produces no group id (the connection runs ungrouped).
 
-Two honest limitations: the negotiation result reaches the *next* dial rather than the socket carrying the reply, so the very first leg of a process runs at the client's own declared rate (negotiation only ever lowers the value, so it converges); and the server's own socket is configured per accepted connection from the static policy, because net/http exposes a connection only at accept time — the per-client group lives on the client's socket.
+The server configures each accepted socket **after** authentication, using the group derived from that connection's token and seed — so an unauthenticated peer never receives the configured rate and never learns a derived group id, and per-client grouping is available on both sides. It is applied once per connection, not once per request.
+
+Two honest limitations: the negotiation result reaches the *next* dial rather than the socket carrying the reply, so the very first leg of a process runs at the client's own declared rate (negotiation only ever lowers the value, so it converges); and the client's rate declaration also caps the **server's downlink** to that client, because `rate` is a single per-socket send budget shared by both directions of the merge — a client that declares a small rate throttles itself.
 
 ### Multi-protocol server
 

@@ -224,14 +224,21 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 	}
 
 	// TCP Brutal bandwidth exchange, piggybacked on the tunnel handshake so no
-	// extra connection is opened. It runs after authentication, so an
-	// unauthenticated request never learns a derived group id, and before the
-	// routing policy checks, so the answer rides whatever response follows. Both
-	// sides derive the group id independently, so this is a cross-check for the
-	// client rather than something it depends on; the server's own socket was
-	// already enabled at accept time (server_api.go).
-	if reply := brutalReply(cfg.Brutal, r); reply != "" {
-		w.Header().Set(brutalHeaderParams, reply)
+	// extra connection is opened. It runs after authentication: the accepted
+	// socket is configured with this client's own group only once the token is
+	// known, so an unauthenticated peer never receives the configured rate and
+	// never learns a derived group id. Both sides derive the group id
+	// independently, so the echoed value is a cross-check for the client rather
+	// than something it depends on. The apply goes to the socket attached to the
+	// request context by ConnContext (server_api.go) and happens once per
+	// connection, not once per request.
+	if cfg.Brutal.enabled {
+		eff, sentNonce := resolveBrutalExchange(cfg.Brutal, r)
+		dec := decideBrutal(eff)
+		applyBrutalOnce(cfg.brutalSockets, brutalConnFromRequest(r), dec, cfg.lg())
+		if cfg.Brutal.negotiate && sentNonce != "" {
+			w.Header().Set(brutalHeaderParams, formatBrutalReply(dec, sentNonce))
+		}
 	}
 
 	policy := cfg.effectiveRoutingPolicy()
@@ -254,7 +261,10 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 	}
 	if err := checkStrictTransportPolicy(r, policy, cfg.Transport, tr.transport); err != nil {
 		lgWarnf(cfg.lg(), "[%s] 🚫 strict routing policy block: %v (IP: %s)", sessionID, err, clientPhysicalAddr)
-		http.Error(w, err.Error(), http.StatusForbidden)
+		// The client gets a generic 403: err.Error() names the configured
+		// allow-list, which is an enumeration oracle for what transports the
+		// server runs. The detail stays in the server log.
+		http.Error(w, "transport forbidden by server policy", http.StatusForbidden)
 		return
 	}
 

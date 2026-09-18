@@ -47,6 +47,10 @@ type config struct {
 	// MasqueALPN selects the MASQUE carrier: ""=auto (h3 first, pin h2 on
 	// failure), "h2", "h3".
 	MasqueALPN string `json:"masque_alpn"`
+	// SessionMax caps concurrent resume sessions on the server (0 = default
+	// 4096). SessionMaxPerPrincipal is the per-principal cap (0 = default 256).
+	SessionMax             int `json:"session_max"`
+	SessionMaxPerPrincipal int `json:"session_max_per_principal"`
 	// Brutal requests TCP Brutal on the tunnel's TCP legs (Linux only; the
 	// non-Linux builds are a silent no-op).
 	Brutal brutalConfig `json:"brutal"`
@@ -177,6 +181,9 @@ func (cfg *config) validate() error {
 	if cfg.DrainTimeoutSec < 0 || cfg.SessionWindowKB < 0 || cfg.HandshakeAckMS < 0 || cfg.KeepaliveSec < 0 || cfg.StandbyCount < 0 {
 		return errors.New("duration, window, and standby fields must be non-negative")
 	}
+	if cfg.SessionMax < 0 || cfg.SessionMaxPerPrincipal < 0 {
+		return errors.New("session_max and session_max_per_principal must be non-negative (0 selects the built-in default)")
+	}
 	if err := cfg.Padding.validate(); err != nil {
 		return err
 	}
@@ -216,7 +223,7 @@ func (cfg *config) validate() error {
 		if cfg.Network == "" {
 			cfg.Network = "tcp"
 		}
-		if cfg.TLS || cfg.Cert != "" || cfg.Key != "" || cfg.LocalOnly || cfg.Pprof != "" {
+		if cfg.TLS || cfg.Cert != "" || cfg.Key != "" || cfg.LocalOnly || cfg.Pprof != "" || cfg.SessionMax != 0 || cfg.SessionMaxPerPrincipal != 0 {
 			return errors.New("client config contains server-only fields")
 		}
 		endpoint, err := url.Parse(cfg.Server)
@@ -317,14 +324,16 @@ func applyEnvironment(cfg *config) error {
 		cfg.Brutal.Negotiate = &parsed
 	}
 	ints := map[string]*int{
-		"H2TUNNEL_HEARTBEAT_SEC":            &cfg.HeartbeatSec,
-		"H2TUNNEL_DRAIN_TIMEOUT_SEC":        &cfg.DrainTimeoutSec,
-		"H2TUNNEL_SESSION_WINDOW_KB":        &cfg.SessionWindowKB,
-		"H2TUNNEL_HANDSHAKE_ACK_MS":         &cfg.HandshakeAckMS,
-		"H2TUNNEL_KEEPALIVE_SEC":            &cfg.KeepaliveSec,
-		"H2TUNNEL_STANDBY_CONNECTIONS":      &cfg.StandbyCount,
-		"H2TUNNEL_PADDING_MIN_RECORD_BYTES": &cfg.Padding.MinRecordBytes,
-		"H2TUNNEL_PADDING_MAX_RECORD_BYTES": &cfg.Padding.MaxRecordBytes,
+		"H2TUNNEL_HEARTBEAT_SEC":             &cfg.HeartbeatSec,
+		"H2TUNNEL_DRAIN_TIMEOUT_SEC":         &cfg.DrainTimeoutSec,
+		"H2TUNNEL_SESSION_WINDOW_KB":         &cfg.SessionWindowKB,
+		"H2TUNNEL_HANDSHAKE_ACK_MS":          &cfg.HandshakeAckMS,
+		"H2TUNNEL_KEEPALIVE_SEC":             &cfg.KeepaliveSec,
+		"H2TUNNEL_STANDBY_CONNECTIONS":       &cfg.StandbyCount,
+		"H2TUNNEL_PADDING_MIN_RECORD_BYTES":  &cfg.Padding.MinRecordBytes,
+		"H2TUNNEL_PADDING_MAX_RECORD_BYTES":  &cfg.Padding.MaxRecordBytes,
+		"H2TUNNEL_SESSION_MAX":               &cfg.SessionMax,
+		"H2TUNNEL_SESSION_MAX_PER_PRINCIPAL": &cfg.SessionMaxPerPrincipal,
 	}
 	for key, destination := range ints {
 		if value, ok := os.LookupEnv(key); ok {

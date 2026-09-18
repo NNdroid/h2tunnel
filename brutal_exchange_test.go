@@ -310,3 +310,58 @@ func TestBrutalReplyIsNotSentBeforeAuthentication(t *testing.T) {
 		t.Fatalf("the reply carries no group id: %q", reply)
 	}
 }
+
+// The server applies the per-client group to the accepted socket, which needs the
+// socket handle to survive from ConnContext through the whole production handler
+// chain into routeTunnelRequest. This pins that down end to end: if the value
+// stops reaching the tunnel path, the server silently reverts to never
+// configuring its socket and only this test notices.
+func TestAcceptedSocketReachesTheTunnelPath(t *testing.T) {
+	var caught atomic.Pointer[net.Conn]
+	tlsConfig, err := SelfSignedTLSConfig("localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerOptions{
+		Path:       "/tunnel",
+		Transports: []Transport{TransportH2},
+		Networks:   []Network{NetworkTCP},
+		TLSConfig:  tlsConfig,
+		Authenticator: func(_ context.Context, r *http.Request) (Principal, error) {
+			if c := brutalConnFromRequest(r); c != nil {
+				caught.Store(&c)
+			}
+			return Principal{ID: "authenticated"}, nil
+		},
+		Dialer: TargetDialer(func(context.Context, DialRequest) (net.Conn, error) {
+			return nil, errors.New("h2tunnel: no upstream in this test")
+		}),
+		Tuning: ServerTuning{Brutal: BrutalTuning{Enabled: true, RateBytes: 1, CwndGain: 15, Negotiate: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = server.Serve(Listeners{TCP: ln}) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	client := newBrutalExchangeClient(t, "https://"+ln.Addr().String(), ClientTuning{
+		Brutal: BrutalTuning{Enabled: true, RateBytes: 1, CwndGain: 15, Negotiate: true},
+	})
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	if _, err := client.NegotiateBrutal(ctx); err != nil {
+		t.Fatalf("NegotiateBrutal: %v", err)
+	}
+	if caught.Load() == nil {
+		t.Fatal("the accepted socket never reached the tunnel handler, so the per-client group is not applied")
+	}
+}
