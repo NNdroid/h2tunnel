@@ -187,6 +187,7 @@ func serverOptionsFromConfig(cfg serverConfig) (ServerOptions, error) {
 		Tuning: ServerTuning{
 			SessionWindowBytes: cfg.SessionWindow * 1024,
 			Padding:            cfg.Padding.tuning(),
+			Brutal:             cfg.Brutal.tuning(),
 		},
 	}, nil
 }
@@ -222,6 +223,17 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 		return
 	}
 
+	// TCP Brutal bandwidth exchange, piggybacked on the tunnel handshake so no
+	// extra connection is opened. It runs after authentication, so an
+	// unauthenticated request never learns a derived group id, and before the
+	// routing policy checks, so the answer rides whatever response follows. Both
+	// sides derive the group id independently, so this is a cross-check for the
+	// client rather than something it depends on; the server's own socket was
+	// already enabled at accept time (server_api.go).
+	if reply := brutalReply(cfg.Brutal, r); reply != "" {
+		w.Header().Set(brutalHeaderParams, reply)
+	}
+
 	policy := cfg.effectiveRoutingPolicy()
 	if !policy.allowsNetwork(tr.network) {
 		lgWarnf(cfg.lg(), "[%s] 🚫 strict routing policy block: server restricts Network='%s', rejecting %s request (IP: %s)", sessionID, cfg.Network, strings.ToUpper(tr.network), clientPhysicalAddr)
@@ -247,6 +259,9 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 	}
 
 	switch tr.kind {
+	case kindBrutalExchange:
+		lgDebugf(cfg.lg(), "[%s] -> Brutal bandwidth exchange (no dial)", sessionID)
+		handleBrutalExchangeServer(w, r, sessionID, cfg, sessions)
 	case kindWebTransport:
 		lgDebugf(cfg.lg(), "[%s] -> WebTransport", sessionID)
 		handleWebTransportServer(w, r, sessionID, cfg, wtServer, sessions)

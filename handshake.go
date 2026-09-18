@@ -19,7 +19,13 @@ const (
 	capDatagram   = "datagram"    // UDP datagram mode
 	capCompress   = "compress"    // compression
 	capBackupLine = "backup-line" // backup lane
-	capReplay     = "replay"      // minimal baseline capability set (byte stream + seq replay)
+	// capBrutal declares that the client understands the X-Brutal-Offer /
+	// X-Brutal-Params exchange, so the server can safely answer it. It rides the
+	// existing v2 capability list (parseCaps ignores unknown items), which keeps
+	// older peers forward-compatible: an old server drops the offer, an old
+	// client drops the reply, and nobody bumps a protocol version.
+	capBrutal = "brutal"
+	capReplay = "replay" // minimal baseline capability set (byte stream + seq replay)
 
 	// Parameter keys
 	paramWindowKB       = "window_kb"

@@ -129,6 +129,8 @@ type fileConfig struct {
 	// lives in cmd/h2tunnel and rejects legacy fields such as backup_count.
 	StandbyCount *int          `json:"standby_connections"`
 	Padding      PaddingTuning `json:"padding"`
+	// Brutal requests TCP Brutal on the TCP legs (Linux only, best effort).
+	Brutal BrutalTuning `json:"brutal"`
 	// PrimaryDialIntervalSec is the primary dial interval (s); default 30s (throttles redial storms).
 	PrimaryDialIntervalSec int `json:"primary_dial_interval_sec"`
 	// BackupDialIntervalSec is the backup dial interval (s); default 15s (throttles redial storms).
@@ -174,6 +176,28 @@ func applyEnvOverrides(cfg *fileConfig) error {
 		*dst = parsed
 		return nil
 	}
+	setUint := func(key string, dst any) error {
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			return nil
+		}
+		parsed, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s must be a non-negative integer: %w", key, err)
+		}
+		switch d := dst.(type) {
+		case *uint64:
+			*d = parsed
+		case *uint32:
+			if parsed > uint64(^uint32(0)) {
+				return fmt.Errorf("%s overflows uint32", key)
+			}
+			*d = uint32(parsed)
+		default:
+			return fmt.Errorf("%s: unsupported target type", key)
+		}
+		return nil
+	}
 
 	setString("H2TUNNEL_MODE", &cfg.Mode)
 	setString("H2TUNNEL_LISTEN", &cfg.Listen)
@@ -196,6 +220,8 @@ func applyEnvOverrides(cfg *fileConfig) error {
 		{"H2TUNNEL_TLS", &cfg.TLS},
 		{"H2TUNNEL_INSECURE", &cfg.Insecure},
 		{"H2TUNNEL_LOCAL_ONLY", &cfg.LocalOnly},
+		{"H2TUNNEL_BRUTAL_ENABLED", &cfg.Brutal.Enabled},
+		{"H2TUNNEL_BRUTAL_NEGOTIATE", &cfg.Brutal.Negotiate},
 	} {
 		if err := setBool(field.key, field.dst); err != nil {
 			return err
@@ -221,6 +247,18 @@ func applyEnvOverrides(cfg *fileConfig) error {
 		{"H2TUNNEL_SESSION_MAX_PER_PRINCIPAL", &cfg.SessionMaxPerPrincipal},
 	} {
 		if err := setInt(field.key, field.dst); err != nil {
+			return err
+		}
+	}
+	for _, field := range []struct {
+		key string
+		dst any
+	}{
+		{"H2TUNNEL_BRUTAL_RATE_BYTES", &cfg.Brutal.RateBytes},
+		{"H2TUNNEL_BRUTAL_CWND_GAIN", &cfg.Brutal.CwndGain},
+		{"H2TUNNEL_BRUTAL_GROUP_ID", &cfg.Brutal.GroupID},
+	} {
+		if err := setUint(field.key, field.dst); err != nil {
 			return err
 		}
 	}
@@ -267,6 +305,9 @@ func validateConfig(cfg *fileConfig) error {
 		return fmt.Errorf("session_window_kb must be 0 or between 1 and %d", maxWindowKB)
 	}
 	if _, err := compilePaddingPolicy(cfg.Padding); err != nil {
+		return err
+	}
+	if _, err := compileBrutalPolicy(cfg.Brutal); err != nil {
 		return err
 	}
 
@@ -358,6 +399,8 @@ type serverConfig struct {
 	SessionWindow int `json:"-"`
 	// Padding is the validated server-to-client record-shaping policy.
 	Padding paddingPolicy `json:"-"`
+	// Brutal is the validated TCP Brutal policy (brutal_linux.go applies it).
+	Brutal brutalPolicy `json:"-"`
 
 	// DialTarget is a custom upstream dial function (for library embedding). When
 	// nil, the default net.Dialer{Timeout: 10s} dials the target directly. External
@@ -433,6 +476,16 @@ type clientConfig struct {
 	// MasqueALPN is the MASQUE carrier (""/h2/h3, see ClientTuning.MasqueALPN);
 	// NewClient already lower-cases and trims it.
 	MasqueALPN string `json:"-"`
+	// Brutal is the validated TCP Brutal policy for the tunnel's TCP legs.
+	Brutal brutalPolicy `json:"-"`
+	// clientGroup is this Client instance's stable grouping seed, sent as
+	// X-Client-Group. Generated once in NewClient so every lane of one client
+	// falls in the same Brutal connection group, and stable across TCP-leg
+	// migration (it is not the remote IP).
+	clientGroup string `json:"-"`
+	// brutalPeer caches the server's last X-Brutal-Params answer (see
+	// handleBrutalReply). A pointer so copying clientConfig shares the cache.
+	brutalPeer *brutalPeerCache `json:"-"`
 }
 
 func (c *clientConfig) IsUDP() bool {
@@ -559,6 +612,10 @@ func buildServerConfigChecked(cfg *fileConfig) (serverConfig, error) {
 	if err != nil {
 		return serverConfig{}, err
 	}
+	brutal, err := compileBrutalPolicy(cfg.Brutal)
+	if err != nil {
+		return serverConfig{}, err
+	}
 	listen := cfg.Listen
 	if listen == "" {
 		listen = ":8443"
@@ -590,6 +647,7 @@ func buildServerConfigChecked(cfg *fileConfig) (serverConfig, error) {
 		DrainTimeout:           resolveDrainTimeout(cfg.DrainTimeoutSec),
 		SessionWindow:          resolveSessionWindow(cfg.SessionWindowKB),
 		Padding:                padding,
+		Brutal:                 brutal,
 		SessionMax:             resolveSessionMax(cfg.SessionMax),
 		SessionMaxPerPrincipal: resolveSessionMaxPerPrincipal(cfg.SessionMaxPerPrincipal),
 	}, nil
@@ -607,6 +665,10 @@ func buildServerConfig(cfg *fileConfig) serverConfig {
 // defaults and the connection policy).
 func buildClientConfigChecked(cfg *fileConfig) (clientConfig, error) {
 	padding, err := compilePaddingPolicy(cfg.Padding)
+	if err != nil {
+		return clientConfig{}, err
+	}
+	brutal, err := compileBrutalPolicy(cfg.Brutal)
 	if err != nil {
 		return clientConfig{}, err
 	}
@@ -673,6 +735,7 @@ func buildClientConfigChecked(cfg *fileConfig) (clientConfig, error) {
 		HandshakeAckMs:    resolveHandshakeAckMs(cfg.HandshakeAckMs),
 		KeepaliveSec:      resolveKeepaliveSec(cfg.KeepaliveSec),
 		Padding:           padding,
+		Brutal:            brutal,
 		connectionPolicy:  policy,
 	}, nil
 }

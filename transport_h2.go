@@ -26,6 +26,45 @@ import (
 //  6. primary lane: replay the downlink gap → enter the frame loop reading uplink
 //
 // =========================================
+// handleBrutalExchangeServer answers a _BrutalBwExchange request: it negotiates
+// and returns the decision, without dialing a target or creating a session.
+//
+// It still completes the resume/2 handshake (layer A ack + layer B
+// HANDSHAKE<->HANDSHAKE-ACK) so the client can drive it through the same
+// executor as a business tunnel — the sentinel is then just a tunnel whose
+// server side never dials. X-Brutal-Params was already written before dispatch
+// (routeTunnelRequest), after authentication.
+func handleBrutalExchangeServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg serverConfig, sessions *sessionTable) {
+	if !cfg.Brutal.enabled {
+		lgWarnf(sessions.lg(), "[%s] 🚫 Brutal bandwidth exchange requested but brutal is disabled", sessionID)
+		http.Error(w, "brutal bandwidth exchange disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Header.Get("X-Tunnel-Proto") != resumeFrameTypeResume {
+		w.Header().Set("X-Resume-Error", resumeErrVersionUnsupported.String())
+		http.Error(w, "resume/2 required", http.StatusUpgradeRequired)
+		return
+	}
+
+	flusher, _ := w.(http.Flusher)
+	writer := &resumeSessionWriter{w: w, flusher: flusher, padding: cfg.Padding}
+	defer writer.close()
+
+	w.Header().Set("X-Resume-Version", "2")
+	w.Header().Set("X-Resume-Ack", "ok")
+	w.WriteHeader(http.StatusOK)
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	// Complete layer B so the client's executor is satisfied, then close: there
+	// is no target to dial and no session to keep alive.
+	if !doServerHandshakeAck(r.Body, writer, defaultHandshakeAckMs, sessionID, sessions.lg()) {
+		return
+	}
+	_ = writer.writeEnd()
+}
+
 func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionID string, tr tunnelRequest, cfg serverConfig, sessions *sessionTable) {
 	// Version is a hard constraint: non resume/2 is rejected outright, no fallback (v1 removed).
 	if r.Header.Get("X-Tunnel-Proto") != resumeFrameTypeResume {

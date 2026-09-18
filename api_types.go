@@ -43,6 +43,11 @@ var (
 	ErrForbidden            = errors.New("h2tunnel: target forbidden")
 	ErrUnsupportedNetwork   = errors.New("h2tunnel: unsupported network")
 	ErrUnsupportedTransport = errors.New("h2tunnel: unsupported transport")
+	// ErrBrutalUnavailable means the TCP Brutal socket layer cannot apply here —
+	// a non-Linux host, a kernel without the module, or a socket that is not a
+	// TCP connection. A failed Brutal apply never fails a connection, so this only
+	// ever shows up in logs.
+	ErrBrutalUnavailable = errors.New("h2tunnel: TCP Brutal unavailable")
 )
 
 // CredentialProvider adds authentication data to one outgoing tunnel request.
@@ -187,6 +192,11 @@ type ClientTuning struct {
 	// (h3 first, automatically pinned to h2 if the h3 dial fails). On UDP-blocked
 	// deployments, explicitly setting "h2" skips the first-connection QUIC handshake timeout.
 	MasqueALPN string
+	// Brutal requests TCP Brutal on the tunnel's TCP legs (h2, h2c, grpc and the
+	// masque h2 carrier). UDP/QUIC legs are unaffected. It is a Linux-only,
+	// best-effort optimization: on any other platform, or on a kernel without the
+	// module, it degrades to a WARN and the connection proceeds unchanged.
+	Brutal BrutalTuning
 }
 
 // ServerOptions configures an embeddable tunnel server. Authenticator and
@@ -226,6 +236,36 @@ type ServerTuning struct {
 	// Padding controls server-to-client application-layer tunnel records.
 	// Configure both client and server to shape both traffic directions.
 	Padding PaddingTuning
+	// Brutal requests TCP Brutal on the connections the server accepts. Together
+	// with ClientTuning.Brutal it turns a deployment's upload path into a shared
+	// connection group, so a client's aggregate send rate is capped regardless of
+	// how many connections it opens. Linux-only and best-effort, same as the
+	// client side.
+	Brutal BrutalTuning
+}
+
+// BrutalTuning requests TCP Brutal, a Linux TCP congestion controller driven by
+// an explicit send rate. Zero values are safe: the feature is off.
+type BrutalTuning struct {
+	// Enabled turns the feature on. When false nothing is set on any socket and
+	// no negotiation headers are sent.
+	Enabled bool `json:"enabled"`
+	// RateBytes is this side's declared send rate in bytes per second. 0 means
+	// "no local preference": the peer's value is used instead. The negotiated
+	// result is min(server, client).
+	RateBytes uint64 `json:"rate_bytes"`
+	// CwndGain is the congestion-window gain in tenths, so 15 = 1.5x and 20 = 2.0x.
+	// The kernel cannot hold a float, hence the scaling. 0 selects the 1.5x
+	// default; 1-1000 is accepted. 1.5x-2.0x is the recommended range.
+	CwndGain uint32 `json:"cwnd_gain"`
+	// GroupID is a static override. 0 derives it from the presented token and the
+	// client's stable group seed, which is what a shared-token deployment needs.
+	// A non-zero value pins the given group and is how several clients are put in
+	// one shared rate bucket.
+	GroupID uint64 `json:"group_id"`
+	// Negotiate runs the in-band bandwidth exchange. false skips it and applies
+	// this side's local values as-is.
+	Negotiate bool `json:"negotiate"`
 }
 
 // PaddingTuning controls application-layer record shaping. When enabled, each

@@ -272,6 +272,10 @@ func buildResumeRequestChecked(ctx context.Context, body io.Reader, sessID strin
 	}
 	setXDst(req.Header, cfg)
 	setTunnelRequestHeaders(req.Header)
+	// TCP Brutal exchange (piggybacked, no extra connection): the offer carries
+	// this leg's local rate/gain plus a fresh nonce, and X-Client-Group carries
+	// the stable per-client seed the server derives the group id from.
+	setBrutalOfferHeaders(req.Header, cfg.Brutal, cfg.clientGroup)
 
 	if cfg.usesMasque() {
 		req.Header.Set("Protocol", protocolConnectTCP)
@@ -403,6 +407,10 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 		lgDebugf(cfg.lg(), "[Resume] 🔧 server-aligned params: window_kb=%d handshake_ack=%dms keepalive=%ds",
 			aligned.windowKB, aligned.handshakeAckMs, aligned.keepaliveSec)
 	}
+	// TCP Brutal bandwidth exchange (piggybacked on this handshake): verify the
+	// echoed nonce and cache the negotiated decision for the next dial. A new
+	// leg re-offers on its first request, so a migrated TCP leg re-negotiates.
+	handleBrutalReply(req, resp.Header.Get(brutalHeaderParams), cfg.brutalPeer, cfg.lg())
 	lgInfof(cfg.lg(), "[Resume] ✅ tunnel resume ready (serverUplink=%d)", *serverUplink)
 
 	// ===== layer-B handshake: send HANDSHAKE first, wait HANDSHAKE-ACK, zero business bytes before ack =====

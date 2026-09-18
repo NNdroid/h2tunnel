@@ -304,6 +304,9 @@ const (
 	kindMasqueTCP
 	kindMasqueUDP
 	kindResume // the POST resume/2 data plane (h2/h2c/grpc/h3 sub-classified by the transport label)
+	// kindBrutalExchange is the _BrutalBwExchange sentinel: answer the bandwidth
+	// exchange and send nothing else. It never dials and never creates a session.
+	kindBrutalExchange
 )
 
 // tunnelRequest is the classification result: kind, carrier label, network and
@@ -317,6 +320,13 @@ type tunnelRequest struct {
 }
 
 func classifyTunnelRequest(r *http.Request, cfg serverConfig, wtAvailable bool) tunnelRequest {
+	// The bandwidth-exchange sentinel is matched on the raw header before
+	// getRequestDestination runs: an underscore-leading label is not a valid DNS
+	// name, and the destination resolver's fallback would otherwise substitute a
+	// real address (127.0.0.1:22) for it, turning a no-dial request into a dial.
+	if target := rawTunnelTarget(r); target == brutalBwExchangeTarget {
+		return tunnelRequest{kind: kindBrutalExchange, transport: resumeWireTransport(r), network: networkTCP, target: target}
+	}
 	network, target := getRequestDestination(r, cfg)
 	if r.Method == http.MethodConnect {
 		switch {
@@ -340,6 +350,14 @@ func classifyTunnelRequest(r *http.Request, cfg serverConfig, wtAvailable bool) 
 		return tunnelRequest{kind: kindResume, transport: resumeWireTransport(r), network: network, target: target}
 	}
 	return tunnelRequest{}
+}
+
+// rawTunnelTarget returns the target exactly as the client sent it, without the
+// fallback that rewrites an empty or malformed value to a default upstream. The
+// bandwidth-exchange sentinel is looked up here because it would otherwise be
+// rewritten before the classifier saw it.
+func rawTunnelTarget(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-Target"))
 }
 
 // masqueRequestTarget resolves the MASQUE target: X-Target (logical service name)

@@ -65,6 +65,11 @@ func RunGenSystemd(args []string) {
     "min_record_bytes": 600,
     "max_record_bytes": 1200
   },
+  "brutal": {
+    "enabled": false,
+    "rate_bytes": 0,
+    "cwnd_gain": 15
+  },
   "log_level": "info"
 }`, *listen, *path, *token, transport)
 

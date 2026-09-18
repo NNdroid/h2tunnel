@@ -45,15 +45,12 @@ type tlsCamouflage struct {
 }
 
 // utlsDialTLSContext produces the http2.Transport DialTLSContext: raw TCP via
-// rawDial (net.Dialer when nil, honoring the cfg.Dialer custom socket), then a
-// utls handshake with the chosen browser fingerprint.
-func (c *Client) utlsDialTLSContext(rawDial func(ctx context.Context, network, address string) (net.Conn, error)) func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-	if rawDial == nil {
-		var d net.Dialer
-		rawDial = d.DialContext
-	}
+// dialTCP (net.Dialer when cfg.Dialer is nil, honoring the custom socket and
+// enabling TCP Brutal on it before wrapping), then a utls handshake with the
+// chosen browser fingerprint.
+func (c *Client) utlsDialTLSContext() func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-		raw, err := rawDial(ctx, network, addr)
+		raw, err := c.dialTCP(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}

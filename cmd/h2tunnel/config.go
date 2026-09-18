@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	h2tunnel "github.com/NNdroid/h2tunnel"
 )
 
 type config struct {
@@ -45,11 +47,58 @@ type config struct {
 	// MasqueALPN selects the MASQUE carrier: ""=auto (h3 first, pin h2 on
 	// failure), "h2", "h3".
 	MasqueALPN string `json:"masque_alpn"`
+	// Brutal requests TCP Brutal on the tunnel's TCP legs (Linux only; the
+	// non-Linux builds are a silent no-op).
+	Brutal brutalConfig `json:"brutal"`
 }
 
 type paddingConfig struct {
 	MinRecordBytes int `json:"min_record_bytes"`
 	MaxRecordBytes int `json:"max_record_bytes"`
+}
+
+// brutalConfig is the config.json form of h2tunnel.BrutalTuning. Negotiate is a
+// pointer so that omitting it means the documented default (true) rather than
+// accidentally turning the exchange off.
+type brutalConfig struct {
+	Enabled   bool   `json:"enabled"`
+	RateBytes uint64 `json:"rate_bytes"`
+	CwndGain  uint32 `json:"cwnd_gain"`
+	GroupID   uint64 `json:"group_id"`
+	Negotiate *bool  `json:"negotiate"`
+}
+
+// tuning converts to the library's exported form, applying the negotiate
+// default when the key was omitted.
+func (b brutalConfig) tuning() h2tunnel.BrutalTuning {
+	negotiate := true
+	if b.Negotiate != nil {
+		negotiate = *b.Negotiate
+	}
+	return h2tunnel.BrutalTuning{
+		Enabled:   b.Enabled,
+		RateBytes: b.RateBytes,
+		CwndGain:  b.CwndGain,
+		GroupID:   b.GroupID,
+		Negotiate: negotiate,
+	}
+}
+
+// brutalCwndGainMax mirrors brutalMaxCwndGain in the library. The library
+// re-checks at NewClient/NewServer and fails loudly either way, so a drift here
+// only weakens this early, config-load-time message.
+const brutalCwndGainMax = 1000
+
+// validate applies the same range rule the library enforces, so a bad value is
+// reported at config load instead of at NewClient/NewServer.
+func (b brutalConfig) validate() error {
+	if b.CwndGain == 0 {
+		return nil // 0 selects the 1.5x default
+	}
+	if b.CwndGain > brutalCwndGainMax {
+		return fmt.Errorf("brutal.cwnd_gain must be between 1 and %d tenths, got %d", brutalCwndGainMax, b.CwndGain)
+	}
+	return nil
 }
 
 func (p paddingConfig) validate() error {
@@ -129,6 +178,9 @@ func (cfg *config) validate() error {
 		return errors.New("duration, window, and standby fields must be non-negative")
 	}
 	if err := cfg.Padding.validate(); err != nil {
+		return err
+	}
+	if err := cfg.Brutal.validate(); err != nil {
 		return err
 	}
 	if cfg.Mode == "server" {
@@ -243,7 +295,8 @@ func applyEnvironment(cfg *config) error {
 	}
 	bools := map[string]*bool{
 		"H2TUNNEL_TLS": &cfg.TLS, "H2TUNNEL_INSECURE": &cfg.Insecure,
-		"H2TUNNEL_LOCAL_ONLY": &cfg.LocalOnly,
+		"H2TUNNEL_LOCAL_ONLY":     &cfg.LocalOnly,
+		"H2TUNNEL_BRUTAL_ENABLED": &cfg.Brutal.Enabled,
 	}
 	for key, destination := range bools {
 		if value, ok := os.LookupEnv(key); ok {
@@ -253,6 +306,15 @@ func applyEnvironment(cfg *config) error {
 			}
 			*destination = parsed
 		}
+	}
+	// H2TUNNEL_BRUTAL_NEGOTIATE is set through a pointer so an explicit false is
+	// distinguishable from unset (unset keeps the negotiate: true default).
+	if value, ok := os.LookupEnv("H2TUNNEL_BRUTAL_NEGOTIATE"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("H2TUNNEL_BRUTAL_NEGOTIATE must be a boolean: %w", err)
+		}
+		cfg.Brutal.Negotiate = &parsed
 	}
 	ints := map[string]*int{
 		"H2TUNNEL_HEARTBEAT_SEC":            &cfg.HeartbeatSec,
@@ -272,6 +334,25 @@ func applyEnvironment(cfg *config) error {
 			}
 			*destination = parsed
 		}
+	}
+	for key, destination := range map[string]*uint64{
+		"H2TUNNEL_BRUTAL_RATE_BYTES": &cfg.Brutal.RateBytes,
+		"H2TUNNEL_BRUTAL_GROUP_ID":   &cfg.Brutal.GroupID,
+	} {
+		if value, ok := os.LookupEnv(key); ok {
+			parsed, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return fmt.Errorf("%s must be a non-negative integer: %w", key, err)
+			}
+			*destination = parsed
+		}
+	}
+	if value, ok := os.LookupEnv("H2TUNNEL_BRUTAL_CWND_GAIN"); ok {
+		parsed, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return fmt.Errorf("H2TUNNEL_BRUTAL_CWND_GAIN must be a non-negative integer: %w", err)
+		}
+		cfg.Brutal.CwndGain = uint32(parsed)
 	}
 	return nil
 }

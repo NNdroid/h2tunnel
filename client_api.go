@@ -119,6 +119,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	brutal, err := compileBrutalPolicy(options.Tuning.Brutal)
+	if err != nil {
+		return nil, err
+	}
+	warnBrutalUnavailable(options.Logger, brutal)
 	windowKB, err := windowBytesToKB(options.Tuning.SessionWindowBytes)
 	if err != nil {
 		return nil, err
@@ -173,6 +178,12 @@ func NewClient(options ClientOptions) (*Client, error) {
 		RedialBudget:      options.Tuning.RedialBudget,
 		Padding:           padding,
 		MasqueALPN:        alpn,
+		Brutal:            brutal,
+		// One random value per Client instance, sent as X-Client-Group so every
+		// lane of this client lands in the same Brutal connection group. It is
+		// stable across TCP-leg migration, which is why it replaces the remote IP.
+		clientGroup: newClientSessionID(),
+		brutalPeer:  &brutalPeerCache{},
 		// Probe placeholder: warm-up lanes carry X-Resume-Role=backup (DialKindProbe);
 		// the server never dials for them — this value only appears in lane request headers.
 		TargetAddr: "__probe__",
@@ -341,6 +352,81 @@ func (c *Client) newMasqueHTTPClient() *http.Client {
 	}
 }
 
+// brutalLocalDecision is the TCP Brutal decision for a fresh TCP leg: this
+// client's own policy merged with whatever the server last told it, and a group
+// id derived from the shared token plus this instance's seed. Both sides derive
+// the same value independently, which is what makes grouping work without the
+// token being a per-client secret: the seed is what differs. It also keeps every
+// lane of this client (2 primary + N standby) in one Brutal group rather than N
+// independent buckets that would let total upload scale with lane count.
+func (c *Client) brutalLocalDecision() brutalDecision {
+	p := c.cfg.Brutal
+	p.groupID = resolveBrutalGroupID(p, c.cfg.Token, c.cfg.clientGroup)
+	if peer, ok := c.cfg.brutalPeer.get(); ok {
+		p = applyOffer(p, peer.rateBytes, peer.cwndGain)
+	}
+	return decideBrutal(p)
+}
+
+// dialTCP opens a TCP connection and enables TCP Brutal on the raw socket.
+// Brutal must be applied before tls.Client / utls.UClient wrap the conn:
+// tcpConnFrom follows only Unwrap chains, and tls.Conn exposes NetConn instead.
+func (c *Client) dialTCP(ctx context.Context, network, address string) (net.Conn, error) {
+	var (
+		raw net.Conn
+		err error
+	)
+	if c.cfg.Dialer != nil {
+		raw, err = c.cfg.Dialer(ctx, network, address)
+	} else {
+		var dialer net.Dialer
+		raw, err = dialer.DialContext(ctx, network, address)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if c.cfg.Brutal.enabled {
+		applyBrutalBestEffort(raw, c.brutalLocalDecision(), c.log)
+	}
+	return raw, nil
+}
+
+// NegotiateBrutal runs one explicit TCP Brutal bandwidth exchange against the
+// server (the _BrutalBwExchange sentinel) without opening a business tunnel,
+// and reports the negotiated decision.
+//
+// It is the standalone form of the exchange that otherwise rides every resume/2
+// handshake: use it to learn the agreed rate and group id before opening any
+// tunnels. The sentinel session closes as soon as the server has answered, so
+// the returned conn is short-lived and is closed here. The decision returned is
+// the server's last answer, which is stable for the server's lifetime because
+// its policy does not change between exchanges.
+//
+// It reports ErrBrutalUnavailable when brutal is disabled in this client's
+// tuning; a non-Linux host also gets it from the platform socket layer, which
+// does not stop the exchange itself.
+func (c *Client) NegotiateBrutal(ctx context.Context) (BrutalTuning, error) {
+	if !c.cfg.Brutal.enabled {
+		return BrutalTuning{}, ErrBrutalUnavailable
+	}
+	conn, err := c.DialContext(ctx, networkTCP, brutalBwExchangeTarget)
+	if err != nil {
+		return BrutalTuning{}, err
+	}
+	_ = conn.Close()
+	d, ok := c.cfg.brutalPeer.get()
+	if !ok {
+		return BrutalTuning{}, errors.New("h2tunnel: the server did not answer the brutal bandwidth exchange")
+	}
+	return BrutalTuning{
+		Enabled:   true,
+		RateBytes: d.rateBytes,
+		CwndGain:  d.cwndGain,
+		GroupID:   d.groupID,
+		Negotiate: c.cfg.Brutal.negotiate,
+	}, nil
+}
+
 // newHTTP2Transport builds the TLS HTTP/2 transport (where utls disguise and the
 // custom-socket dialer converge); shared by the masque h2 leg and h2/grpc.
 func (c *Client) newHTTP2Transport() *http2.Transport {
@@ -356,10 +442,10 @@ func (c *Client) newHTTP2Transport() *http2.Transport {
 		}
 		if c.utls != nil {
 			// utls fingerprint disguise: takes over the TLS handshake (raw socket still honors cfg.Dialer).
-			t2.DialTLSContext = c.utlsDialTLSContext(c.cfg.Dialer)
+			t2.DialTLSContext = c.utlsDialTLSContext()
 		} else if c.cfg.Dialer != nil {
 			t2.DialTLSContext = func(ctx context.Context, network, address string, tlsConfig *tls.Config) (net.Conn, error) {
-				raw, err := c.cfg.Dialer(ctx, network, address)
+				raw, err := c.dialTCP(ctx, network, address)
 				if err != nil {
 					return nil, err
 				}
@@ -375,11 +461,7 @@ func (c *Client) newHTTP2Transport() *http2.Transport {
 	}
 	t2.AllowHTTP = true
 	t2.DialTLSContext = func(ctx context.Context, network, address string, _ *tls.Config) (net.Conn, error) {
-		if c.cfg.Dialer != nil {
-			return c.cfg.Dialer(ctx, network, address)
-		}
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, address)
+		return c.dialTCP(ctx, network, address)
 	}
 	return t2
 }

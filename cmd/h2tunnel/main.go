@@ -151,6 +151,7 @@ func runServer(cfg *config, logger *slog.Logger) error {
 				MinRecordBytes: cfg.Padding.MinRecordBytes,
 				MaxRecordBytes: cfg.Padding.MaxRecordBytes,
 			},
+			Brutal: cfg.Brutal.tuning(),
 		},
 		Logger: logger,
 	})
@@ -206,6 +207,7 @@ func runClient(cfg *config, logger *slog.Logger) error {
 				MaxRecordBytes: cfg.Padding.MaxRecordBytes,
 			},
 			MasqueALPN: cfg.MasqueALPN,
+			Brutal:     cfg.Brutal.tuning(),
 		},
 		Logger: logger,
 	})

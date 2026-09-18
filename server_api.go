@@ -80,6 +80,11 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	brutal, err := compileBrutalPolicy(options.Tuning.Brutal)
+	if err != nil {
+		return nil, err
+	}
+	warnBrutalUnavailable(options.Logger, brutal)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cfg := serverConfig{
@@ -91,6 +96,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		SessionMax:             options.Tuning.SessionMax,
 		SessionMaxPerPrincipal: options.Tuning.SessionMaxPerPrincipal,
 		Padding:                padding,
+		Brutal:                 brutal,
 		Authenticator:          options.Authenticator,
 		TargetDialer:           options.Dialer,
 		ServerContext:          ctx,
@@ -163,6 +169,13 @@ func NewServer(options ServerOptions) (*Server, error) {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       time.Hour,
 		ConnState:         s.trackHTTPConnection,
+	}
+	if cfg.Brutal.enabled {
+		// ConnContext is the only hook that still holds the accepted socket:
+		// net/http calls it in the accept loop with the raw conn, h2c hijacks the
+		// conn before any handler runs, and x/net/http2 builds each request context
+		// from the handler's BaseContext rather than from the conn.
+		s.httpServer.ConnContext = s.brutalConnContext
 	}
 	if cfg.TLSConfig != nil {
 		tlsConfig := cfg.TLSConfig.Clone()
@@ -441,6 +454,22 @@ func (s *Server) trackHTTPConnection(conn net.Conn, state http.ConnState) {
 	if closeNow {
 		_ = conn.Close()
 	}
+}
+
+// brutalConnContext enables TCP Brutal on the just-accepted socket. It runs
+// before authentication, which is why it applies the ungrouped form: group_id 0
+// (the default) caps each accepted connection individually, so an unauthenticated
+// client cannot buy itself more than one connection's worth of the configured
+// rate. The operator's static GroupID override is honored here too, which is the
+// "share one egress budget across all accepted connections" mode; a per-client
+// group cannot be used at this point because the token has not been presented
+// yet.
+func (s *Server) brutalConnContext(ctx context.Context, conn net.Conn) context.Context {
+	if !s.cfg.Brutal.enabled {
+		return ctx
+	}
+	applyBrutalBestEffort(conn, decideBrutal(s.cfg.Brutal), s.log)
+	return ctx
 }
 
 func (s *Server) closeTrackedHTTPConnections() error {

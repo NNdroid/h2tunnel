@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -75,6 +76,133 @@ func TestConfigPaddingValidationAndEnvironment(t *testing.T) {
 		if err := cfg.validate(); err == nil {
 			t.Fatalf("validate accepted padding %+v", padding)
 		}
+	}
+}
+
+func TestConfigBrutalSectionAndValidation(t *testing.T) {
+	write := func(t *testing.T, data string) *config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	reject := func(t *testing.T, data string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(path); err == nil {
+			t.Fatalf("loadConfig accepted %s", data)
+		}
+	}
+	// mk renders a server config with one extra member; an empty extra omits it.
+	mk := func(extra string) string {
+		if extra == "" {
+			return `{"mode":"server"}`
+		}
+		return `{"mode":"server",` + extra + `}`
+	}
+
+	// An absent section is disabled, but negotiate still defaults to true so
+	// enabling later does not silently drop the exchange.
+	cfg := write(t, mk(""))
+	if got := cfg.Brutal.tuning(); got.Enabled || got.RateBytes != 0 || got.CwndGain != 0 || got.GroupID != 0 || !got.Negotiate {
+		t.Fatalf("absent section = %+v, want disabled with negotiate defaulting to true", got)
+	}
+
+	cfg = write(t, mk(`"brutal":{"enabled":true,"rate_bytes":200000000,"cwnd_gain":20,"group_id":42}`))
+	if got := cfg.Brutal.tuning(); !got.Enabled || got.RateBytes != 200000000 || got.CwndGain != 20 || got.GroupID != 42 || !got.Negotiate {
+		t.Fatalf("parsed tuning = %+v", got)
+	}
+	if cfg.Brutal.Negotiate != nil {
+		t.Fatalf("an omitted negotiate must stay nil")
+	}
+
+	cfg = write(t, mk(`"brutal":{"enabled":true,"negotiate":false}`))
+	if got := cfg.Brutal.tuning(); got.Negotiate {
+		t.Fatalf("an explicit negotiate=false must be honored: %+v", got)
+	}
+
+	// cwnd_gain 0 is valid: it selects the library's 1.5x default.
+	cfg = write(t, mk(`"brutal":{"enabled":true,"cwnd_gain":0}`))
+	if got := cfg.Brutal.tuning(); got.CwndGain != 0 {
+		t.Fatalf("cwnd_gain 0 must stay 0 for the library to default it: %+v", got)
+	}
+
+	reject(t, mk(`"brutal":{"cwnd_gain":`+strconv.Itoa(brutalCwndGainMax+1)+`}`))
+	reject(t, mk(`"brutal":{"cwnd_gain":-1}`))
+	reject(t, mk(`"brutal":{"rate_bytes":-1}`))
+
+	// brutal applies to both sides, so neither mode may reject it.
+	write(t, mk(`"brutal":{"enabled":true,"rate_bytes":1,"cwnd_gain":15}`))
+	write(t, `{"mode":"client","server":"https://example.com","target":"echo","brutal":{"enabled":true,"rate_bytes":1,"cwnd_gain":15}}`)
+}
+
+func TestConfigBrutalEnvironment(t *testing.T) {
+	t.Setenv("H2TUNNEL_BRUTAL_ENABLED", "true")
+	t.Setenv("H2TUNNEL_BRUTAL_RATE_BYTES", "100000000")
+	t.Setenv("H2TUNNEL_BRUTAL_CWND_GAIN", "20")
+	t.Setenv("H2TUNNEL_BRUTAL_GROUP_ID", "42")
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"mode":"server"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Brutal.tuning(); !got.Enabled || got.RateBytes != 100000000 || got.CwndGain != 20 || got.GroupID != 42 || !got.Negotiate {
+		t.Fatalf("env-derived tuning = %+v", got)
+	}
+
+	// An explicit false is distinguishable from an omitted key, which is the
+	// whole reason the field is a pointer.
+	t.Setenv("H2TUNNEL_BRUTAL_NEGOTIATE", "false")
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Brutal.Negotiate == nil || *cfg.Brutal.Negotiate {
+		t.Fatalf("negotiate = %v, want a non-nil false pointer", cfg.Brutal.Negotiate)
+	}
+	if got := cfg.Brutal.tuning(); got.Negotiate {
+		t.Fatalf("an explicit negotiate=false must be honored: %+v", got)
+	}
+
+	// Reset to valid values: an invalid entry would otherwise poison the next
+	// loadConfig call in this test.
+	t.Setenv("H2TUNNEL_BRUTAL_RATE_BYTES", "1")
+	t.Setenv("H2TUNNEL_BRUTAL_CWND_GAIN", "15")
+	t.Setenv("H2TUNNEL_BRUTAL_GROUP_ID", "1")
+	invalid := []struct{ env, value string }{
+		{"H2TUNNEL_BRUTAL_RATE_BYTES", "-1"},
+		{"H2TUNNEL_BRUTAL_RATE_BYTES", "abc"},
+		{"H2TUNNEL_BRUTAL_CWND_GAIN", "-1"},
+		{"H2TUNNEL_BRUTAL_CWND_GAIN", "abc"},
+		{"H2TUNNEL_BRUTAL_GROUP_ID", "-1"},
+		{"H2TUNNEL_BRUTAL_GROUP_ID", "abc"},
+		{"H2TUNNEL_BRUTAL_ENABLED", "maybe"},
+		{"H2TUNNEL_BRUTAL_NEGOTIATE", "maybe"},
+	}
+	for _, tc := range invalid {
+		t.Setenv(tc.env, tc.value)
+		if _, err := loadConfig(path); err == nil {
+			t.Fatalf("%s=%s was accepted", tc.env, tc.value)
+		}
+	}
+	// A gain above the library's bound is a parseable uint32, so it is caught
+	// by validate rather than by ParseUint.
+	t.Setenv("H2TUNNEL_BRUTAL_CWND_GAIN", strconv.Itoa(brutalCwndGainMax+1))
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("a cwnd_gain above the bound was accepted")
 	}
 }
 
@@ -156,6 +284,11 @@ func TestGeneratedProxyAndServiceConfigsMatchCurrentCLI(t *testing.T) {
 		!strings.Contains(systemd, `"min_record_bytes": 600`) ||
 		!strings.Contains(systemd, `"max_record_bytes": 1200`) {
 		t.Fatalf("generated systemd config is missing the current path or padding schema:\n%s", systemd)
+	}
+	// The generated sample must keep advertising the brutal section, disabled:
+	// operators find the knob by reading their own generated config.
+	if !strings.Contains(systemd, `"brutal": {`) || !strings.Contains(systemd, `"enabled": false`) {
+		t.Fatalf("generated systemd config no longer advertises the brutal section:\n%s", systemd)
 	}
 }
 

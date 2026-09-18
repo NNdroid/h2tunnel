@@ -50,6 +50,7 @@ func NewClient(ClientOptions) (*Client, error)
 func (*Client) Start(context.Context) error
 func (*Client) DialContext(context.Context, string, string) (net.Conn, error)
 func (*Client) DialPacketContext(context.Context, string, string) (PacketConn, error)
+func (*Client) NegotiateBrutal(context.Context) (BrutalTuning, error)
 func (*Client) Shutdown(context.Context) error
 func (*Client) Close() error
 ```
@@ -363,6 +364,39 @@ if err := server.Shutdown(shutdownCtx); err != nil {
 }
 ```
 
+### 12. TCP Brutal congestion control (Linux only)
+
+Set the same `BrutalTuning` on both sides. The feature is off unless `Enabled`
+is true, and it is a silent no-op on non-Linux builds or on a kernel without the
+`brutal` controller — no error is returned either way.
+
+```go
+brutal := h2tunnel.BrutalTuning{
+    Enabled:   true,
+    RateBytes: 200_000_000, // this side's declared rate, bytes/second
+    CwndGain:  20,          // tenths, so 20 = 2.0x
+    Negotiate: true,
+}
+
+clientOptions.Tuning.Brutal = brutal
+serverOptions.Tuning.Brutal = brutal
+
+// Optional: force one shared rate bucket instead of the derived per-client one.
+brutal.GroupID = 7
+```
+
+The effective `RateBytes` and `CwndGain` are the minimum of the two sides.
+`GroupID` is derived when zero: `u64le(HMAC-SHA256(token, seed)[:8]) | 1`, where
+the seed is the client's stable group id, so it stays constant across connection
+migration. Set a non-zero value to put several distinct clients in one bucket.
+
+```go
+// The explicit form of the in-band exchange: it answers with the negotiation
+// headers and never dials an origin or opens a session.
+tuning, err := client.NegotiateBrutal(ctx)
+// tuning.GroupID is what the server derived for this client.
+```
+
 `Shutdown` refuses new sessions and waits for existing connections to end naturally; `Close` terminates immediately. When embedded in an external `http.Server`, stop the external server from accepting new requests first, then call the tunnel server's `Shutdown`.
 
 ## CDN and reverse-proxy deployment
@@ -434,6 +468,12 @@ The heartbeat interval must be smaller than the shortest idle timeout on the pat
     "min_record_bytes": 600,
     "max_record_bytes": 1200
   },
+  "brutal": {
+    "enabled": false,
+    "rate_bytes": 0,
+    "cwnd_gain": 15,
+    "negotiate": true
+  },
   "log_level": "info"
 }
 ```
@@ -465,6 +505,12 @@ When `cert` and `key` are both empty, the CLI generates an in-process self-signe
   "padding": {
     "min_record_bytes": 600,
     "max_record_bytes": 1200
+  },
+  "brutal": {
+    "enabled": false,
+    "rate_bytes": 0,
+    "cwnd_gain": 15,
+    "negotiate": true
   },
   "log_level": "info"
 }
@@ -506,6 +552,11 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `padding.min_record_bytes` | shared | `0` (off) | minimum application-layer tunnel record length; must be `17..65527`. The client shapes the uplink, the server shapes the downlink |
 | `padding.max_record_bytes` | shared | 125% of the minimum | random cap for application-layer tunnel records; at most `65535`, at least 8B above the minimum. Large UDP packets are never split to satisfy the cap |
 | `pprof` | server | empty | when non-empty, start `net/http/pprof` at that address (e.g. `127.0.0.1:6060`); bind only to trusted addresses |
+| `brutal.enabled` | shared | `false` | Linux TCP Brutal congestion control. On other operating systems, or when the running kernel has no `brutal` controller, this is a silent no-op (one WARN at startup) and traffic falls back to the default controller |
+| `brutal.rate_bytes` | shared | `0` (no local preference) | declared bandwidth in bytes/second for this side; the effective value is the minimum of the two sides. `0` means "no opinion, take the peer's value"; if both sides say `0` only the congestion algorithm is switched and no rate is pushed |
+| `brutal.cwnd_gain` | shared | `0` (→ 15) | congestion window gain in tenths: `15` = 1.5x, `20` = 2.0x. `0` selects the built-in 1.5x; anything above 1000 fails at startup. The effective value is the minimum of the two sides |
+| `brutal.group_id` | shared | `0` (derive) | static connection-group id. `0` derives one per client: `u64le(HMAC-SHA256(token, groupSeed)[:8]) \| 1`, where the seed is `X-Client-Group` (a random value generated once per client instance) with `X-Session-ID` as the fallback. Set a value to merge several distinct clients into one shared bucket. `1` is forced so the id can never read as "no group" |
+| `brutal.negotiate` | shared | `true` | when `false`, skip the bandwidth exchange and apply this side's own values only |
 | `heartbeat_sec` | client | `25` | CDN bidirectional heartbeat; negative disables it |
 | `session_window_kb` | shared | `256` | bounded ring window per resumable session |
 | `handshake_ack_ms` | client | `3000` | data-plane handshake ack timeout |
@@ -514,7 +565,7 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `drain_timeout_sec` | shared | `30` | seconds to wait for existing sessions at exit |
 | `log_level` | shared | `info` | `debug`, `info`, `warn`, `error` |
 
-Every field can be overridden by an uppercased env var of the same name, e.g. `H2TUNNEL_SERVER`, `H2TUNNEL_TRANSPORT`, `H2TUNNEL_STANDBY_CONNECTIONS`, `H2TUNNEL_UTLS`, `H2TUNNEL_MASQUE_ALPN`, `H2TUNNEL_PADDING_MIN_RECORD_BYTES`, `H2TUNNEL_PADDING_MAX_RECORD_BYTES`, `H2TUNNEL_PPROF`. Malformed boolean or integer env values also fail at startup.
+Every field can be overridden by an uppercased env var of the same name, e.g. `H2TUNNEL_SERVER`, `H2TUNNEL_TRANSPORT`, `H2TUNNEL_STANDBY_CONNECTIONS`, `H2TUNNEL_UTLS`, `H2TUNNEL_MASQUE_ALPN`, `H2TUNNEL_PADDING_MIN_RECORD_BYTES`, `H2TUNNEL_PADDING_MAX_RECORD_BYTES`, `H2TUNNEL_PPROF`, `H2TUNNEL_BRUTAL_ENABLED`, `H2TUNNEL_BRUTAL_RATE_BYTES`, `H2TUNNEL_BRUTAL_CWND_GAIN`, `H2TUNNEL_BRUTAL_GROUP_ID`, `H2TUNNEL_BRUTAL_NEGOTIATE`. Malformed boolean or integer env values also fail at startup.
 
 ### MASQUE dual carriers (h3 / h2)
 
@@ -525,6 +576,20 @@ Every field can be overridden by an uppercased env var of the same name, e.g. `H
 - **auto (default)**: h3 first; the first failed h3 dial pins h2 (links with UDP blocked need not wait for the QUIC timeout again per connection). Use `masque_alpn` to force one.
 
 Server-side listeners are automatic for both carriers: `masque` makes TCP and QUIC **optional stacks** (`listenerPlan`), and `ListenAndServe` opens both by default. ⚠️ **For the server to accept extended CONNECT over h2, the process must set `GODEBUG=http2xconnect=1` at startup** (x/net reads that switch only once in `init`, and `//go:debug` rejects non-stdlib keys). Without it the h3 carrier is unaffected and only the h2 leg is explicitly rejected with `extended connect not supported by peer` — the CLI logs a WARN when masque is enabled and the switch is missing. This limitation disappears if x/net upstream drops the gate.
+
+### TCP Brutal congestion control (Linux)
+
+`brutal.enabled` switches the tunnel's TCP legs to the [TCP Brutal](https://github.com/synack42/TCP-Brutal) kernel congestion controller, which is deliberately aggressive and pushes hard at a rate you declare. It is a Linux kernel module: on macOS, Windows, or a Linux kernel that has no `brutal` in `/proc/net/ipv4/tcp_available`, the flag is accepted but does nothing, and a single WARN is logged at startup — the same config file keeps working once the module is loaded.
+
+The scope is the tunnel leg itself (client↔server) and the server's accepted client sockets. It does not apply to the server→origin upstream connection, to the client's local loopback listener, or to any QUIC/UDP leg.
+
+**Bandwidth exchange.** Proxy protocols carry no bandwidth field, so the two sides negotiate through the tunnel instead: the client sends `X-Brutal-Offer: rate=,gain=,nonce=` on its requests, and the server answers with `X-Brutal-Params: rate=,gain=,group_id=,nonce=`. The effective value is the minimum on both axes — a client cannot claim more than the server configured, and the server cannot push a rate above what the client declared. A fresh 16-byte nonce travels in both headers and is echoed back; the client applies a reply only when its nonce matches, which stops a cached or out-of-band reply from reconfiguring the connection. The nonce is deliberately **not** part of the HMAC input — folding it in would give every exchange its own group id and defeat grouping.
+
+If the inline exchange ever needs to be separated, dial the sentinel target `_BrutalBwExchange`: it is recognized before any target substitution, never dials an origin, never opens a session, and answers with the negotiation headers plus an END frame.
+
+**Connection groups.** Kernel-side rate limiting is per connection group: every socket with the same non-zero `group_id` (same user, same netns) shares `rate_bytes` as a *total*, so adding more links cannot multiply the allowance. The id is derived as `u64le(HMAC-SHA256(token, seed)[:8]) | 1` on both sides, independently — the shared token is the key and the seed is what differs per client. The seed is `X-Client-Group`, a random 128-bit value generated once per client instance, so it survives connection migration (the remote IP changes, the id does not), falling back to `X-Session-ID` for older clients. `brutal.group_id` overrides the derivation to merge several distinct clients into one bucket on purpose.
+
+Two honest limitations: the negotiation result reaches the *next* dial rather than the socket carrying the reply, so the very first leg of a process runs at the client's own declared rate (negotiation only ever lowers the value, so it converges); and the server's own socket is configured per accepted connection from the static policy, because net/http exposes a connection only at accept time — the per-client group lives on the client's socket.
 
 ### Multi-protocol server
 
