@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
     branches: [main]
+  # Manual runs (Actions page or API) without needing a new push, e.g. to
+  # re-verify a flaky or infrastructure-dependent job on the same commit.
+  workflow_dispatch:
 
 jobs:
   test:
