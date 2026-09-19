@@ -282,6 +282,18 @@ func dnsQuery(id uint16, name string) []byte {
 	return out
 }
 
+// quicHandshakeStarved reports whether a dial failed because quic-go aborted
+// the QUIC handshake after its built-in 5-second "no recent network activity"
+// bound (the library only pins MaxIdleTimeout=30s; the handshake bound is
+// quic-go's default and has no knob). Under -race on an overloaded CI runner
+// one side of the loopback pair can be descheduled for exactly that long while
+// the server stays healthy — the subtests that follow a starved dial succeed
+// within ~200ms — so the matrix retries such a dial once. A genuinely dead
+// server fails both attempts.
+func quicHandshakeStarved(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no recent network activity")
+}
+
 // newProtocolClient creates and starts a client per transport type.
 func newProtocolClient(t testing.TB, env *protocolEnv, transport h2tunnel.Transport) *h2tunnel.Client {
 	return newProtocolClientWithPadding(t, env, transport, h2tunnel.PaddingTuning{})
@@ -358,6 +370,9 @@ func TestProtocolRealTargetMatrix(t *testing.T) {
 			defer cancel()
 
 			conn, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "http")
+			if quicHandshakeStarved(err) {
+				conn, err = client.DialContext(ctx, h2tunnel.NetworkTCP, "http")
+			}
 			if err != nil {
 				t.Fatalf("dial http target: %v", err)
 			}
@@ -412,6 +427,9 @@ func TestProtocolRealTargetMatrix(t *testing.T) {
 			defer cancel()
 
 			packetConn, err := client.DialPacketContext(ctx, h2tunnel.NetworkUDP, "dns")
+			if quicHandshakeStarved(err) {
+				packetConn, err = client.DialPacketContext(ctx, h2tunnel.NetworkUDP, "dns")
+			}
 			if err != nil {
 				t.Fatalf("dial dns target: %v", err)
 			}
