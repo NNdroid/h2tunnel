@@ -37,6 +37,17 @@ jobs:
         shell: bash
         run: go build -v ./...
 
+      - name: Build (32-bit compatibility)
+        # Releases ship linux/386 and linux/arm (GOARM=6) binaries. These
+        # targets have a 32-bit int and stricter 64-bit atomic alignment
+        # rules, so keep them compiling on every push instead of first
+        # failing when cutting a release.
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          GOOS=linux GOARCH=386 go build ./...
+          GOOS=linux GOARCH=arm GOARM=6 go build ./...
+
       - name: Test (race)
         # quic-go officially does not support Go's race detector on Windows:
         # native crash (Exception 0xc0000005 / unknown pc, see the race

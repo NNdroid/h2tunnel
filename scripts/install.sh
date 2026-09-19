@@ -27,7 +27,9 @@ get_arch() {
   case "${arch}" in
     x86_64)  echo "amd64" ;;
     aarch64) echo "arm64" ;;
-    armv7l)  echo "arm" ;;
+    # The release arm binary is built with GOARM=6, so it runs on every
+    # 32-bit ARM from v6 up (v7/v8-A32 execute v6 code fine).
+    armv6l|armv7l|armv8l) echo "arm" ;;
     i386|i686) echo "386" ;;
     *)       echo "amd64" ;;
   esac

@@ -666,7 +666,7 @@ Every push automatically runs `go vet`, `go build`, and `go test -race` on Ubunt
 
 The release flow (`.github/workflows/release.yml`):
 
-1. **Automatic release**: push any `v*` tag to trigger; cross-compiles 7 platforms of bare binaries (linux amd64/arm64/arm/386, windows amd64, darwin amd64/arm64), uploaded directly as Release assets without packaging archives.
+1. **Automatic release**: push any `v*` tag to trigger; cross-compiles 7 platforms of bare binaries (linux amd64/arm64/arm/386, windows amd64, darwin amd64/arm64), uploaded directly as Release assets without packaging archives. The `arm` binary is built with `GOARM=6`, so one asset covers every 32-bit ARM board from ARMv6 up (including Raspberry Pi 1/Zero-class SoCs).
 2. **Manual build**: trigger the Release workflow manually from the GitHub Actions page; artifacts are only collected into that run's Artifacts (`h2tunnel-manual-<sha>`) and no Release is created.
 
 Binaries inject the version via `-ldflags "-X github.com/NNdroid/h2tunnel.buildVersion=..."`, formatted as `v1.0.yyyyMMdd.<git commit count>-<short commit hash (7)>`, which `h2tunnel version` prints. The tag name itself does not enter version computation; after pushing, the Release title is the computed canonical version.

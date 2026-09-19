@@ -23,6 +23,10 @@ This file records notable changes for library users. Dates are release dates (UT
 - An abandoned h2 stream (a peer that vanishes without a FIN) keeps its handler goroutine until the connection closes. It is bounded per connection by the new 256-stream cap, and the session table reaper already drops the business session after 60 s idle, so the leaked resource is one goroutine per abandoned stream; closing it would require an idle reader in the uplink hot path, and x/net exposes no read-idle knob on the server side without also killing legitimately quiet links (the default heartbeat is 25 s and can be disabled). Connection-level flooding is a reverse-proxy / WAF concern rather than a tunnel concern.
 - x/net's `http2.Server` has no `MaxHeaderListSize` field, so the advertised value is the built-in default and untunable; net/http's 1 MiB total-header limit still rejects oversized headers.
 
+### Platform compatibility
+- **32-bit audit + broader ARM support**: the library and CLI now compile for `linux/386`, `linux/arm (GOARM=6)` and `windows/386`, verified per-push by a new CI build gate. The code itself needed no changes for 32-bit: all counters use the self-aligning `atomic.Int64`/`Uint64`/`Bool` types (a raw 64-bit atomic on a struct field would panic with "unaligned 64-bit atomic operation" on 32-bit platforms), there is no `unsafe` or `uintptr` arithmetic, oversized knobs such as `brutal.rate_bytes` are `uint64`, and `Atoi`-parsed knobs are all small by nature. The resume/2 frame length field is a wire-format `uint32` and is unaffected by platform bitness.
+- **Fixed: the `linux_arm` release binary aborted with "illegal instruction" on ARMv6-class CPUs** (Raspberry Pi 1/Zero, older NAS/router SoCs). No `GOARM` was set, so Go defaulted to ARMv7. The arm asset is now built with `GOARM=6` — ARMv7 and 32-bit ARMv8 execute v6 code fine, so this only widens compatibility; the asset name is unchanged. `scripts/install.sh` now maps `armv6l` and `armv8l` (32-bit userland on ARMv8) to the arm binary as well.
+
 ## 2026-09-18
 
 ### Added

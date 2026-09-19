@@ -22,6 +22,11 @@ jobs:
             goarch: arm64
           - goos: linux
             goarch: arm
+            # ARMv6 keeps the single arm asset compatible with every 32-bit ARM
+            # board from ARMv6 up (ARMv7/v8-A32 execute v6 code fine); the
+            # default GOARM=7 aborts with "illegal instruction" on ARMv6-class
+            # CPUs (Raspberry Pi 1/Zero, older NAS/router SoCs).
+            goarm: "6"
           - goos: linux
             goarch: 386
           - goos: windows
@@ -53,6 +58,8 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          # Empty for non-arm targets, where the go tool ignores GOARM.
+          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
         run: |
           go build -trimpath -ldflags "-s -w -X github.com/NNdroid/h2tunnel.buildVersion=${{ steps.ver.outputs.version }}" \
