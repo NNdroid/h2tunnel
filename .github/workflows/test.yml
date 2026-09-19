@@ -148,8 +148,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-user-static
-          QEMU=/usr/bin/${{ matrix.qemu }}-static
-          [ -x "$QEMU" ] || QEMU=/usr/bin/${{ matrix.qemu }}
+          QEMU=/usr/bin/qemu-${{ matrix.qemu }}-static
+          [ -x "$QEMU" ] || QEMU=/usr/bin/qemu-${{ matrix.qemu }}
           if [ ! -x "$QEMU" ]; then
             echo "no qemu-user emulator for ${{ matrix.arch }}:"
             ls -l /usr/bin | grep -i qemu || true
