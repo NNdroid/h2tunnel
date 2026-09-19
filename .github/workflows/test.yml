@@ -82,6 +82,114 @@ jobs:
           path: coverage.out
           retention-days: 7
 
+  # test-32bit: run the suite for real on the two 32-bit release targets.
+  #
+  # The compile gate in the test job above only proves the code builds with a
+  # 32-bit int; this job proves it runs. That catches a different class of bug:
+  # int truncation in hot paths (benchmarks run long enough for counters to
+  # cross 2^31), unaligned or too-small atomic access, and code paths that the
+  # suite only reaches under a 32-bit address space.
+  #
+  # GitHub's hosted runners are 64-bit only, so the binaries execute under
+  # user-mode emulation (qemu-user + binfmt). The emulated process talks to the
+  # host kernel directly, so loopback TCP/UDP and QUIC sockets behave the same
+  # as on a real 32-bit board.
+  test-32bit:
+    name: Test 32-bit (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Same as the native test job: GODEBUG must be in place before the test
+      # process starts, or the MASQUE-over-h2 assertions skip silently.
+      GODEBUG: http2xconnect=1
+      # Match the shipped linux_arm binary exactly (release.yml builds it with
+      # GOARM=6). GOARM is ignored for non-arm targets, so this is harmless for
+      # 386.
+      GOARM: "6"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: "386"
+            label: linux/386
+          - arch: arm
+            label: linux/arm GOARM=6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install user-mode emulation (qemu-user + binfmt)
+        # Static qemu-user binaries plus the binfmt_misc handler that makes the
+        # kernel route 32-bit ELF execution to them. Without binfmt registration
+        # the test binary would fail to exec at all.
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support
+          # binfmt_misc occasionally needs the handler map reloaded before the
+          # entry shows up. If the 32-bit x86 handler is missing, try to reload
+          # it and re-check, so a broken registration fails here with evidence
+          # instead of ten minutes into the suite. The handler name may be
+          # spelled "386" or "i386" depending on the qemu package version.
+          if ! grep -Eq ':(386|i386):' /proc/sys/fs/binfmt_misc/binfmt_misc; then
+            sudo update-binfmts --enable --package qemu-user-static || true
+            sudo service binfmt-support restart || true
+          fi
+          if ! grep -Eq ':(386|i386):' /proc/sys/fs/binfmt_misc/binfmt_misc; then
+            echo "no 32-bit x86 binfmt handler registered:"
+            cat /proc/sys/fs/binfmt_misc/binfmt_misc
+            exit 1
+          fi
+
+      - name: Vet + smoke test (proves the target execs and runs)
+        # Vet first on the 32-bit target (the native job only vets the host
+        # arch), then a single fast test so a broken qemu/binfmt setup fails in
+        # seconds rather than ten minutes into the suite.
+        shell: bash
+        run: |
+          export GOOS=linux GOARCH=${{ matrix.arch }}
+          go vet ./...
+          go test -count=1 -run 'TestConfigValidationCanonicalizesDefaults' -timeout 3m .
+
+      - name: Test suite
+        # No -race: the race detector plus user-mode emulation is an order of
+        # magnitude too slow to fit this job, and quic-go documents that the
+        # detector is unsupported on some platforms. Data-race coverage of the
+        # same code is already native on 64-bit (the test job's race step).
+        # The timeout is ~2x the native one: emulation slows CPU-bound work, and
+        # several tests wait out real timers.
+        shell: bash
+        run: |
+          export GOOS=linux GOARCH=${{ matrix.arch }}
+          go test -v -count=1 -timeout 30m -coverprofile=coverage-32.out ./...
+
+      - name: Benchmarks
+        # Benchmarks on an emulated CPU are canaries, not measurements: they
+        # prove the hot paths execute on a 32-bit int without truncation or
+        # misalignment faults and still emit sane throughput. Absolute values
+        # here must never be compared with the native Benchmark (Linux only)
+        # step -- the two differ by the emulation factor, which varies per run.
+        # -benchtime is shorter than the native step for the same reason.
+        shell: bash
+        run: |
+          export GOOS=linux GOARCH=${{ matrix.arch }}
+          go test -run '^$' -bench . -benchtime 500ms -count=1 -timeout 25m ./...
+
+      - name: Upload 32-bit coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-32bit-${{ matrix.arch }}
+          path: coverage-32.out
+          if-no-files-found: warn
+          retention-days: 7
+
   profile:
     name: Profile (flamegraph)
     runs-on: ubuntu-latest

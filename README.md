@@ -662,7 +662,7 @@ go test -run '^$' -bench '^BenchmarkPublicAPIThroughCDN72KB$' -benchmem .
 
 ## Continuous integration and releases
 
-Every push automatically runs `go vet`, `go build`, and `go test -race` on Ubuntu, Windows, and macOS (see `.github/workflows/test.yml`).
+Every push automatically runs `go vet`, `go build`, and `go test -race` on Ubuntu, Windows, and macOS (see `.github/workflows/test.yml`). A separate job runs the suite for real on the two 32-bit release targets (`linux/386` and `linux/arm` with `GOARM=6`), including all benchmarks: GitHub's hosted runners are 64-bit only, so the binaries execute under user-mode emulation (qemu-user + binfmt). `-race` is skipped there, because the detector plus emulation is an order of magnitude too slow to fit the job; data-race coverage of the same code stays native on 64-bit.
 
 The release flow (`.github/workflows/release.yml`):
 

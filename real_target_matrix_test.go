@@ -282,16 +282,43 @@ func dnsQuery(id uint16, name string) []byte {
 	return out
 }
 
+// A dial aborted by quic-go's handshake-idle bound is retried instead of
+// failed. That bound is the library's default 5s and the library exposes no
+// knob for it; it is about scheduling rather than reachability, so on a slow CI
+// runner — -race on a 3-core mac, or this suite under user-mode 32-bit
+// emulation — one side of the loopback pair can be descheduled for exactly that
+// long while the server stays healthy. The subtests right after a starved dial
+// succeed within ~200ms. A genuinely dead server fails every attempt.
+const (
+	quicDialAttempts     = 3
+	quicStarveRetryDelay = 500 * time.Millisecond
+)
+
 // quicHandshakeStarved reports whether a dial failed because quic-go aborted
-// the QUIC handshake after its built-in 5-second "no recent network activity"
-// bound (the library only pins MaxIdleTimeout=30s; the handshake bound is
-// quic-go's default and has no knob). Under -race on an overloaded CI runner
-// one side of the loopback pair can be descheduled for exactly that long while
-// the server stays healthy — the subtests that follow a starved dial succeed
-// within ~200ms — so the matrix retries such a dial once. A genuinely dead
-// server fails both attempts.
+// the QUIC handshake after its built-in "no recent network activity" bound.
 func quicHandshakeStarved(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no recent network activity")
+}
+
+// closeable is just Close, the only method the retry helper needs from a dial
+// result. A generic constraint cannot name an interface that is itself
+// non-empty (net.Conn and net.PacketConn both have methods, so neither is
+// usable in a type set), which is why this minimal shape is used instead.
+type closeable interface{ Close() error }
+
+// dialWithStarvationRetry calls f up to quicDialAttempts times, retrying only
+// when the error looks like a handshake-idle abort rather than a real failure.
+func dialWithStarvationRetry[T closeable](f func() (T, error)) (T, error) {
+	var conn T
+	var err error
+	for attempt := 0; attempt < quicDialAttempts; attempt++ {
+		conn, err = f()
+		if !quicHandshakeStarved(err) {
+			return conn, err
+		}
+		time.Sleep(quicStarveRetryDelay)
+	}
+	return conn, err
 }
 
 // newProtocolClient creates and starts a client per transport type.
@@ -369,10 +396,9 @@ func TestProtocolRealTargetMatrix(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			conn, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "http")
-			if quicHandshakeStarved(err) {
-				conn, err = client.DialContext(ctx, h2tunnel.NetworkTCP, "http")
-			}
+			conn, err := dialWithStarvationRetry(func() (net.Conn, error) {
+				return client.DialContext(ctx, h2tunnel.NetworkTCP, "http")
+			})
 			if err != nil {
 				t.Fatalf("dial http target: %v", err)
 			}
@@ -426,10 +452,9 @@ func TestProtocolRealTargetMatrix(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			packetConn, err := client.DialPacketContext(ctx, h2tunnel.NetworkUDP, "dns")
-			if quicHandshakeStarved(err) {
-				packetConn, err = client.DialPacketContext(ctx, h2tunnel.NetworkUDP, "dns")
-			}
+			packetConn, err := dialWithStarvationRetry(func() (h2tunnel.PacketConn, error) {
+				return client.DialPacketContext(ctx, h2tunnel.NetworkUDP, "dns")
+			})
 			if err != nil {
 				t.Fatalf("dial dns target: %v", err)
 			}
