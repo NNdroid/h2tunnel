@@ -91,13 +91,22 @@ jobs:
   # suite only reaches under a 32-bit address space.
   #
   # GitHub's hosted runners are 64-bit only, so the binaries execute under
-  # user-mode emulation (qemu-user + binfmt). The emulated process talks to the
-  # host kernel directly, so loopback TCP/UDP and QUIC sockets behave the same
-  # as on a real 32-bit board.
+  # user-mode emulation. qemu-user talks to the host kernel directly, so
+  # loopback TCP/UDP and QUIC sockets behave the same as on a real 32-bit
+  # board. The runners do not mount binfmt_misc, so the kernel cannot route
+  # 32-bit ELF execution to qemu by itself; instead the job registers the
+  # wrapper that the go tool already supports for exactly this case -- when
+  # GOOS/GOARCH differ from the host, `go test` runs the test binary through
+  # an executable named go_<goos>_<goarch>_exec found on PATH. Registering one
+  # wrapper is all that is needed, and the rest of the job stays plain
+  # `go test`.
   test-32bit:
     name: Test 32-bit (${{ matrix.label }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Backstop only: each step carries its own -timeout, and qemu-arm on an
+    # x86 host is several times slower than qemu-i386, so the arm run gets room
+    # without an unbounded wait.
+    timeout-minutes: 90
     env:
       # Same as the native test job: GODEBUG must be in place before the test
       # process starts, or the MASQUE-over-h2 assertions skip silently.
@@ -106,14 +115,19 @@ jobs:
       # GOARM=6). GOARM is ignored for non-arm targets, so this is harmless for
       # 386.
       GOARM: "6"
+      # No cgo anywhere in the repo; pinning it keeps the emulated binaries
+      # static and free of host library assumptions.
+      CGO_ENABLED: "0"
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: "386"
             label: linux/386
+            qemu: i386
           - arch: arm
             label: linux/arm GOARM=6
+            qemu: arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -124,37 +138,41 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install user-mode emulation (qemu-user + binfmt)
-        # Static qemu-user binaries plus the binfmt_misc handler that makes the
-        # kernel route 32-bit ELF execution to them. Without binfmt registration
-        # the test binary would fail to exec at all.
+      - name: Register qemu-user as the go cross-exec wrapper
+        # qemu-user-static provides the static emulators and needs no binfmt
+        # registration to be driven explicitly, which is what the wrapper does.
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support
-          # binfmt_misc occasionally needs the handler map reloaded before the
-          # entry shows up. If the 32-bit x86 handler is missing, try to reload
-          # it and re-check, so a broken registration fails here with evidence
-          # instead of ten minutes into the suite. The handler name may be
-          # spelled "386" or "i386" depending on the qemu package version.
-          if ! grep -Eq ':(386|i386):' /proc/sys/fs/binfmt_misc/binfmt_misc; then
-            sudo update-binfmts --enable --package qemu-user-static || true
-            sudo service binfmt-support restart || true
-          fi
-          if ! grep -Eq ':(386|i386):' /proc/sys/fs/binfmt_misc/binfmt_misc; then
-            echo "no 32-bit x86 binfmt handler registered:"
-            cat /proc/sys/fs/binfmt_misc/binfmt_misc
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          QEMU=/usr/bin/${{ matrix.qemu }}-static
+          [ -x "$QEMU" ] || QEMU=/usr/bin/${{ matrix.qemu }}
+          if [ ! -x "$QEMU" ]; then
+            echo "no qemu-user emulator for ${{ matrix.arch }}:"
+            ls -l /usr/bin | grep -i qemu || true
             exit 1
           fi
+          mkdir -p /tmp/cross-exec
+          printf '#!/bin/bash\nexec %q "$@"\n' "$QEMU" > "/tmp/cross-exec/go_linux_${{ matrix.arch }}_exec"
+          chmod +x "/tmp/cross-exec/go_linux_${{ matrix.arch }}_exec"
+          # GITHUB_PATH only reaches later steps, so verify the wrapper here and
+          # prove it in the next step (go vet + go run + one test).
+          [ -x "/tmp/cross-exec/go_linux_${{ matrix.arch }}_exec" ]
+          echo "/tmp/cross-exec" >> "$GITHUB_PATH"
+          cat "/tmp/cross-exec/go_linux_${{ matrix.arch }}_exec"
 
       - name: Vet + smoke test (proves the target execs and runs)
         # Vet first on the 32-bit target (the native job only vets the host
-        # arch), then a single fast test so a broken qemu/binfmt setup fails in
-        # seconds rather than ten minutes into the suite.
+        # arch). `go run` also goes through the cross-exec wrapper, so printing
+        # the version is the shortest proof that a real 32-bit binary built by
+        # this job can be executed -- a broken emulator fails here in seconds
+        # instead of ten minutes into the suite. The single fast test then
+        # covers the same path for test binaries.
         shell: bash
         run: |
           export GOOS=linux GOARCH=${{ matrix.arch }}
           go vet ./...
+          go run ./cmd/h2tunnel version
           go test -count=1 -run 'TestConfigValidationCanonicalizesDefaults' -timeout 3m .
 
       - name: Test suite
