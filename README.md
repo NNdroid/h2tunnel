@@ -451,6 +451,59 @@ location /tunnel {
 
 For a plaintext origin, use the `Server.Handler()` embedding example above and let the external server listen only on `127.0.0.1` or a protected private address. Do not allow the CDN to cache `/tunnel`, and do not enable request/response buffering.
 
+#### Which headers must nginx forward?
+
+The short answer: **none.** Neither direction needs a header-forwarding directive.
+
+`proxy_pass_header` controls the **response** direction (origin → client), and nginx
+passes every upstream response header through by default except its own `X-Accel-*`
+control family. h2tunnel sets `X-Accel-Buffering: no` specifically so nginx consumes and
+hides it — that is the desired outcome, not a leak. Every `X-Resume-*` and `X-Brutal-*`
+header is `X-`-prefixed and therefore untouched.
+
+`proxy_set_header` controls the **request** direction (client → origin), and nginx
+forwards every client header there by default too. The one thing it rewrites is `Host`:
+with no explicit directive it becomes `$proxy_host` (the `proxy_pass` target, e.g.
+`127.0.0.1:8443`) rather than the client's host, which breaks a virtual-hosted origin.
+`proxy_set_header Host $host;` is the only forwarding line that actually earns its place;
+the others in the generated snippet are documentation of the contract, not fixes.
+
+nginx does strip the hop-by-hop set (`Connection`, `Upgrade`, `TE`, `Keep-Alive`,
+`Transfer-Encoding`, `Proxy-*`) from upstream requests, but h2tunnel never sets any of
+them — there is no WebSocket or HTTP-Upgrade transport in the codebase — so there is
+nothing to preserve. Adding `proxy_set_header Upgrade $http_upgrade;` is common
+copy-paste that h2tunnel does not want.
+
+These are the request headers the protocol depends on. Each one is forwarded by default,
+so the table is a checklist for diagnosing a tunnel that breaks behind a proxy, not a list
+of directives to write:
+
+| Header | Purpose |
+| --- | --- |
+| `X-Auth-Token` or `Authorization: Bearer <token>` | Authentication. The client sends both, so either surviving is enough. Strip them and every dial dies with 401. |
+| `X-Tunnel-Proto`, `X-Session-ID`, `X-Resume-Version`, `X-Resume-Caps`, `X-Resume-Params`, `X-Resume-Role` | The resume/2 handshake, read before any data flows. A proxy that rewrites them produces 426/400 errors instead of a tunnel. |
+| `X-Network`, `X-Target` | Routing. Missing or altered, the server silently falls back to a default target (`127.0.0.1:22` for TCP, `127.0.0.1:53` for UDP) instead of your destination — the most misleading failure mode in this list. |
+| `X-Client-Group` | Brutal connection-group derivation. Losing it degrades grouping from per-client to per-session granularity, so adding links multiplies the allowance instead of sharing one bucket. |
+| `X-Brutal-Offer`, `X-Brutal-Params` | TCP Brutal negotiation. The 16-byte replay-prevention nonce is a field inside these two values, not a header of its own. |
+| `Content-Length`, `Content-Type`, `Accept-Encoding: identity` | Must not be re-chunked or re-encoded; keep `proxy_request_buffering off` and `gzip off`. |
+
+Optional client-IP headers the server reads for logging and geo-aware policy:
+`CF-Connecting-IP`, `True-Client-IP`, `X-Real-IP`, `X-Forwarded-For`.
+
+Two transports cannot go through nginx at all: **`masque`** and **`wt`**. Both are
+CONNECT-based, and both negotiate over QUIC/UDP (`wt` is HTTP/3 WebTransport and asserts
+an HTTP/3 stream at the server; `masque` is either HTTP/3 CONNECT or h2 extended CONNECT,
+which nginx does not proxy upstream either). Expose them on UDP directly, or point nginx
+only at the TCP-backed transports — `h2`, `h2c`, `grpc` — which are long-lived HTTP
+streaming requests and work fine behind a normal reverse proxy.
+
+If you additionally want nginx to keep idle upstream connections open
+(`proxy_http_version 1.1;` plus `proxy_keepalive N;` in an `upstream` block), you must
+add `proxy_set_header Connection "";` — otherwise nginx sends `Connection: close` and
+closes every upstream socket at the end of the tunnel it just streamed. This is the one
+legitimate reason to touch `Connection` here, and it is upstream keep-alive only; it has
+nothing to do with forwarding the client's headers.
+
 The heartbeat interval must be smaller than the shortest idle timeout on the path. The default 25s suits common 60s proxy timeouts; adjust explicitly if the CDN's shortest timeout differs. Controlled proxy latency, error responses, auth-header forwarding, cache/buffer headers, and steady-state throughput are all covered by automated tests.
 
 ## CLI usage

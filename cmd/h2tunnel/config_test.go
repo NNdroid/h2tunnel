@@ -335,6 +335,58 @@ func TestGeneratedProxyAndServiceConfigsMatchCurrentCLI(t *testing.T) {
 	}
 }
 
+func TestGenNginxNormalizesWindowsLocationPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"/tunnel":                     "/tunnel",
+		"/your_secret_path":           "/your_secret_path",
+		"/a/b/c":                      "/a/b/c",
+		`C:\Users\me\tunnel`:          "/Users/me/tunnel",
+		"C:/Program Files/Git/tunnel": "/Program Files/Git/tunnel",
+	} {
+		if got := normalizeLocationPath(in); got != want {
+			t.Fatalf("normalizeLocationPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// A shell-mangled path must not reach the location directive verbatim.
+	out := captureStdout(t, func() {
+		RunGenNginx([]string{"-domain", "tunnel.example", "-path", `C:\Users\me\tunnel`})
+	})
+	if !strings.Contains(out, "location /Users/me/tunnel {") {
+		t.Fatalf("generated Nginx config did not normalize the location path:\n%s", out)
+	}
+
+	// The realistic case on Windows: MSYS rewrites "/tunnel" into the current
+	// directory plus the requested path. The cwd prefix must be stripped.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mangled := filepath.ToSlash(filepath.Join(wd, "tunnel"))
+	if got := normalizeLocationPath(mangled); got != "/tunnel" {
+		t.Fatalf("normalizeLocationPath(%q) = %q, want %q", mangled, got, "/tunnel")
+	}
+
+	// Values that could not be a real location path must be rejected rather than
+	// printed into a config nginx would refuse to load.
+	for _, bad := range []string{
+		"/Program Files/Git/tunnel", // MSYS mangled, drive letter already dropped
+		"tunnel",
+		"//tunnel",
+		"",
+		"/tunnel x",
+	} {
+		if err := validateLocationPath(bad); err == nil {
+			t.Fatalf("validateLocationPath(%q) accepted a bad path", bad)
+		}
+	}
+	for _, good := range []string{"/tunnel", "/your_secret_path", "/a/b/c"} {
+		if err := validateLocationPath(good); err != nil {
+			t.Fatalf("validateLocationPath(%q) rejected a good path: %v", good, err)
+		}
+	}
+}
+
 func captureStdout(t *testing.T, run func()) string {
 	t.Helper()
 	reader, writer, err := os.Pipe()

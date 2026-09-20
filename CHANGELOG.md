@@ -2,6 +2,15 @@
 
 This file records notable changes for library users. Dates are release dates (UTC+8).
 
+## 2026-09-21
+
+### Documentation
+- **The reverse-proxy header contract is now written down**: README gained a "Which headers must nginx forward?" section, and the answer is that h2tunnel needs none. `proxy_pass_header` governs the response direction, where nginx passes everything through except its own `X-Accel-*` family — and h2tunnel sets `X-Accel-Buffering: no` precisely so nginx consumes and hides it, so that is the desired outcome rather than a leak. In the request direction nginx also forwards everything by default, and h2tunnel sets no `Connection` or `Upgrade` header at all (there is no WebSocket or HTTP-Upgrade transport), so the hop-by-hop stripping that most copy-pasted proxy snippets guard against is moot here. The one genuine `proxy_set_header` is `Host`, which nginx otherwise rewrites to `$proxy_host` and would break a virtual-hosted origin. The section documents the full request-header inventory as a diagnostic checklist rather than a directive list — including the sharpest trap, where a lost `X-Target` makes the server silently dial `127.0.0.1:22` or `127.0.0.1:53` instead of the intended destination — plus the optional upstream-keep-alive caveat that `proxy_keepalive` needs `proxy_set_header Connection "";`.
+- **Documented which transports may sit behind nginx**: only `h2`, `h2c` and `grpc` — long-lived HTTP streaming requests. `masque` and `wt` are both CONNECT-based over QUIC/UDP and cannot be proxied upstream by nginx (`wt` asserts an HTTP/3 stream server-side, and nginx does not proxy either HTTP/3 CONNECT or h2 extended CONNECT).
+
+### Fixed
+- **`gen-nginx` no longer emits an unparseable `location` on Windows**: POSIX shells and MSYS turn a lone `/tunnel` into `C:\...\tunnel` before the binary sees it, producing `location C:/Program Files/Git/tunnel`, which nginx rejects. Drive-qualified input is now rewritten to a path form (`C:\Users\me\tunnel` → `location /Users/me/tunnel`); plain `/tunnel` input is untouched. The generated snippet also states why no forwarding directives appear in it, and carries the optional keep-alive line commented out.
+
 ## 2026-09-19
 
 ### Security hardening
