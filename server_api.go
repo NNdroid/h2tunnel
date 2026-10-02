@@ -91,9 +91,14 @@ func NewServer(options ServerOptions) (*Server, error) {
 		return nil, err
 	}
 	warnBrutalUnavailable(options.Logger, brutal)
+	if err := options.Tuning.QUICReceiveWindow.Validate(); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cfg := serverConfig{
+		QUICReceiveWindow:      options.Tuning.QUICReceiveWindow,
+		PauseDetachedRead:      options.Tuning.PauseDetachedRead,
 		Path:                   normalizeTunnelPath(options.Path),
 		Transport:              transportList,
 		Network:                networkList,
@@ -142,14 +147,15 @@ func NewServer(options ServerOptions) (*Server, error) {
 		httpConns:  make(map[net.Conn]struct{}),
 	}
 	s.sessions = &sessionTable{
-		events:          &s.events,
-		sessions:        make(map[string]*tunnelSession),
-		perPrincipal:    make(map[string]int),
-		logger:          s.log,
-		idleTimeout:     cfg.SessionIdleTimeout,
-		maxSessions:     resolveSessionMax(cfg.SessionMax),
-		maxPerPrincipal: resolveSessionMaxPerPrincipal(cfg.SessionMaxPerPrincipal),
-		padding:         cfg.Padding,
+		pauseDetachedRead: cfg.PauseDetachedRead,
+		events:            &s.events,
+		sessions:          make(map[string]*tunnelSession),
+		perPrincipal:      make(map[string]int),
+		logger:            s.log,
+		idleTimeout:       cfg.SessionIdleTimeout,
+		maxSessions:       resolveSessionMax(cfg.SessionMax),
+		maxPerPrincipal:   resolveSessionMaxPerPrincipal(cfg.SessionMaxPerPrincipal),
+		padding:           cfg.Padding,
 	}
 	if s.sessions.idleTimeout <= 0 {
 		s.sessions.idleTimeout = sessionIdleTimeout
@@ -157,6 +163,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	s.rootHandler = s.buildRootHandler()
 	if cfg.EnableH3 {
 		s.wtServer = newH3WTServer("", s.rootHandler, cfg.TLSConfig)
+		s.wtServer.H3.QUICConfig = cfg.QUICReceiveWindow.config()
 	}
 	handler := s.rootHandler
 	// h2 receive window (uplink flow-control backpressure): x/net defaults to 1MB
@@ -208,6 +215,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		}
 	}
 	s.cfg.stats = &s.stats.server
+	s.cfg.logger = s.log
 	s.cfg.events = &s.events
 	if options.EventHandler != nil {
 		s.SetEventHandler(options.EventHandler)

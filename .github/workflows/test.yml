@@ -234,8 +234,9 @@ jobs:
       - name: Collect CPU + memory profiles from the throughput benchmark
         shell: bash
         run: |
-          go test -run '^$' -bench 'BenchmarkProtocolThroughput/(H2_TCP|H2C_TCP|gRPC_TCP|H3_TCP|WT_TCP|MASQUE_TCP|MASQUE_H2_TCP|MASQUE_H3_TCP|MASQUE_H2_UDP|MASQUE_H3_UDP)$' \
-            -benchtime 3s -timeout 20m -cpuprofile cpu.out -memprofile mem.out .
+          go test -run '^$' -bench 'BenchmarkProtocolStreaming/Padding=true/(H2|H3)/(Download|Duplex)/Streams=1$' \
+            -benchtime 3s -timeout 20m -cpuprofile cpu.out -memprofile mem.out \
+            -mutexprofile mutex.out -blockprofile block.out .
 
       - name: Render flamegraphs and top reports
         shell: bash
@@ -245,6 +246,8 @@ jobs:
           go tool pprof -top cpu.out </dev/null > profile-out/cpu-top.txt
           go tool pprof -svg -sample_index=alloc_space mem.out > profile-out/alloc-flamegraph.svg
           go tool pprof -top -sample_index=alloc_objects mem.out </dev/null > profile-out/alloc-top.txt || true
+          go tool pprof -top mutex.out </dev/null > profile-out/mutex-top.txt
+          go tool pprof -top block.out </dev/null > profile-out/block-top.txt
 
       - name: Upload profiles
         uses: actions/upload-artifact@v4

@@ -91,6 +91,10 @@ func newProtocolEnv(t testing.TB) *protocolEnv {
 }
 
 func newProtocolEnvWithPadding(t testing.TB, padding h2tunnel.PaddingTuning) *protocolEnv {
+	return newProtocolEnvWithServerTuning(t, h2tunnel.ServerTuning{Padding: padding})
+}
+
+func newProtocolEnvWithServerTuning(t testing.TB, tuning h2tunnel.ServerTuning) *protocolEnv {
 	t.Helper()
 	env := &protocolEnv{}
 
@@ -123,6 +127,12 @@ func newProtocolEnvWithPadding(t testing.TB, padding h2tunnel.PaddingTuning) *pr
 	udpEcho := bindUDPRetry(t, "127.0.0.1:0")
 	go serveUDPEcho(udpEcho)
 	t.Cleanup(func() { _ = udpEcho.Close() })
+	transfer, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go serveTransferTarget(transfer)
+	t.Cleanup(func() { _ = transfer.Close() })
 
 	// —— tunnel servers ——
 	authenticator, err := h2tunnel.NewTokenAuthenticator(protocolMatrixToken)
@@ -130,10 +140,11 @@ func newProtocolEnvWithPadding(t testing.TB, padding h2tunnel.PaddingTuning) *pr
 		t.Fatal(err)
 	}
 	dialer, err := h2tunnel.NewStaticServiceDialer(map[string]h2tunnel.Service{
-		"http":      {Network: h2tunnel.NetworkTCP, Address: rawHTTP.Addr().String()},
-		"dns":       {Network: h2tunnel.NetworkUDP, Address: env.dnsConn.LocalAddr().String()},
-		"bench-tcp": {Network: h2tunnel.NetworkTCP, Address: benchEcho.Addr().String()},
-		"bench-udp": {Network: h2tunnel.NetworkUDP, Address: udpEcho.LocalAddr().String()},
+		"http":           {Network: h2tunnel.NetworkTCP, Address: rawHTTP.Addr().String()},
+		"dns":            {Network: h2tunnel.NetworkUDP, Address: env.dnsConn.LocalAddr().String()},
+		"bench-tcp":      {Network: h2tunnel.NetworkTCP, Address: benchEcho.Addr().String()},
+		"bench-udp":      {Network: h2tunnel.NetworkUDP, Address: udpEcho.LocalAddr().String()},
+		"bench-transfer": {Network: h2tunnel.NetworkTCP, Address: transfer.Addr().String()},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +161,7 @@ func newProtocolEnvWithPadding(t testing.TB, padding h2tunnel.PaddingTuning) *pr
 		TLSConfig:     tlsConfig,
 		Authenticator: authenticator,
 		Dialer:        dialer,
-		Tuning:        h2tunnel.ServerTuning{Padding: padding},
+		Tuning:        tuning,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +200,7 @@ func newProtocolEnvWithPadding(t testing.TB, padding h2tunnel.PaddingTuning) *pr
 		Networks:      []h2tunnel.Network{h2tunnel.NetworkTCP, h2tunnel.NetworkUDP},
 		Authenticator: authenticator,
 		Dialer:        dialer,
-		Tuning:        h2tunnel.ServerTuning{Padding: padding},
+		Tuning:        tuning,
 	})
 	if err != nil {
 		t.Fatal(err)

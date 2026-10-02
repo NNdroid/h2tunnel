@@ -31,11 +31,12 @@ type virtualPacketConn struct {
 	// Tunnel data-plane ingress, injected per transport by DialPacketContext:
 	//   - h2/h2c/h3/grpc/masque: udpSession (upstream = uplink queue, tunnelDone = session end)
 	//   - wt: WT-stream datagram plane (see client_api.go dialPacketWT)
-	upstream   chan<- []byte
+	upstream   *datagramQueue
 	tunnelDone <-chan struct{}
 	tunnel     io.Closer
 
 	mu            sync.Mutex
+	deliverMu     sync.RWMutex
 	readDeadline  time.Time
 	writeDeadline time.Time
 	readChanged   chan struct{}
@@ -63,16 +64,20 @@ func newVirtualPacketConn(target string, cancel context.CancelFunc) *virtualPack
 
 // deliver hands an inbound UDP packet to the reader (ReadFrom) using a pooled
 // buffer so the hot inbound path stays allocation-free. ReadFrom returns the
-// buffer to udpBufPool once it has copied the bytes into the application's
+// buffer to its size-class pool once it has copied the bytes into the application's
 // buffer, so there is no per-packet heap allocation on the receive path.
 func (c *virtualPacketConn) deliver(packet []byte) error {
-	bufPtr := udpBufPool.Get().(*[]byte)
-	buf := *bufPtr
-	n := copy(buf, packet)
-	d := udpData{BufPtr: bufPtr, Data: buf[:n]}
+	c.deliverMu.RLock()
+	defer c.deliverMu.RUnlock()
 	select {
 	case <-c.done:
-		udpBufPool.Put(bufPtr)
+		return net.ErrClosed
+	default:
+	}
+	d := copyDatagram(packet)
+	select {
+	case <-c.done:
+		releaseDatagram(d)
 		return net.ErrClosed
 	case c.incoming <- d:
 		return nil
@@ -99,9 +104,7 @@ func (c *virtualPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		case d := <-c.incoming:
 			stopTimer(timer)
 			n := copy(p, d.Data)
-			if d.BufPtr != nil {
-				udpBufPool.Put(d.BufPtr)
-			}
+			releaseDatagram(d)
 			return n, c.remote, nil
 		case <-changed:
 			stopTimer(timer)
@@ -119,12 +122,28 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if len(p) > maxTunnelUDPPayload {
 		return 0, &net.OpError{Op: "write", Net: networkUDP, Addr: c.remote, Err: fmt.Errorf("UDP payload exceeds tunnel limit %d", maxTunnelUDPPayload)}
 	}
-	packet := append([]byte(nil), p...)
+	c.upstream.mu.RLock()
+	defer c.upstream.mu.RUnlock()
+	select {
+	case <-c.done:
+		return 0, c.endError()
+	case <-c.upstream.done:
+		return 0, net.ErrClosed
+	default:
+	}
+	packet := copyDatagram(p)
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseDatagram(packet)
+		}
+	}()
 	for {
 		deadline, changed := c.writeState()
 		timer, timeout := deadlineTimer(deadline)
 		select {
-		case c.upstream <- packet:
+		case c.upstream.packets <- packet:
+			transferred = true
 			stopTimer(timer)
 			return len(p), nil
 		case <-changed:
@@ -134,6 +153,9 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 			stopTimer(timer)
 			return 0, c.endError()
 		case <-c.tunnelDone:
+			stopTimer(timer)
+			return 0, net.ErrClosed
+		case <-c.upstream.done:
 			stopTimer(timer)
 			return 0, net.ErrClosed
 		case <-timeout:
@@ -156,7 +178,7 @@ type closeFunc func()
 func (f closeFunc) Close() error { f(); return nil }
 
 // attachWTTunnel injects the WebTransport stream data plane.
-func (c *virtualPacketConn) attachWTTunnel(upstream chan<- []byte, tunnelDone <-chan struct{}, tunnel io.Closer) {
+func (c *virtualPacketConn) attachWTTunnel(upstream *datagramQueue, tunnelDone <-chan struct{}, tunnel io.Closer) {
 	c.upstream = upstream
 	c.tunnelDone = tunnelDone
 	c.tunnel = tunnel
@@ -172,13 +194,24 @@ func (c *virtualPacketConn) fail(err error) {
 		c.mu.Lock()
 		c.terminalErr = err
 		c.mu.Unlock()
+		close(c.done)
 		if c.cancel != nil {
 			c.cancel()
 		}
 		if c.tunnel != nil {
 			_ = c.tunnel.Close()
 		}
-		close(c.done)
+		c.deliverMu.Lock()
+		for {
+			select {
+			case p := <-c.incoming:
+				releaseDatagram(p)
+			default:
+				goto drained
+			}
+		}
+	drained:
+		c.deliverMu.Unlock()
 		if c.onClose != nil {
 			c.onClose()
 		}

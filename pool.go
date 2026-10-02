@@ -24,4 +24,5 @@ var (
 type udpData struct {
 	BufPtr *[]byte
 	Data   []byte
+	pool   *sync.Pool
 }

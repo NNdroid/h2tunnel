@@ -218,7 +218,7 @@ Callbacks are dispatched on a dedicated goroutine with panic recovery and never 
 
 Self-heal tuning (`ClientTuning`):
 
-- `AutoRedial: true` — automatically resets and continues after redial exhaustion (16 attempts), essential for "stay down until the network returns" scenarios; when off, exhaustion terminates the tunnel and dispatches a `TunnelDied` event.
+- `AutoRedial: true` — continues after redial exhaustion (16 attempts) during transient outages; when off, exhaustion terminates the tunnel and dispatches a `TunnelDied` event. Authentication / policy rejection (401/403/407) and incompatible protocol versions (426) stop immediately in both modes. Change credentials/policy/version and dial again. Retries use jitter; a stream that ran successfully for 30 seconds resets the backoff cadence.
 - `RedialBudget` — per-attempt dial budget for stream setup + handshake, tightening the abandon pace during outages; the timer stops once the tunnel is ready and never affects established streams.
 - `SessionWindowBytes` — when outage duration × downlink rate exceeds the window, the gap is unrecoverable; raise it for long outages / high throughput.
 
@@ -614,6 +614,8 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `padding.min_record_bytes` | shared | `0` (off) | minimum application-layer tunnel record length; must be `17..65527`. The client shapes the uplink, the server shapes the downlink |
 | `padding.max_record_bytes` | shared | 125% of the minimum | random cap for application-layer tunnel records; at most `65535`, at least 8B above the minimum. Large UDP packets are never split to satisfy the cap |
 | `pprof` | server | empty | when non-empty, start `net/http/pprof` at that address (e.g. `127.0.0.1:6060`); bind only to trusted addresses |
+| `pause_detached_read` | server | false | pause TCP target reads while the tunnel is detached, applying target-side backpressure during recovery; one read already in flight may complete; UDP is unaffected |
+| `quic_receive_window` | both | default | H3/WT/MASQUE-H3 receive-window tuning: `initial_stream_bytes`, `initial_connection_bytes`, `max_stream_bytes`, `max_connection_bytes`; zero keeps existing defaults, each field is bounded to 256 MiB |
 | `brutal.enabled` | shared | `false` | Linux TCP Brutal congestion control. On other operating systems, or when the running kernel has no `brutal` controller, this is a silent no-op (one WARN at startup) and traffic falls back to the default controller |
 | `brutal.rate_bytes` | shared | `0` (no local preference) | declared bandwidth in bytes/second for this side; the effective value is the minimum of the two sides. `0` means "no opinion, take the peer's value"; if both sides say `0` only the congestion algorithm is switched and no rate is pushed |
 | `brutal.cwnd_gain` | shared | `0` (→ 15) | congestion window gain in tenths: `15` = 1.5x, `20` = 2.0x. `0` selects the built-in 1.5x; anything above 1000 fails at startup. The effective value is the minimum of the two sides |
@@ -711,6 +713,13 @@ go test -run '^$' -bench 'BenchmarkWriteFrame32KB|BenchmarkReadFrame32KB|Benchma
 
 # CDN-topology end-to-end benchmark
 go test -run '^$' -bench '^BenchmarkPublicAPIThroughCDN72KB$' -benchmem .
+
+# Continuous one-way / full-duplex transfers through real TCP targets (1/8 sessions)
+# Set GODEBUG=http2xconnect=1 before running to include the MASQUE H2 carrier.
+go test -run '^$' -bench '^BenchmarkProtocolStreaming$' -benchmem .
+
+# Recovery under traffic, delayed CDN streaming, and large UDP datagrams
+go test -run 'TestProtocolRecoveryDuringContinuousTraffic|TestPaddedContinuousTrafficThroughDelayedCDN|TestLargeUDPDatagramsAllProtocols' .
 ```
 
 ## Continuous integration and releases

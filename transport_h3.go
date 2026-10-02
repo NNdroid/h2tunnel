@@ -53,7 +53,7 @@ func newH3Transport(cfg clientConfig) *http.Client {
 	}
 	return &http.Client{Transport: &http3.Transport{
 		TLSClientConfig: tlsConfig,
-		QUICConfig:      getDefaultQUICConfig(),
+		QUICConfig:      cfg.QUICReceiveWindow.config(),
 		Dial:            cfg.QUICDialer,
 	}}
 }

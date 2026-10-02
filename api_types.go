@@ -150,6 +150,8 @@ type ClientOptions struct {
 // ClientTuning contains the small set of knobs that materially affect CDN
 // reliability or per-session memory. Zero values select safe defaults.
 type ClientTuning struct {
+	// QUIC receive credit; zero preserves the current H3/WT/MASQUE defaults.
+	QUICReceiveWindow QUICReceiveWindowTuning
 	// Session-recovery ring window size (bytes). 0 = default 256KB, capped at
 	// 64MB (larger errors). Outage-recovery note: outage duration × downlink rate
 	// > window ⇒ the gap is unrecoverable and the session terminates. Raise it for
@@ -220,6 +222,13 @@ type ServerOptions struct {
 
 // Server performance tuning. Zero values select safe defaults.
 type ServerTuning struct {
+	// QUIC receive credit; zero preserves the current H3/WT/MASQUE defaults.
+	QUICReceiveWindow QUICReceiveWindowTuning
+	// Pause TCP target reads while detached. This applies transport backpressure
+	// during recovery instead of continuously overwriting the replay window.
+	// A read already in flight can still append one chunk. UDP is unaffected.
+	// False preserves the existing overwrite behavior. Idle retention still applies.
+	PauseDetachedRead bool
 	// Session-recovery ring window size (bytes). 0 = default 256KB, capped at
 	// 64MB (larger errors).
 	SessionWindowBytes int

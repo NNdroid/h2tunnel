@@ -77,16 +77,19 @@ type tunnelSession struct {
 	// interleave bytes on the target stream. It is taken WITHOUT s.mu held: the
 	// seq bookkeeping in acceptUplinkSeq happens under s.mu (fast, no I/O), then
 	// the actual (potentially blocking) targetConn.Write happens only under
-	// writeMu. This keeps a slow/blocked target write from stalling the session's
+	// writeMu. Committed bytes advance uplinkRecv after each target write. This
+	// keeps a slow/blocked target write from stalling the session's
 	// control plane (downlink pump, reaper, close) which would otherwise wait on
 	// s.mu.
 	writeMu sync.Mutex
 
 	// downlink: server targetConn → HTTP stream / ring buffer
-	downlinkSent uint64 // bytes written to the client, cumulative
-	downlinkRing *ringBuffer
-	activeWriter *resumeSessionWriter // downlink writer of the current active stream; nil = no stream
-	closed       bool
+	downlinkSent      uint64 // bytes written to the client, cumulative
+	downlinkRing      *ringBuffer
+	activeWriter      *resumeSessionWriter // downlink writer of the current active stream; nil = no stream
+	closed            bool
+	pauseDetachedRead bool
+	writerChanged     chan struct{}
 
 	// downlinkMu serializes downlink frame writes (replay vs live) so the
 	// client sees strictly continuous downlink seq; frameSentSeq records
@@ -146,6 +149,13 @@ func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 			return len(data), nil
 		}
 		s.downlinkMu.Lock()
+		s.mu.Lock()
+		writer = s.activeWriter
+		s.mu.Unlock()
+		if writer == nil {
+			s.downlinkMu.Unlock()
+			return len(data), nil
+		}
 		err := s.frameW(&resumeWriterAdapter{w: writer}, data)
 		s.downlinkMu.Unlock()
 		if err != nil {
@@ -172,9 +182,23 @@ func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 	// written — the race window) are skipped, so the seq the client sees
 	// stays strictly continuous.
 	s.downlinkMu.Lock()
+	// A reconnect can replace the writer while this chunk waits behind replay.
+	// Send on the current generation, never the obsolete stream captured above.
+	s.mu.Lock()
+	writer = s.activeWriter
+	s.mu.Unlock()
+	if writer == nil {
+		s.downlinkMu.Unlock()
+		return len(data), nil
+	}
 	if seq+uint64(len(data)) <= s.frameSentSeq {
 		s.downlinkMu.Unlock()
 		return len(data), nil
+	}
+	originalLen := len(data)
+	if seq < s.frameSentSeq {
+		data = data[s.frameSentSeq-seq:]
+		seq = s.frameSentSeq
 	}
 	// This chunk's start seq = seq. Write a resume frame (the client's
 	// readResumeFrame parses by seq).
@@ -188,7 +212,7 @@ func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 		// stream resumes from the downlink seq.
 		s.clearActiveWriter(writer)
 	}
-	return len(data), nil
+	return originalLen, nil
 }
 
 // lg returns the session table logger (nil-safe).
@@ -212,6 +236,7 @@ func (s *tunnelSession) setActiveWriter(w *resumeSessionWriter) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.activeWriter = w
+	s.signalWriterChangedLocked()
 }
 
 // clearActiveWriter clears it when the stream closes.
@@ -220,6 +245,37 @@ func (s *tunnelSession) clearActiveWriter(w *resumeSessionWriter) {
 	defer s.mu.Unlock()
 	if s.activeWriter == w {
 		s.activeWriter = nil
+		s.signalWriterChangedLocked()
+	}
+}
+
+func (s *tunnelSession) signalWriterChangedLocked() {
+	if !s.pauseDetachedRead {
+		return
+	}
+	if s.writerChanged != nil {
+		close(s.writerChanged)
+	}
+	s.writerChanged = make(chan struct{})
+}
+
+func (s *tunnelSession) waitActiveWriter() bool {
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return false
+		}
+		if s.activeWriter != nil {
+			s.mu.Unlock()
+			return true
+		}
+		if s.writerChanged == nil {
+			s.writerChanged = make(chan struct{})
+		}
+		changed := s.writerChanged
+		s.mu.Unlock()
+		<-changed
 	}
 }
 
@@ -248,7 +304,10 @@ func (s *tunnelSession) replayDownlinkLocked(w *resumeSessionWriter, fromSeq uin
 	tmp := make([]byte, 8192)
 	seq := fromSeq
 	for seq < target {
-		n, err := s.downlinkRing.ReadAt(seq, tmp)
+		// A concurrent pump may append while replay writes block. Do not read
+		// beyond this replay's snapshot and overlap a queued live chunk.
+		limit := min(uint64(len(tmp)), target-seq)
+		n, err := s.downlinkRing.ReadAt(seq, tmp[:limit])
 		if n > 0 {
 			if _, wErr := w.writeFrame(seq, tmp[:n]); wErr != nil {
 				return wErr
@@ -293,6 +352,10 @@ func (s *tunnelSession) attachAndReplay(writer *resumeSessionWriter, fromSeq uin
 // datagram mode: data is an already-decoded UDP packet, committed directly
 // with no seq check.
 func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
+	// Serialize both sequence decisions and their target writes. A concurrent
+	// resume can snapshot the committed watermark while the old write blocks.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -306,16 +369,21 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 		// No ordering in datagram mode: validate liveness, then write under
 		// writeMu (released s.mu first so the socket write can't stall s.mu).
 		s.lastSeen.Store(time.Now().UnixNano())
+		conn := s.targetConn
 		s.mu.Unlock()
-		return s.writeTarget(data)
+		n, err := conn.Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+		return err
 	}
 	expected := s.uplinkRecv
 	switch {
 	case seq < expected:
 		// The client re-sent bytes already received (early in recovery);
 		// trim the duplicated head as expected.
-		skip := int(expected - seq)
-		if skip >= len(data) {
+		skip := expected - seq
+		if skip >= uint64(len(data)) {
 			s.lastSeen.Store(time.Now().UnixNano())
 			s.mu.Unlock()
 			return nil
@@ -326,44 +394,46 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 		s.mu.Unlock()
 		return errResumeBadSeq
 	}
-	s.uplinkRecv += uint64(len(data))
-	s.lastSeen.Store(time.Now().UnixNano())
+	conn := s.targetConn
 	s.mu.Unlock()
-	return s.writeTarget(data)
-}
-
-// writeTarget serializes the (potentially blocking) targetConn.Write without
-// holding s.mu, so a congested upstream cannot stall the session's control plane
-// (downlink pump / reaper / close all serialize on s.mu). writeMu is taken so
-// concurrent uplink frames don't interleave bytes on the target stream.
-func (s *tunnelSession) writeTarget(data []byte) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	s.mu.Lock()
-	closed := s.closed
-	s.mu.Unlock()
-	if closed {
-		return net.ErrClosed
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n < 0 || n > len(data) {
+			return io.ErrShortWrite
+		}
+		if n > 0 {
+			s.mu.Lock()
+			s.uplinkRecv += uint64(n)
+			s.mu.Unlock()
+			s.lastSeen.Store(time.Now().UnixNano())
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
-	if _, err := s.targetConn.Write(data); err != nil {
-		return err
-	}
-	s.lastSeen.Store(time.Now().UnixNano())
 	return nil
 }
 
 // sessionTable is the server-side session table (instance-level, owned by a
 // Server; embedded libraries do not share tables across Servers).
 type sessionTable struct {
-	events          *serverEventSink
-	logger          *slog.Logger
-	padding         paddingPolicy
-	mu              sync.Mutex
-	sessions        map[string]*tunnelSession
-	perPrincipal    map[string]int // active session count per principal (for the per-principal cap)
-	idleTimeout     time.Duration
-	maxSessions     int // global cap on concurrent sessions (0 = unlimited)
-	maxPerPrincipal int // per-principal cap (0 = unlimited)
+	events            *serverEventSink
+	logger            *slog.Logger
+	padding           paddingPolicy
+	mu                sync.Mutex
+	sessions          map[string]*tunnelSession
+	perPrincipal      map[string]int // active session count per principal (for the per-principal cap)
+	idleTimeout       time.Duration
+	maxSessions       int // global cap on concurrent sessions (0 = unlimited)
+	maxPerPrincipal   int // per-principal cap (0 = unlimited)
+	pending           int // reserved slots, including target dials in progress
+	pendingPrincipal  map[string]int
+	closed            bool
+	pauseDetachedRead bool
 }
 
 type sessionBinding struct {
@@ -435,9 +505,9 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 	// target: a rejected new session must not waste an upstream connection, and
 	// the cap bounds memory under a flood of distinct (never-resumed) session
 	// IDs. Resuming an already-present session is unaffected (it does not add one).
-	if !t.canAdmit(binding.principalID) {
+	if t.closed {
 		t.mu.Unlock()
-		return nil, false, errSessionLimitExceeded
+		return nil, false, net.ErrClosed
 	}
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
@@ -458,30 +528,56 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 		}
 		return nil, false, errors.New("session exists but target is dead")
 	}
+	if !t.canAdmit(binding.principalID) {
+		t.mu.Unlock()
+		return nil, false, errSessionLimitExceeded
+	}
+	if t.pendingPrincipal == nil {
+		t.pendingPrincipal = make(map[string]int)
+	}
+	t.pending++
+	t.pendingPrincipal[binding.principalID]++
 	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.pending--
+		t.pendingPrincipal[binding.principalID]--
+		if t.pendingPrincipal[binding.principalID] == 0 {
+			delete(t.pendingPrincipal, binding.principalID)
+		}
+		t.mu.Unlock()
+	}()
 
 	tconn, err := dialTarget()
 	if err != nil {
 		return nil, false, err
 	}
 	s := &tunnelSession{
-		logger:       t.logger,
-		id:           id,
-		createdAt:    time.Now(),
-		network:      binding.network,
-		events:       t.events,
-		targetConn:   tconn,
-		datagram:     datagram,
-		binding:      binding,
-		frameW:       frameW,
-		frameR:       frameR,
-		downlinkRing: newRingBuffer(sizeKB),
+		pauseDetachedRead: t.pauseDetachedRead && !datagram,
+		logger:            t.logger,
+		id:                id,
+		createdAt:         time.Now(),
+		network:           binding.network,
+		events:            t.events,
+		targetConn:        tconn,
+		datagram:          datagram,
+		binding:           binding,
+		frameW:            frameW,
+		frameR:            frameR,
+	}
+	if !datagram {
+		s.downlinkRing = newRingBuffer(sizeKB)
 	}
 	s.lastSeen.Store(time.Now().UnixNano())
 
 	// A competing request may have installed the same ID while this one dialed.
 	// Keep the established session and close the losing connection immediately.
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		_ = tconn.Close()
+		return nil, false, net.ErrClosed
+	}
 	if existing, ok := t.sessions[id]; ok {
 		existing.mu.Lock()
 		bindingMatches := existing.binding.matches(binding)
@@ -517,10 +613,10 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 // canAdmit reports whether a new session for principalID may be admitted under
 // the configured global and per-principal caps. Caller must hold t.mu.
 func (t *sessionTable) canAdmit(principalID string) bool {
-	if t.maxSessions > 0 && len(t.sessions) >= t.maxSessions {
+	if t.maxSessions > 0 && len(t.sessions)+t.pending >= t.maxSessions {
 		return false
 	}
-	if t.maxPerPrincipal > 0 && t.perPrincipal[principalID] >= t.maxPerPrincipal {
+	if t.maxPerPrincipal > 0 && t.perPrincipal[principalID]+t.pendingPrincipal[principalID] >= t.maxPerPrincipal {
 		return false
 	}
 	return true
@@ -534,7 +630,7 @@ func (t *sessionTable) deleteSessionLocked(id string) (*tunnelSession, bool) {
 		return nil, false
 	}
 	delete(t.sessions, id)
-	if s.binding.principalID != "" && t.perPrincipal != nil {
+	if t.perPrincipal != nil {
 		t.perPrincipal[s.binding.principalID]--
 		if t.perPrincipal[s.binding.principalID] <= 0 {
 			delete(t.perPrincipal, s.binding.principalID)
@@ -588,7 +684,10 @@ func (t *sessionTable) removeLocked(id string) *tunnelSession {
 func (s *tunnelSession) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.closed = true
+	if !s.closed {
+		s.closed = true
+		s.signalWriterChangedLocked()
+	}
 	s.targetCloseOnce.Do(func() {
 		if s.targetConn != nil {
 			_ = s.targetConn.Close()
@@ -608,9 +707,13 @@ func (s *tunnelSession) touch() {
 // targetConn is read continuously, data keeps going into the ring, and the
 // next stream resumes from seq.
 func (s *tunnelSession) downlinkPump() {
-	bufPtr := tcpBufPool.Get().(*[]byte)
+	pool := &tcpBufPool
+	if s.datagram {
+		pool = &udpBufPool
+	}
+	bufPtr := pool.Get().(*[]byte)
 	buf := *bufPtr
-	defer tcpBufPool.Put(bufPtr)
+	defer pool.Put(bufPtr)
 	defer s.close()
 
 	// Give targetConn a 5-minute read deadline backstop. The idle reaper closes
@@ -623,6 +726,9 @@ func (s *tunnelSession) downlinkPump() {
 		// Datagram reads preserve one complete UDP message. Stream shaping is
 		// centralized in resumeSessionWriter, so live and replayed bytes follow
 		// the same record policy without increasing target read syscalls.
+		if s.pauseDetachedRead && !s.waitActiveWriter() {
+			return
+		}
 		n, err := s.targetConn.Read(buf)
 		if n > 0 {
 			s.writeDownlink(buf[:n])
@@ -684,33 +790,22 @@ func (a *resumeWriterAdapter) Write(p []byte) (int, error) {
 // and flushes. seq is this chunk's starting offset in the session's downlink
 // coordinate space.
 func (w *resumeSessionWriter) writeFrame(seq uint64, data []byte) (int, error) {
-	written := 0
-	for len(data) > 0 {
-		chunkLen, padLen := w.padding.dataChunk(len(data), resumeHeaderLen)
-		if err := w.writeOneFrame(seq, data[:chunkLen], padLen); err != nil {
-			return written, err
-		}
-		written += chunkLen
-		seq += uint64(chunkLen)
-		data = data[chunkLen:]
-	}
-	return written, nil
-}
-
-func (w *resumeSessionWriter) writeOneFrame(seq uint64, data []byte, padLen int) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return net.ErrClosed
+		return 0, net.ErrClosed
 	}
-	if err := writeResumeFrame(w.w, seq, data, padLen); err != nil {
+	n, err := writeResumeDataFrames(w.w, seq, data, w.padding)
+	if err != nil {
 		w.closed = true
-		return err
+		return n, err
 	}
-	if w.flusher != nil {
+	// Flush a complete input chunk once. Record boundaries and padding are
+	// unchanged; small interactive writes still flush immediately.
+	if n > 0 && w.flusher != nil {
 		w.flusher.Flush()
 	}
-	return nil
+	return n, nil
 }
 
 // writeRaw writes raw bytes on the stream and flushes, without resume
@@ -854,8 +949,10 @@ func (t *sessionTable) len() int {
 func (t *sessionTable) closeAll() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.closed = true
 	for _, s := range t.sessions {
 		s.close()
 	}
 	t.sessions = make(map[string]*tunnelSession)
+	t.perPrincipal = make(map[string]int)
 }

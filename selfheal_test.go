@@ -12,6 +12,7 @@ package h2tunnel_test
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -142,7 +143,7 @@ func TestAutoRedialRecoversAfterExhaustion(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			if deny {
-				return nil, h2tunnel.ErrForbidden
+				return nil, errors.New("target temporarily unavailable")
 			}
 			return realDialer(ctx, request)
 		},
@@ -174,7 +175,7 @@ func TestAutoRedialRecoversAfterExhaustion(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 
-	// Background dial: the target is currently denied, so it keeps redialing
+	// Background dial: the target is temporarily unavailable, so it keeps redialing
 	// (AutoRedial keeps it alive).
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dialCancel()

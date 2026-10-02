@@ -49,8 +49,10 @@ type config struct {
 	MasqueALPN string `json:"masque_alpn"`
 	// SessionMax caps concurrent resume sessions on the server (0 = default
 	// 4096). SessionMaxPerPrincipal is the per-principal cap (0 = default 256).
-	SessionMax             int `json:"session_max"`
-	SessionMaxPerPrincipal int `json:"session_max_per_principal"`
+	SessionMax             int                              `json:"session_max"`
+	SessionMaxPerPrincipal int                              `json:"session_max_per_principal"`
+	QUICReceiveWindow      h2tunnel.QUICReceiveWindowTuning `json:"quic_receive_window"`
+	PauseDetachedRead      bool                             `json:"pause_detached_read"`
 	// Brutal requests TCP Brutal on the tunnel's TCP legs (Linux only; the
 	// non-Linux builds are a silent no-op).
 	Brutal brutalConfig `json:"brutal"`
@@ -190,6 +192,12 @@ func (cfg *config) validate() error {
 	if err := cfg.Brutal.validate(); err != nil {
 		return err
 	}
+	if err := cfg.QUICReceiveWindow.Validate(); err != nil {
+		return err
+	}
+	if cfg.Mode == "client" && cfg.PauseDetachedRead {
+		return errors.New("pause_detached_read is server-only")
+	}
 	if cfg.Mode == "server" {
 		if cfg.Listen == "" {
 			cfg.Listen = ":8443"
@@ -302,8 +310,9 @@ func applyEnvironment(cfg *config) error {
 	}
 	bools := map[string]*bool{
 		"H2TUNNEL_TLS": &cfg.TLS, "H2TUNNEL_INSECURE": &cfg.Insecure,
-		"H2TUNNEL_LOCAL_ONLY":     &cfg.LocalOnly,
-		"H2TUNNEL_BRUTAL_ENABLED": &cfg.Brutal.Enabled,
+		"H2TUNNEL_LOCAL_ONLY":          &cfg.LocalOnly,
+		"H2TUNNEL_BRUTAL_ENABLED":      &cfg.Brutal.Enabled,
+		"H2TUNNEL_PAUSE_DETACHED_READ": &cfg.PauseDetachedRead,
 	}
 	for key, destination := range bools {
 		if value, ok := os.LookupEnv(key); ok {
@@ -345,8 +354,12 @@ func applyEnvironment(cfg *config) error {
 		}
 	}
 	for key, destination := range map[string]*uint64{
-		"H2TUNNEL_BRUTAL_RATE_BYTES": &cfg.Brutal.RateBytes,
-		"H2TUNNEL_BRUTAL_GROUP_ID":   &cfg.Brutal.GroupID,
+		"H2TUNNEL_QUIC_INITIAL_STREAM_BYTES":     &cfg.QUICReceiveWindow.InitialStreamBytes,
+		"H2TUNNEL_QUIC_MAX_STREAM_BYTES":         &cfg.QUICReceiveWindow.MaxStreamBytes,
+		"H2TUNNEL_QUIC_INITIAL_CONNECTION_BYTES": &cfg.QUICReceiveWindow.InitialConnectionBytes,
+		"H2TUNNEL_QUIC_MAX_CONNECTION_BYTES":     &cfg.QUICReceiveWindow.MaxConnectionBytes,
+		"H2TUNNEL_BRUTAL_RATE_BYTES":             &cfg.Brutal.RateBytes,
+		"H2TUNNEL_BRUTAL_GROUP_ID":               &cfg.Brutal.GroupID,
 	} {
 		if value, ok := os.LookupEnv(key); ok {
 			parsed, err := strconv.ParseUint(value, 10, 64)

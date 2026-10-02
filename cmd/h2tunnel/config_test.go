@@ -1,6 +1,7 @@
 package main
 
 import (
+	h2tunnel "github.com/NNdroid/h2tunnel"
 	"io"
 	"os"
 	"path/filepath"
@@ -8,6 +9,39 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestPerformanceConfigAndEnvironment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := `{"mode":"server","pause_detached_read":true,"quic_receive_window":{"initial_stream_bytes":1048576,"initial_connection_bytes":2097152,"max_stream_bytes":16777216,"max_connection_bytes":33554432}}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.PauseDetachedRead || cfg.QUICReceiveWindow.MaxStreamBytes != 16<<20 {
+		t.Fatal("JSON tuning lost")
+	}
+	t.Setenv("H2TUNNEL_QUIC_MAX_STREAM_BYTES", "25165824")
+	t.Setenv("H2TUNNEL_PAUSE_DETACHED_READ", "false")
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PauseDetachedRead || cfg.QUICReceiveWindow.MaxStreamBytes != 24<<20 {
+		t.Fatal("environment tuning lost")
+	}
+	for _, bad := range []config{
+		{Mode: "server", QUICReceiveWindow: h2tunnel.QUICReceiveWindowTuning{MaxStreamBytes: 257 << 20}},
+		{Mode: "server", QUICReceiveWindow: h2tunnel.QUICReceiveWindowTuning{InitialStreamBytes: 9 << 20}},
+		{Mode: "client", Server: "https://example.com", Target: "echo", PauseDetachedRead: true},
+	} {
+		if err := bad.validate(); err == nil {
+			t.Fatal("invalid performance config accepted")
+		}
+	}
+}
 
 func TestParseLeadingConfig(t *testing.T) {
 	tests := []struct {

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,7 +50,10 @@ type udpSession struct {
 	frameR func(io.Reader, []byte) (int, error)
 
 	// upstream is the uplink queue: the local UDP receive goroutine enqueues, the stream write goroutine consumes.
-	upstream chan []byte
+	upstream    *datagramQueue
+	dropped     atomic.Uint64
+	lastDropLog atomic.Int64
+	readyAt     time.Time // owned by the reconnect loop
 	// closing done signals the current stream's read/write loops to exit (session end).
 	done      chan struct{}
 	doneOnce  sync.Once
@@ -70,7 +74,7 @@ func newUDPSession(sessionID string, cfg clientConfig, reqUrl string, httpClient
 		httpClient: httpClient,
 		localConn:  localConn,
 		clientAddr: clientAddr,
-		upstream:   make(chan []byte, cfg.datagramQueueSize()),
+		upstream:   newDatagramQueue(cfg.datagramQueueSize()),
 		done:       make(chan struct{}),
 	}
 	if cfg.usesMasque() {
@@ -84,7 +88,7 @@ func newUDPSession(sessionID string, cfg clientConfig, reqUrl string, httpClient
 }
 
 func (s *udpSession) close() {
-	s.doneOnce.Do(func() { close(s.done) })
+	s.doneOnce.Do(func() { close(s.done); s.upstream.close() })
 }
 
 func (s *udpSession) notifyReady(err error) {
@@ -96,12 +100,31 @@ func (s *udpSession) notifyReady(err error) {
 
 // enqueue puts a locally received UDP packet onto the uplink queue; drops it if the session already ended.
 func (s *udpSession) enqueue(pkt []byte) {
+	s.upstream.mu.RLock()
+	defer s.upstream.mu.RUnlock()
+	p := copyDatagram(pkt)
+	select {
+	case <-s.upstream.done:
+		releaseDatagram(p)
+		return
+	default:
+	}
 	select {
 	case <-s.done:
+		releaseDatagram(p)
 		return
-	case s.upstream <- pkt:
+	case s.upstream.packets <- p:
 	default:
-		lgWarnf(s.cfg.lg(), "[UDP-Resume:%s] ⚠️ uplink queue overflow, dropping packet from %s", s.sessionID, s.clientAddr)
+		releaseDatagram(p)
+		s.dropped.Add(1)
+		if s.cfg.stats != nil {
+			s.cfg.stats.DatagramDrops.Add(1)
+		}
+		now := time.Now().UnixNano()
+		last := s.lastDropLog.Load()
+		if now-last >= int64(time.Second) && s.lastDropLog.CompareAndSwap(last, now) {
+			lgWarnf(s.cfg.lg(), "[UDP-Resume:%s] uplink queue overflow: dropped %d packets", s.sessionID, s.dropped.Swap(0))
+		}
 	}
 }
 
@@ -124,23 +147,24 @@ func (s *udpSession) run() {
 			}
 			return
 		}
+		s.readyAt = time.Time{}
 		err := s.runOneStream()
+		if !s.readyAt.IsZero() && time.Since(s.readyAt) >= resumeStableInterval {
+			attempt = 1
+		}
 		if err == nil {
 			return // normal end (peer closed)
 		}
 		finalErr = err
-		// AutoRedial semantics match the TCP side: when on, even "permanent" errors
-		// (auth / target denied) keep redialing — these are usually transient after a network change.
-		if !s.cfg.AutoRedial && isPermanentTunnelError(err) {
+		// Match TCP: fatal authentication/policy/version errors stop even with
+		// AutoRedial, while transient outages may recover indefinitely.
+		if isFatalTunnelError(err) || (!s.cfg.AutoRedial && isPermanentTunnelError(err)) {
 			return
 		}
 		if s.isDone() {
 			return
 		}
-		delay := time.Duration(attempt) * 200 * time.Millisecond
-		if delay > udpResumeBackoffMax {
-			delay = udpResumeBackoffMax
-		}
+		delay := resumeRetryDelay(attempt)
 		lgInfof(s.cfg.lg(), "[UDP-Resume:%s] 🔁 stream break, redial #%d (same-session resume), waiting %v: %v",
 			s.sessionID, attempt, delay, err)
 		if s.cfg.events != nil {
@@ -196,14 +220,31 @@ func (s *udpSession) context() context.Context {
 }
 
 func (s *udpSession) enqueueContext(ctx context.Context, pkt []byte) error {
+	s.upstream.mu.RLock()
+	defer s.upstream.mu.RUnlock()
 	select {
+	case <-s.upstream.done:
+		return net.ErrClosed
+	default:
+	}
+	p := copyDatagram(pkt)
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseDatagram(p)
+		}
+	}()
+	select {
+	case <-s.upstream.done:
+		return net.ErrClosed
 	case <-s.done:
 		return net.ErrClosed
 	case <-s.context().Done():
 		return net.ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
-	case s.upstream <- pkt:
+	case s.upstream.packets <- p:
+		transferred = true
 		return nil
 	}
 }
@@ -233,6 +274,8 @@ func (s *udpSession) runOneStream() error {
 	// A force signal cancels this stream's ctx, interrupting the reader to trigger a redial (the server's UDP socket is preserved).
 	go func() {
 		select {
+		case <-s.done:
+			cancel()
 		case <-s.force:
 			lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] 🔌 force pulse: interrupting the current stream and redialing immediately (server UDP socket preserved)", s.sessionID)
 			cancel()
@@ -263,6 +306,7 @@ func (s *udpSession) runOneStream() error {
 		budgetStop() // after ready the budget no longer bounds the data plane
 	}
 	s.notifyReady(nil)
+	s.readyAt = time.Now()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -278,11 +322,13 @@ func (s *udpSession) runOneStream() error {
 				return
 			case <-ctx.Done():
 				return
-			case pkt, ok := <-s.upstream:
-				if !ok {
-					return
+			case pkt := <-s.upstream.packets:
+				err := s.frameW(pw, pkt.Data)
+				if err == nil && s.cfg.stats != nil {
+					s.cfg.stats.UplinkBytes.Add(int64(len(pkt.Data)))
 				}
-				if err := s.frameW(pw, pkt); err != nil {
+				releaseDatagram(pkt)
+				if err != nil {
 					lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] ❌ uplink write failed: %v", s.sessionID, err)
 					return
 				}
@@ -314,6 +360,9 @@ func (s *udpSession) runOneStream() error {
 			if wErr != nil {
 				lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] local UDP write failed: %v", s.sessionID, wErr)
 				return
+			}
+			if s.cfg.stats != nil {
+				s.cfg.stats.DownlinkBytes.Add(int64(n))
 			}
 		}
 	}()

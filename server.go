@@ -185,6 +185,8 @@ func serverOptionsFromConfig(cfg serverConfig) (ServerOptions, error) {
 		Authenticator: auth,
 		Dialer:        dialer,
 		Tuning: ServerTuning{
+			QUICReceiveWindow:  cfg.QUICReceiveWindow,
+			PauseDetachedRead:  cfg.PauseDetachedRead,
 			SessionWindowBytes: cfg.SessionWindow * 1024,
 			Padding:            cfg.Padding.tuning(),
 			Brutal:             cfg.Brutal.tuning(),

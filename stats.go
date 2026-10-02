@@ -26,6 +26,8 @@ type ClientStats struct {
 	ResumeReconnects atomic.Int64
 	// ActiveDials: number of dials currently in progress.
 	ActiveDials atomic.Int64
+	// DatagramDrops counts packets dropped by the nonblocking UDP enqueue path.
+	DatagramDrops atomic.Int64
 }
 
 // ServerStats holds cumulative server statistics.

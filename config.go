@@ -383,17 +383,19 @@ func validateConfig(cfg *fileConfig) error {
 // serverConfig is the server runtime configuration. It can be built
 // programmatically (zero-value fields take defaults automatically).
 type serverConfig struct {
-	ListenAddr   string        `json:"listen"`
-	TLSCert      string        `json:"cert"`
-	TLSKey       string        `json:"key"`
-	EnableTLS    bool          `json:"tls"`
-	Path         string        `json:"path"`
-	LocalOnly    bool          `json:"local_only"`
-	LogLevel     string        `json:"log_level"`
-	EnableH3     bool          `json:"-"`
-	Transport    string        `json:"transport"`
-	Network      string        `json:"network"` // "all", "tcp", "udp"
-	DrainTimeout time.Duration `json:"-"`       // derived from drain_timeout_sec
+	QUICReceiveWindow QUICReceiveWindowTuning `json:"-"`
+	PauseDetachedRead bool                    `json:"-"`
+	ListenAddr        string                  `json:"listen"`
+	TLSCert           string                  `json:"cert"`
+	TLSKey            string                  `json:"key"`
+	EnableTLS         bool                    `json:"tls"`
+	Path              string                  `json:"path"`
+	LocalOnly         bool                    `json:"local_only"`
+	LogLevel          string                  `json:"log_level"`
+	EnableH3          bool                    `json:"-"`
+	Transport         string                  `json:"transport"`
+	Network           string                  `json:"network"` // "all", "tcp", "udp"
+	DrainTimeout      time.Duration           `json:"-"`       // derived from drain_timeout_sec
 	// SessionWindow is the recovery ring buffer size (KB); the server must
 	// implement it to cooperate with client recovery.
 	SessionWindow int `json:"-"`
@@ -435,17 +437,18 @@ type serverConfig struct {
 // clientConfig is the client runtime configuration. It can be built
 // programmatically (zero-value fields take defaults automatically).
 type clientConfig struct {
-	ListenAddr string `json:"listen"`
-	ServerUrl  string `json:"server"`
-	Path       string `json:"path"`
-	TargetAddr string `json:"target"`
-	Insecure   bool   `json:"insecure"`
-	CustomHost string `json:"host"`
-	ServerName string `json:"sni"`
-	Transport  string `json:"transport"`
-	Network    string `json:"network"` // "all", "tcp", "udp"
-	LogLevel   string `json:"log_level"`
-	Token      string `json:"token"`
+	QUICReceiveWindow QUICReceiveWindowTuning `json:"-"`
+	ListenAddr        string                  `json:"listen"`
+	ServerUrl         string                  `json:"server"`
+	Path              string                  `json:"path"`
+	TargetAddr        string                  `json:"target"`
+	Insecure          bool                    `json:"insecure"`
+	CustomHost        string                  `json:"host"`
+	ServerName        string                  `json:"sni"`
+	Transport         string                  `json:"transport"`
+	Network           string                  `json:"network"` // "all", "tcp", "udp"
+	LogLevel          string                  `json:"log_level"`
+	Token             string                  `json:"token"`
 
 	// The two fields below are client-side keep-alive and drain parameters, same semantics as serverConfig
 	HeartbeatInterval time.Duration `json:"-"`

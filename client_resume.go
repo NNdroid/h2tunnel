@@ -28,9 +28,21 @@ import (
 // =========================================
 
 const (
-	resumeMaxAttempts = 16              // max rebuilds within one localConn lifetime
-	resumeBackoffMax  = 5 * time.Second // rebuild backoff cap
+	resumeMaxAttempts    = 16              // max rebuilds within one localConn lifetime
+	resumeBackoffMax     = 5 * time.Second // rebuild backoff cap
+	resumeStableInterval = 30 * time.Second
 )
+
+func resumeRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 25 {
+		attempt = 25
+	}
+	delay := time.Duration(attempt) * 200 * time.Millisecond
+	return delay + time.Duration(rand.Int64N(int64(delay)))
+}
 
 // seqWriter is an io.Writer that auto-increments seq — shared by uplink replay and live
 // padding is applied inside Write, including ring-buffer replay writes.
@@ -87,7 +99,11 @@ func executeResumableTunnelContext(ctx context.Context, sessionID string, localC
 	// phase, timer stopped at ready); here we only handle the redial cadence.
 
 	for attempt := 1; ; attempt++ {
-		ok, err := runResumeAttemptContext(ctx, sessID, &serverUplink, &clientDownlink, localConn, ringBuf, reqUrl, cfg, httpClient, func() { notifyReady(nil) }, force)
+		var readyAt time.Time
+		ok, err := runResumeAttemptContext(ctx, sessID, &serverUplink, &clientDownlink, localConn, ringBuf, reqUrl, cfg, httpClient, func() { readyAt = time.Now(); notifyReady(nil) }, force)
+		if !readyAt.IsZero() && time.Since(readyAt) >= resumeStableInterval {
+			attempt = 1
+		}
 		if ok {
 			return nil // normal end (EOF / peer closed)
 		}
@@ -114,14 +130,10 @@ func executeResumableTunnelContext(ctx context.Context, sessionID string, localC
 			}
 		}
 		// try to recover after backoff (same session id, same serverUplink)
-		delay := time.Duration(attempt) * 200 * time.Millisecond
-		if delay > resumeBackoffMax {
-			delay = resumeBackoffMax
-		}
 		// Add up to +100% jitter so synchronized tunnels (a fleet coming back
 		// from the same outage) don't reconnect in lockstep and avalanche the
 		// server.
-		delay += time.Duration(rand.Int64N(int64(delay)))
+		delay := resumeRetryDelay(attempt)
 		lgInfof(cfg.lg(), "[Resume] 🔁 redial #%d (same-session resume), waiting %v", attempt, delay)
 		if cfg.events != nil {
 			cfg.events.dispatch(ClientEvent{
@@ -207,19 +219,19 @@ func isPermanentTunnelError(err error) bool {
 }
 
 // isFatalTunnelError reports errors that redialing can never recover from, so the
-// tunnel must fail-fast even when AutoRedial is enabled. The only such case is a
-// resume protocol version mismatch (HTTP 426): the client and server speak
-// different resume versions, and a retry will never interoperate — it is a
-// build/version problem, not a transient network blip.
-//
-// Auth / target-denied (401/403) / 5xx errors intentionally do NOT fail-fast with
-// AutoRedial on: the product design keeps redialing through them because a network
-// change can re-authenticate or bring the target back (see isPermanentTunnelError
-// for the AutoRedial-off semantics).
+// tunnel must fail-fast even when AutoRedial is enabled. Authentication, target
+// policy, and incompatible protocol versions need caller intervention. A 5xx
+// remains transient and can be retried.
 func isFatalTunnelError(err error) bool {
 	var statusErr *TunnelError
-	if errors.As(err, &statusErr) && statusErr.status == http.StatusUpgradeRequired {
-		return true // 426 resume version unsupported: never recoverable by redialing
+	if errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrForbidden) {
+		return true
+	}
+	if errors.As(err, &statusErr) {
+		switch statusErr.status {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusProxyAuthRequired, http.StatusUpgradeRequired:
+			return true
+		}
 	}
 	return false
 }
@@ -334,20 +346,6 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 		defer timer.Stop()
 	}
 
-	// A force signal cancels this attempt's ctx, interrupting the resp.Body reader and
-	// stream setup — equivalent to a stream break, so the outer loop redials immediately
-	// (session/ring preserved).
-	go func() {
-		select {
-		case <-force:
-			lgDebugf(cfg.lg(), "[Resume] 🔌 force pulse: abandoning the current stream and redialing immediately (session/recovery window preserved)")
-			cancel()
-			// immediately wake the sendLoop blocked in localConn.Read (a pipe read does not respond to ctx cancel).
-			_ = localConn.SetReadDeadline(time.Now())
-		case <-ctx.Done():
-		}
-	}()
-
 	// On attempt end, interrupt the send goroutine that may be blocked in localConn.Read,
 	// so the old sendLoop and the next attempt's sendLoop never read the same conn concurrently
 	// (see resumeSendLoop's done parameter). Once-guarded: endAttempt also runs from the
@@ -364,6 +362,15 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	defer endAttempt()
 	// clear any stale read deadline left by the previous round, back to "wait forever".
 	_ = localConn.SetReadDeadline(time.Time{})
+	go func() {
+		select {
+		case <-force:
+			cancel()
+		case <-ctx.Done():
+		}
+		endAttempt()
+		_ = pw.CloseWithError(ctx.Err())
+	}()
 
 	// Build the resume request per transport type:
 	//  - h2 / h3 / grpc: POST cfg.Path, target in X-Target/X-Network headers
@@ -455,6 +462,9 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 		defer wg.Done()
 		defer close(recvDone)
 		recvErr = resumeRecvLoop(resp.Body, localConn, clientDownlink, cfg.lg(), cfg.stats)
+		if recvErr != nil {
+			cancel()
+		}
 	}()
 	// A normal recv end is the peer's END frame. The send loop may still be parked
 	// reading an application conn nobody closes (a read-only tunnel, or an app
@@ -472,6 +482,9 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	}()
 
 	wg.Wait()
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 
 	// Local EOF (app closed the conn) -> sendLoop already sent END and returned nil:
 	// treat it as a normal end (half-close semantics win, even if recvErr is non-nil
@@ -520,6 +533,13 @@ func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBu
 		// adding a competing writer to the HTTP request body.
 		if heartbeat > 0 {
 			_ = localConn.SetReadDeadline(time.Now().Add(heartbeat))
+		}
+		// Re-check after the deadline update: cancellation may have set an
+		// immediate deadline just before the heartbeat overwrote it.
+		select {
+		case <-done:
+			return nil
+		default:
 		}
 		n, rErr := localConn.Read(buf)
 		if n > 0 {

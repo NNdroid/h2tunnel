@@ -83,6 +83,7 @@ func startClientDirect(cfg clientConfig) {
 		TLSConfig:   tlsConfig,
 		Credentials: credentials,
 		Tuning: ClientTuning{
+			QUICReceiveWindow:  cfg.QUICReceiveWindow,
 			SessionWindowBytes: cfg.SessionWindow * 1024,
 			HeartbeatInterval:  cfg.HeartbeatInterval,
 			KeepaliveInterval:  time.Duration(cfg.KeepaliveSec) * time.Second,

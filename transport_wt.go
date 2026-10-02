@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -125,7 +124,15 @@ func (m *wtSessionManager) dialAndInstall(ctx context.Context) (*webtransport.Se
 }
 
 func (m *wtSessionManager) dialSession(ctx context.Context) (*webtransport.Session, error) {
-	_, session, err := m.dialer.Dial(ctx, m.reqUrl, m.headers)
+	response, session, err := m.dialer.Dial(ctx, m.reqUrl, m.headers)
+	if err != nil && response != nil {
+		if response.Body != nil {
+			response.Body.Close()
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return nil, newTunnelHTTPError(response.StatusCode)
+		}
+	}
 	return session, err
 }
 
@@ -173,7 +180,7 @@ func newWTManagerForTunnelContext(ctx context.Context, cfg clientConfig, reqUrl,
 		lg: cfg.lg(),
 		dialer: &webtransport.Transport{
 			TLSClientConfig: tlsConfig,
-			QUICConfig:      getDefaultQUICConfig(),
+			QUICConfig:      cfg.QUICReceiveWindow.config(),
 			DialAddr:        cfg.QUICDialer,
 		},
 		reqUrl:  reqUrl,
@@ -221,7 +228,11 @@ func executeResumeWTWithManagerContext(ctx context.Context, localConn net.Conn, 
 	// only pace the redials.
 
 	for attempt := 1; ; attempt++ {
-		ok, err := runResumeWTTryContext(ctx, sessionID, &serverUplink, &clientDownlink, localConn, ringBuf, cfg, wtManager, func() { notifyReady(nil) }, force)
+		var readyAt time.Time
+		ok, err := runResumeWTTryContext(ctx, sessionID, &serverUplink, &clientDownlink, localConn, ringBuf, cfg, wtManager, func() { readyAt = time.Now(); notifyReady(nil) }, force)
+		if !readyAt.IsZero() && time.Since(readyAt) >= resumeStableInterval {
+			attempt = 1
+		}
 		if ok {
 			return nil // normal end (EOF / peer END)
 		}
@@ -236,13 +247,15 @@ func executeResumeWTWithManagerContext(ctx context.Context, localConn net.Conn, 
 		}
 		// Stream died: reopen a new stream with the same session id to resume
 		// (after backoff).
-		delay := time.Duration(attempt) * 200 * time.Millisecond
-		if delay > resumeBackoffMax {
-			delay = resumeBackoffMax
-		}
 		// Up to +100% jitter to desynchronize a reconnecting fleet (avoid avalanche).
-		delay += time.Duration(rand.Int64N(int64(delay)))
+		delay := resumeRetryDelay(attempt)
 		lgInfof(cfg.lg(), "[Resume/WT] 🔁 WT stream reopen #%d (resuming same session), waiting %v", attempt, delay)
+		if cfg.stats != nil {
+			cfg.stats.ResumeReconnects.Add(1)
+		}
+		if cfg.events != nil {
+			cfg.events.dispatch(ClientEvent{Kind: EventReconnecting, Target: cfg.TargetAddr, Network: NetworkTCP, Transport: cfg.transportValue(), Attempt: attempt, Reason: "stream interrupted"})
+		}
 		select {
 		case <-ctx.Done():
 			notifyReady(ctx.Err())
@@ -284,10 +297,9 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 	// concurrently with the next attempt's sendLoop (see resumeSendLoop's
 	// done parameter).
 	done := make(chan struct{})
-	defer func() {
-		close(done)
-		_ = localConn.SetReadDeadline(time.Now())
-	}()
+	var doneOnce sync.Once
+	endAttempt := func() { doneOnce.Do(func() { close(done); _ = localConn.SetReadDeadline(time.Now()) }) }
+	defer endAttempt()
 	_ = localConn.SetReadDeadline(time.Time{})
 
 	// Per-attempt cancellation: both the RedialBudget alarm and force pulses
@@ -330,9 +342,13 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 			case <-force:
 				lgDebugf(cfg.lg(), "[Resume/WT] 🔌 force pulse: closing current WT stream for immediate redial")
 				cancel()
-				_ = stream.Close()
-				_ = localConn.SetReadDeadline(time.Now())
+				endAttempt()
+				stream.CancelRead(0)
+				stream.CancelWrite(0)
 			case <-ctx.Done():
+				endAttempt()
+				stream.CancelRead(0)
+				stream.CancelWrite(0)
 			}
 		}()
 	}
@@ -375,9 +391,18 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 	go func() {
 		defer wg.Done()
 		recvErr = resumeRecvLoopWT(stream, localConn, clientDownlink, cfg.lg(), cfg.stats)
+		endAttempt()
+		if recvErr != nil {
+			cancel()
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+		}
 	}()
 
 	wg.Wait()
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if recvErr == nil {
 		return true, nil
 	}
@@ -655,7 +680,7 @@ func doWTStreamHandshake(s *webtransport.Stream, writer *resumeSessionWriter, ti
 // stream-open's dialing phase.
 func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionManager,
 	packet *virtualPacketConn, session *webtransport.Session, firstStream *webtransport.Stream,
-	upstream chan []byte, done <-chan struct{}, force <-chan struct{},
+	upstream *datagramQueue, done <-chan struct{}, force <-chan struct{},
 ) error {
 	stream := firstStream
 	var current atomic.Pointer[webtransport.Stream]
@@ -696,6 +721,9 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 				session = nil
 				sess, err := mgr.GetSession(ctx)
 				if err != nil {
+					if isFatalTunnelError(err) || (!cfg.AutoRedial && isPermanentTunnelError(err)) {
+						return err
+					}
 					if !backoffWTUDP(ctx, cfg, done, attempt) {
 						return wtUDPTerminalErr(ctx)
 					}
@@ -732,6 +760,7 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 				_ = stream.Close()
 			})
 		}
+		readyAt := time.Now()
 		var upErr, downErr error
 		upExited := make(chan struct{})
 		downExited := make(chan struct{})
@@ -741,8 +770,13 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 				select {
 				case <-attemptDone:
 					return
-				case pkt := <-upstream:
-					if err := writeUDPPacket(stream, pkt, cfg.Padding); err != nil {
+				case pkt := <-upstream.packets:
+					err := writeUDPPacket(stream, pkt.Data, cfg.Padding)
+					if err == nil && cfg.stats != nil {
+						cfg.stats.UplinkBytes.Add(int64(len(pkt.Data)))
+					}
+					releaseDatagram(pkt)
+					if err != nil {
 						upErr = err
 						over()
 						return
@@ -767,6 +801,9 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 					over()
 					return
 				}
+				if cfg.stats != nil {
+					cfg.stats.DownlinkBytes.Add(int64(n))
+				}
 			}
 		}()
 
@@ -781,6 +818,9 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 		<-downExited
 		current.Store(nil)
 		stream = nil
+		if time.Since(readyAt) >= resumeStableInterval {
+			attempt = 1
+		}
 
 		// Local close / sessionCtx cancel: the session is final, no redial.
 		select {
@@ -816,12 +856,8 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 // should terminate (done/ctx/exhausted). attempt increments per round; when
 // AutoRedial is off, the 16th attempt is terminal.
 func backoffWTUDP(ctx context.Context, cfg clientConfig, done <-chan struct{}, attempt int) bool {
-	delay := time.Duration(attempt) * 200 * time.Millisecond
-	if delay > resumeBackoffMax {
-		delay = resumeBackoffMax
-	}
 	// Up to +100% jitter to desynchronize a reconnecting fleet (avoid avalanche).
-	delay += time.Duration(rand.Int64N(int64(delay)))
+	delay := resumeRetryDelay(attempt)
 	lgInfof(cfg.lg(), "[WT-UDP:%s] 🔁 stream died, reopen #%d (server UDP socket retained), waiting %v", cfg.TargetAddr, attempt, delay)
 	select {
 	case <-done:

@@ -146,6 +146,8 @@ func runServer(cfg *config, logger *slog.Logger) error {
 		Authenticator: auth,
 		Dialer:        directTargetDialer(cfg.LocalOnly),
 		Tuning: h2tunnel.ServerTuning{
+			QUICReceiveWindow:      cfg.QUICReceiveWindow,
+			PauseDetachedRead:      cfg.PauseDetachedRead,
 			SessionWindowBytes:     cfg.SessionWindowKB * 1024,
 			SessionMax:             cfg.SessionMax,
 			SessionMaxPerPrincipal: cfg.SessionMaxPerPrincipal,
@@ -199,6 +201,7 @@ func runClient(cfg *config, logger *slog.Logger) error {
 		Credentials:     credentials,
 		UtlxFingerprint: cfg.UtlxFingerprint,
 		Tuning: h2tunnel.ClientTuning{
+			QUICReceiveWindow:  cfg.QUICReceiveWindow,
 			SessionWindowBytes: cfg.SessionWindowKB * 1024,
 			HeartbeatInterval:  durationOrDefaultSeconds(cfg.HeartbeatSec),
 			KeepaliveInterval:  time.Duration(cfg.KeepaliveSec) * time.Second,

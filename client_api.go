@@ -124,6 +124,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 		return nil, err
 	}
 	warnBrutalUnavailable(options.Logger, brutal)
+	if err := options.Tuning.QUICReceiveWindow.Validate(); err != nil {
+		return nil, err
+	}
 	windowKB, err := windowBytesToKB(options.Tuning.SessionWindowBytes)
 	if err != nil {
 		return nil, err
@@ -159,6 +162,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	cfg := clientConfig{
+		QUICReceiveWindow: options.Tuning.QUICReceiveWindow,
 		ServerUrl:         strings.TrimRight(endpoint, "/"),
 		Path:              normalizeTunnelPath(options.Path),
 		CustomHost:        strings.TrimSpace(options.Host),
@@ -219,6 +223,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 		active:       make(map[*managedConn]struct{}),
 	}
 	ret.cfg.events = &ret.events
+	ret.cfg.stats = &ret.stats.client
+	ret.cfg.logger = ret.log
 	if options.EventHandler != nil {
 		ret.SetEventHandler(options.EventHandler)
 	}
@@ -536,6 +542,9 @@ func (c *Client) DialContext(ctx context.Context, network, target string) (net.C
 		}
 		// err==nil = the engine ended normally (EOF→END), a peer FIN from the other side;
 		// only err!=nil is classified by context/error.
+		if managed.localClosed.Load() {
+			err = nil
+		}
 		reason, cause := tunnelDeathReason(nil, err)
 		c.dispatchClientEvent(ClientEvent{
 			Kind:      EventTunnelDied,
@@ -722,10 +731,10 @@ func (c *Client) dialPacketWT(ctx context.Context, dialCfg clientConfig, packet 
 		return err
 	}
 
-	upstream := make(chan []byte, dialCfg.datagramQueueSize())
+	upstream := newDatagramQueue(dialCfg.datagramQueueSize())
 	done := make(chan struct{}) // closed when the session terminates (local close / redial exhausted)
 	var stopOnce sync.Once
-	stop := func() { stopOnce.Do(func() { close(done) }) }
+	stop := func() { stopOnce.Do(func() { close(done); upstream.close() }) }
 	packet.attachWTTunnel(upstream, done, closeFunc(stop))
 
 	go func() {
@@ -822,6 +831,7 @@ func (c *Client) removeActive(conn *managedConn) {
 }
 
 type managedConn struct {
+	localClosed atomic.Bool
 	net.Conn
 	cancel  context.CancelFunc
 	onClose func()
@@ -858,6 +868,7 @@ func (c *managedConn) finishWith(err error) {
 }
 
 func (c *managedConn) Close() error {
+	c.localClosed.Store(true)
 	err := c.Conn.Close()
 	c.finish()
 	return err
