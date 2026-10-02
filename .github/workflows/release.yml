@@ -4,13 +4,59 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (leave empty to auto-generate)"
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Prepare release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$INPUT_VERSION" ]]; then
+            version="$INPUT_VERSION"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="v1.0.$(date -u +%Y%m%d).$(git rev-list --count HEAD)-$(git rev-parse --short=7 HEAD)"
+          fi
+
+          # Normalize manually entered versions so both "1.2.3" and "v1.2.3" work.
+          if [[ "$version" != v* ]]; then
+            version="v${version}"
+          fi
+
+          if [[ ! "$version" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "Invalid release version: $version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Release version: $version"
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -48,12 +94,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Compute version
-        id: ver
-        run: |
-          version="v1.0.$(date -u +%Y%m%d).$(git rev-list --count HEAD)-$(git rev-parse --short=7 HEAD)"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -61,8 +101,9 @@ jobs:
           # Empty for non-arm targets, where the go tool ignores GOARM.
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          go build -trimpath -ldflags "-s -w -X github.com/NNdroid/h2tunnel.buildVersion=${{ steps.ver.outputs.version }}" \
+          go build -trimpath -ldflags "-s -w -X github.com/NNdroid/h2tunnel.buildVersion=${VERSION}" \
             -o "h2tunnel_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext || '' }}" ./cmd/h2tunnel
 
       - name: Show version
@@ -76,29 +117,9 @@ jobs:
           path: h2tunnel_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.ext || '' }}
           if-no-files-found: error
 
-  # On manual dispatch: collect one bundle of binaries into Artifacts only, no Release
-  upload-manual:
-    if: github.event_name == 'workflow_dispatch'
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Upload single artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: h2tunnel-manual-${{ github.sha }}
-          path: dist/*
-          if-no-files-found: error
-
-  # On tag push: attach all binaries to the GitHub Release
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    name: Publish ${{ needs.prepare.outputs.version }}
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -110,12 +131,15 @@ jobs:
       - name: Create Release and Upload Binaries
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.ver.outputs.version }}
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }}
           body: |
             Automated release
 
-            Build version: ${{ steps.ver.outputs.version }}
-            (computed as v1.0.yyyyMMdd.<commit count>-<short hash>)
+            Build version: ${{ needs.prepare.outputs.version }}
+
+            When no version is supplied for a manual run, the version is generated as:
+            `v1.0.yyyyMMdd.<commit count>-<short hash>`
 
             Download the binaries directly, no extraction needed.
           files: dist/*
