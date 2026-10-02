@@ -51,6 +51,17 @@ jobs:
           GOOS=linux GOARCH=386 go build ./...
           GOOS=linux GOARCH=arm GOARM=6 go build ./...
 
+      - name: Enable large UDP datagrams on macOS
+        # Darwin's default UDP send space is only 9216 bytes. The 48 KB
+        # integration test needs both the tunnel target and echo to send it.
+        # Set this before creating sockets; keep the full payload assertion.
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sysctl net.inet.udp.maxdgram
+          sudo sysctl -w net.inet.udp.maxdgram=65535
+          test "$(sysctl -n net.inet.udp.maxdgram)" -ge 48000
+
       - name: Test (race)
         # quic-go officially does not support Go's race detector on Windows:
         # native crash (Exception 0xc0000005 / unknown pc, see the race

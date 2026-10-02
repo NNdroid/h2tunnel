@@ -71,6 +71,32 @@ func isBindForbidden(err error) bool {
 	return errors.As(err, &errno) && errno == 10013
 }
 
+func isBindAddressInUse(err error) bool {
+	var errno syscall.Errno
+	// Windows socket errors use WSAEADDRINUSE, not syscall.EADDRINUSE.
+	return errors.Is(err, syscall.EADDRINUSE) || (errors.As(err, &errno) && errno == 10048)
+}
+
+// TCP and UDP allocate ephemeral ports independently. A free TCP port can
+// already belong to a UDP socket, so retry the entire pair on that collision.
+func listenTCPUDPPair(listenTCP func(string, string) (net.Listener, error), listenUDP func(string, string) (net.PacketConn, error)) (net.Listener, net.PacketConn, error) {
+	for attempt := 1; ; attempt++ {
+		tcp, err := listenTCP("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, nil, err
+		}
+		udp, err := listenUDP("udp", tcp.Addr().String())
+		if err == nil {
+			return tcp, udp, nil
+		}
+		_ = tcp.Close()
+		if (!isBindForbidden(err) && !isBindAddressInUse(err)) || attempt >= 10 {
+			return nil, nil, err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // bindUDPRetry binds a UDP port, retrying on another port when it lands in a Windows excluded range.
 func bindUDPRetry(t testing.TB, addr string) net.PacketConn {
 	t.Helper()
@@ -166,23 +192,9 @@ func newProtocolEnvWithServerTuning(t testing.TB, tuning h2tunnel.ServerTuning) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	// TCP+UDP bound as a pair on the same port: if the UDP side hits an excluded range, redo the whole pair (the TCP port must match).
-	var tlsTCP net.Listener
-	var tlsQUIC net.PacketConn
-	for attempt := 1; ; attempt++ {
-		tlsTCP, err = net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		tlsQUIC, err = net.ListenPacket("udp", tlsTCP.Addr().String())
-		if err == nil {
-			break
-		}
-		if !isBindForbidden(err) || attempt >= 10 {
-			t.Fatal(err)
-		}
-		_ = tlsTCP.Close()
-		time.Sleep(50 * time.Millisecond)
+	tlsTCP, tlsQUIC, err := listenTCPUDPPair(net.Listen, net.ListenPacket)
+	if err != nil {
+		t.Fatal(err)
 	}
 	tlsEnv := make(chan error, 1)
 	go func() { tlsEnv <- tlsServer.Serve(h2tunnel.Listeners{TCP: tlsTCP, QUIC: tlsQUIC}) }()

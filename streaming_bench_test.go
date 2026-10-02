@@ -238,6 +238,33 @@ func TestProtocolContinuousTransfers(t *testing.T) {
 }
 
 func TestLargeUDPDatagramsAllProtocols(t *testing.T) {
+	want := bytes.Repeat([]byte("datagram"), 6000)
+	// Fail at the kernel boundary with the actual send error rather than
+	// timing out six tunnel protocols when the host cannot send this payload.
+	probe := bindUDPRetry(t, "127.0.0.1:0")
+	defer probe.Close()
+	peer, err := net.Dial("udp", probe.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	probe.SetDeadline(time.Now().Add(5 * time.Second))
+	peer.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := peer.Write(want); err != nil {
+		t.Fatalf("kernel UDP payload preflight (%d bytes): %v; on macOS check net.inet.udp.maxdgram", len(want), err)
+	}
+	buf := make([]byte, 65536)
+	n, addr, err := probe.ReadFrom(buf)
+	if err != nil || !bytes.Equal(buf[:n], want) {
+		t.Fatalf("kernel UDP receive preflight: bytes=%d err=%v", n, err)
+	}
+	if _, err := probe.WriteTo(buf[:n], addr); err != nil {
+		t.Fatalf("kernel UDP echo preflight: %v", err)
+	}
+	n, err = peer.Read(buf)
+	if err != nil || !bytes.Equal(buf[:n], want) {
+		t.Fatalf("kernel UDP echo receive preflight: bytes=%d err=%v", n, err)
+	}
 	env := newProtocolEnv(t)
 	for _, transport := range []h2tunnel.Transport{h2tunnel.TransportH2, h2tunnel.TransportH2C, h2tunnel.TransportGRPC, h2tunnel.TransportH3, h2tunnel.TransportWebTransport, h2tunnel.TransportMASQUE} {
 		t.Run(string(transport), func(t *testing.T) {
@@ -250,7 +277,6 @@ func TestLargeUDPDatagramsAllProtocols(t *testing.T) {
 			}
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(10 * time.Second))
-			want := bytes.Repeat([]byte("datagram"), 6000)
 			got := make([]byte, 65536)
 			for i := 0; i < 3; i++ {
 				if _, err := c.Write(want); err != nil {
