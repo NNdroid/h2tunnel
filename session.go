@@ -729,6 +729,14 @@ func (s *tunnelSession) downlinkPump() {
 		if s.pauseDetachedRead && !s.waitActiveWriter() {
 			return
 		}
+		// waitActiveWriter blocks, so the backstop can have expired while the pump
+		// was parked waiting for a writer to attach. Resuming without a refresh
+		// made the next Read fail with i/o timeout and tore down the session —
+		// the very session the pause exists to protect.
+		if time.Until(readDeadline) < time.Minute {
+			readDeadline = time.Now().Add(5 * time.Minute)
+			_ = s.targetConn.SetReadDeadline(readDeadline)
+		}
 		n, err := s.targetConn.Read(buf)
 		if n > 0 {
 			s.writeDownlink(buf[:n])

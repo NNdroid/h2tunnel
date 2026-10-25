@@ -124,6 +124,15 @@ func runServer(cfg *config, logger *slog.Logger) error {
 		!strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
 		logger.Warn("⚠️ MASQUE over h2 requires GODEBUG=http2xconnect=1 at process start (h3 carrier unaffected)")
 	}
+	// An empty token is a documented default (the bare config must stay usable
+	// for local development), so it is not a validation error. But it is the
+	// difference between an authenticated tunnel and an open one: every request
+	// authenticates as a single shared "anonymous" principal, so all clients
+	// share one session bucket, one per-principal cap and one Brutal connection
+	// group. Say it at startup instead of letting it look deliberate later.
+	if cfg.Token == "" {
+		logger.Warn("⚠️ no token set: every request authenticates as \"anonymous\". Set token or H2TUNNEL_TOKEN before exposing the listener.")
+	}
 	var err error
 	auth := h2tunnel.Authenticator(func(context.Context, *http.Request) (h2tunnel.Principal, error) {
 		return h2tunnel.Principal{ID: "anonymous"}, nil

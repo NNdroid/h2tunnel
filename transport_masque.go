@@ -10,8 +10,9 @@ import (
 // Authentication and transport/network policy are already done centrally in
 // routeTunnelRequest; these two handlers only enforce target admission and
 // dispatch to the resume/2 engine (a CONNECT stream is fundamentally a byte
-// pipe). Target resolution (X-Target → URI template → X-Dst) is done once by
-// classifyTunnelRequest.
+// pipe). Target resolution (X-Target → RFC 9298 URI template; an empty result
+// is rejected below rather than substituted with a loopback default) is done
+// once by classifyTunnelRequest.
 // =========================================
 
 // ---> server-side MASQUE-TCP

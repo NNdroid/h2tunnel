@@ -482,7 +482,7 @@ of directives to write:
 | --- | --- |
 | `X-Auth-Token` or `Authorization: Bearer <token>` | Authentication. The client sends both, so either surviving is enough. Strip them and every dial dies with 401. |
 | `X-Tunnel-Proto`, `X-Session-ID`, `X-Resume-Version`, `X-Resume-Caps`, `X-Resume-Params`, `X-Resume-Role` | The resume/2 handshake, read before any data flows. A proxy that rewrites them produces 426/400 errors instead of a tunnel. |
-| `X-Network`, `X-Target` | Routing. Missing or altered, the server silently falls back to a default target (`127.0.0.1:22` for TCP, `127.0.0.1:53` for UDP) instead of your destination — the most misleading failure mode in this list. |
+| `X-Network`, `X-Target` | Routing. Missing or altered, the legacy resolver silently falls back to a default target (`127.0.0.1:22` for TCP, `127.0.0.1:53` for UDP) instead of your destination — the most misleading failure mode in this list. `masque` does not: it resolves only from `X-Target` (an address, or a logical name registered with `ServerOptions.Dialer`) and then the RFC 9298 URI template (`/tunnel/tcp/<host>/<port>`), and an unresolvable target is rejected with 403. The fallback is refused there on purpose, because it dials the server's own loopback and clears both the availability check and the `local_only` check over loopback. |
 | `X-Client-Group` | Brutal connection-group derivation. Losing it degrades grouping from per-client to per-session granularity, so adding links multiplies the allowance instead of sharing one bucket. |
 | `X-Brutal-Offer`, `X-Brutal-Params` | TCP Brutal negotiation. The 16-byte replay-prevention nonce is a field inside these two values, not a header of its own. |
 | `Content-Length`, `Content-Type`, `Accept-Encoding: identity` | Must not be re-chunked or re-encoded; keep `proxy_request_buffering off` and `gzip off`. |
@@ -600,7 +600,7 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `server` | client | required | full `http://` or `https://` server address |
 | `target` | client | required | target address the server should connect to |
 | `path` | shared | `/tunnel` | tunnel HTTP path; MASQUE endpoints are nested beneath it: `<path>/.well-known/masque/{tcp,udp}/...` (e.g. `path=/tunnel` → `/tunnel/.well-known/masque/...`; `path=/` yields the standard `/.well-known/masque`) |
-| `token` | shared | empty | pre-shared auth token; must be set in production |
+| `token` | shared | empty | pre-shared auth token; must be set in production. Empty is still valid for local development, but the CLI logs a startup WARN: every request then authenticates as one shared `"anonymous"` principal, so all clients share a session bucket, a per-principal cap and a Brutal connection group |
 | `transport` | shared | server `h2`; client inferred from URL | server accepts comma-separated lists or `all`; client picks exactly one |
 | `network` | shared | `tcp` | `tcp`, `udp`, or `all` |
 | `tls` | server | `false` | enable TLS; `h2/h3/wt/masque` imply TLS automatically, `h2c` forces plaintext |

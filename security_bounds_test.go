@@ -383,3 +383,71 @@ func TestNaturallyDeadTunnelIsRemovedFromTheActiveSet(t *testing.T) {
 		t.Fatalf("Shutdown after a naturally dead tunnel: %v", err)
 	}
 }
+
+// MASQUE target resolution must fail closed. The destination resolver that the
+// rest of the routing code uses never returns an empty target: it substitutes
+// 127.0.0.1:22 (tcp) or 127.0.0.1:53 (udp) for an empty OR invalid value. The
+// MASQUE path used to read that already-resolved value first, so a URI that
+// missed the RFC 9298 template — or an X-Target mistyped into garbage — became
+// a silent dial of the server's own localhost SSH or DNS. The loopback
+// substitute then cleared checkTargetIsAvailable and, on loopback,
+// targetAllowedByRuntime's LocalOnly check as well, so no policy stopped it.
+func TestMasqueTargetResolutionFailsClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		proto  string
+		path   string
+		target string // X-Target; "" means the header is absent
+		dialer bool   // whether a logical-service registry is configured
+		want   string // the resolved target; "" means the request must be rejected
+	}{
+		{"tcp: no header, uri misses the template", protocolConnectTCP, "/tunnel/nothing", "", false, ""},
+		{"udp: no header, uri misses the template", protocolConnectUDP, "/tunnel/nothing", "", false, ""},
+		{"tcp: no header, uri has no protocol segment", protocolConnectTCP, "/tunnel/ssh", "", false, ""},
+		{"tcp: mistyped target without a dialer", protocolConnectTCP, "/tunnel/nothing", "not-an-address", false, ""},
+		{"udp: out-of-range port without a dialer", protocolConnectUDP, "/tunnel/nothing", "127.0.0.1:99999", false, ""},
+		{"tcp: host with no port", protocolConnectTCP, "/tunnel/nothing", "127.0.0.1", false, ""},
+		{"uri template still resolves", protocolConnectTCP, "/tunnel/tcp/127.0.0.1/1", "", false, "127.0.0.1:1"},
+		{"udp uri template still resolves", protocolConnectUDP, "/tunnel/udp/127.0.0.1/1", "", false, "127.0.0.1:1"},
+		{"uri template host without a port is rejected", protocolConnectTCP, "/tunnel/tcp/127.0.0.1", "", false, ""},
+		{"uri template with a bad port is rejected", protocolConnectUDP, "/tunnel/udp/127.0.0.1/99999", "", false, ""},
+		{"x-target address wins over a bad uri", protocolConnectTCP, "/tunnel/nothing", "127.0.0.1:1", false, "127.0.0.1:1"},
+		{"logical name with a dialer is not address-checked", protocolConnectTCP, "/tunnel/nothing", "ssh", true, "ssh"},
+		{"logical x-target keeps priority over the uri", protocolConnectUDP, "/tunnel/udp/127.0.0.1/1", "ssh", true, "ssh"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := serverConfig{LocalOnly: false}
+			if tc.dialer {
+				cfg.TargetDialer = anyTargetDialer()
+			}
+			// Target only: httptest.NewRequest with a host prefix would put the
+			// listener's "127.0.0.1:0" into r.URL.Path, which parseMasqueTarget
+			// then sees as the first URI segment.
+			req := httptest.NewRequest(http.MethodConnect, tc.path, nil)
+			req.Header.Set("Protocol", tc.proto)
+			if tc.target != "" {
+				req.Header.Set("X-Target", tc.target)
+			}
+			tr := classifyTunnelRequest(req, cfg, false)
+			if tr.target != tc.want {
+				t.Fatalf("resolved target = %q, want %q", tr.target, tc.want)
+			}
+			if tc.want == "" {
+				table := &sessionTable{sessions: make(map[string]*tunnelSession), idleTimeout: sessionIdleTimeout}
+				var rw httptest.ResponseRecorder
+				if tc.proto == protocolConnectUDP {
+					handleMasqueUDPServer(&rw, req, "log-id", tr, cfg, table)
+				} else {
+					handleMasqueTCPServer(&rw, req, "log-id", tr, cfg, table)
+				}
+				if rw.Code != http.StatusForbidden {
+					t.Fatalf("status = %d, body = %q; want 403 for an unresolved target", rw.Code, rw.Body.String())
+				}
+				if got := len(table.sessions); got != 0 {
+					t.Fatalf("an unresolved target created %d session(s)", got)
+				}
+			}
+		})
+	}
+}

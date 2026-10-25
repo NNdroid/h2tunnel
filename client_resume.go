@@ -615,7 +615,13 @@ func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64, 
 			*clientDownlink = expected
 			return errGap
 		}
-		if _, wErr := localConn.Write(payloadBuf[:n]); wErr != nil {
+		// localConn may return a partial write: it is a net.Pipe end in tests
+		// and the app's own conn in production, and neither contract promises a
+		// full write. Advancing the watermark by the frame length anyway would
+		// report bytes the application never received, and the next stream would
+		// resume past the hole — data loss no seq check can catch, because the
+		// seq was correct.
+		if wErr := writeAll(localConn, payloadBuf[:n]); wErr != nil {
 			*clientDownlink = expected
 			return wErr
 		}

@@ -42,7 +42,21 @@ type Server struct {
 	stats     stats
 	events    serverEventSink
 	listeners Listeners
-	httpConns map[net.Conn]struct{}
+	// Keyed by connection identity, not the conn object: net/http reports a
+	// hijacked leg's state changes with several different wrappers of the same
+	// socket, so keying on the object would keep one stale entry per wrapper.
+	httpConns map[string]net.Conn
+}
+
+// connIdentity maps every wrapper of one accepted socket to one key.
+//
+// A hijacked h2c leg is reported to ConnState as at least two objects wrapping
+// the same socket: net/http's own conn, and the *h2c.bufConn that http2.ServeConn
+// receives. Both report identical endpoints, so the address pair is a stable key
+// that deduplicates them. Two live connections cannot share one key: the local
+// side assigns one ephemeral port per socket.
+func connIdentity(c net.Conn) string {
+	return c.LocalAddr().String() + "|" + c.RemoteAddr().String()
 }
 
 // h2 receive window (server-side uplink flow-control backpressure). x/net
@@ -144,7 +158,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		ctx:        ctx,
 		cancel:     cancel,
 		reaperStop: make(chan struct{}),
-		httpConns:  make(map[net.Conn]struct{}),
+		httpConns:  make(map[string]net.Conn),
 	}
 	s.sessions = &sessionTable{
 		pauseDetachedRead: cfg.PauseDetachedRead,
@@ -191,14 +205,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       time.Hour,
 		ConnState:         s.trackHTTPConnection,
-	}
-	if cfg.Brutal.enabled {
-		// ConnContext is the only hook that still holds the accepted socket, and
-		// the value it attaches reaches the tunnel handler on both delivery paths
-		// (ALPN via http2.BaseContext, h2c via the hijacked conn's request
-		// context). It is skipped entirely when Brutal is off, so a disabled
-		// deployment pays no per-accept context allocation.
-		s.httpServer.ConnContext = s.brutalConnContext
+		ConnContext:       s.connContext,
 	}
 	if cfg.TLSConfig != nil {
 		tlsConfig := cfg.TLSConfig.Clone()
@@ -300,12 +307,15 @@ func (s *Server) Serve(listeners Listeners) error {
 	results := make(chan result, 2)
 	if listeners.TCP != nil {
 		count++
+		// Wrap before Serve so net/http adopts the wrapper as c.rwc and every
+		// close — including the hijacked h2c leg's deferred one — reports back.
+		listener := &trackedListener{Listener: listeners.TCP, release: s.releaseHTTPConnection}
 		go func() {
 			var err error
 			if !s.cfg.EnableTLS {
-				err = s.httpServer.Serve(listeners.TCP)
+				err = s.httpServer.Serve(listener)
 			} else {
-				err = s.httpServer.ServeTLS(listeners.TCP, "", "")
+				err = s.httpServer.ServeTLS(listener, "", "")
 			}
 			results <- result{kind: "tcp", err: err}
 		}()
@@ -458,21 +468,25 @@ func (s *Server) closeListenersOnly() error {
 }
 
 // h2c.NewHandler hijacks the accepted TCP connection before handing it to
-// http2.Server. net/http deliberately stops tracking hijacked connections, so
-// http.Server.Shutdown and Close cannot terminate them. Keep ownership here so
-// the embeddable Server lifecycle also covers h2c tunnels.
+// http2.Server. net/http stops tracking hijacked connections outright: setState
+// deregisters a conn on StateHijacked, and its deferred cleanup runs c.close()
+// plus setState(StateClosed) only when the conn was not hijacked. http.Server
+// Shutdown and Close therefore cannot terminate an h2c leg, and ConnState never
+// reports its end. Keep ownership here so the embeddable Server lifecycle also
+// covers h2c tunnels.
 func (s *Server) trackHTTPConnection(conn net.Conn, state http.ConnState) {
+	key := connIdentity(conn)
 	closeNow := false
 	s.mu.Lock()
 	switch state {
 	case http.StateClosed:
-		delete(s.httpConns, conn)
+		delete(s.httpConns, key)
 		s.cfg.brutalSockets.forget(conn)
 	default:
 		if s.closing || s.closed {
 			closeNow = true
 		} else {
-			s.httpConns[conn] = struct{}{}
+			s.httpConns[key] = conn
 		}
 	}
 	s.mu.Unlock()
@@ -481,33 +495,85 @@ func (s *Server) trackHTTPConnection(conn net.Conn, state http.ConnState) {
 	}
 }
 
-// brutalConnContext publishes the just-accepted socket on the request context.
+// connContext publishes the accepted socket on the request context for Brutal.
 //
-// net/http calls ConnContext in the accept loop with the raw conn, and the value
-// survives both delivery paths into the tunnel handler: over TLS ALPN, net/http
-// forwards it through http2.BaseContext, and over h2c, h2c.NewHandler passes the
-// request context (and the hijacked conn keeps it) into http2.ServeConn. That is
-// what makes the per-client group applicable at all — see the apply in
+// This is the hook that still holds the accepted socket, and the value it
+// attaches reaches the tunnel handler on both delivery paths (ALPN via
+// http2.BaseContext, h2c via the hijacked conn's request context). That is what
+// makes the per-client group applicable at all — see the apply in
 // routeTunnelRequest.
 //
-// The socket is deliberately NOT configured here. Enabling it pre-auth would hand
-// an unauthenticated peer the configured rate, and the per-client group cannot be
-// derived before the token is presented. Unauthenticated requests therefore run
-// on the kernel's default controller, which is the safe default.
-func (s *Server) brutalConnContext(ctx context.Context, conn net.Conn) context.Context {
-	if conn == nil {
-		return ctx
+// The socket is deliberately NOT configured here. Enabling it pre-auth would
+// hand an unauthenticated peer the configured rate, and the per-client group
+// cannot be derived before the token is presented. Unauthenticated requests
+// therefore run on the kernel's default controller, which is the safe default.
+//
+// The wrapper for tracking closes is installed on the listener, not here:
+// net/http keeps the accepted conn as c.rwc regardless of what ConnContext
+// returns, so a wrapper made here would never be in the hijacked leg's close
+// chain and its release would never fire.
+func (s *Server) connContext(ctx context.Context, conn net.Conn) context.Context {
+	if s.cfg.Brutal.enabled {
+		return context.WithValue(ctx, brutalConnKey{}, conn)
 	}
-	return context.WithValue(ctx, brutalConnKey{}, conn)
+	return ctx
+}
+
+// trackedListener is a listener whose Accept wraps each accepted socket so the
+// Server learns when it dies.
+//
+// Installed in Serve rather than ConnContext: only a wrapper that net/http adopts
+// as c.rwc ends up in the close chain h2c's ServeConn defers to.
+type trackedListener struct {
+	net.Listener
+	release func(net.Conn)
+}
+
+func (l *trackedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &trackedConn{Conn: conn, release: l.release}, nil
+}
+
+// trackedConn is a net.Conn whose Close reports the connection back to its owner.
+// sync.Once makes it safe to release from both Close and ConnState's StateClosed.
+//
+// Unwrap is what lets tcpConnFrom reach the real socket through the wrapper, so
+// Brutal stays applicable to h2c legs; without it the socket would silently fall
+// back to the kernel's default controller.
+type trackedConn struct {
+	net.Conn
+	once    sync.Once
+	release func(net.Conn)
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { c.release(c) })
+	return err
+}
+
+func (c *trackedConn) Unwrap() net.Conn { return c.Conn }
+
+// releaseHTTPConnection drops a closed accepted socket from the tracking maps.
+// connIdentity resolves it to the same key trackHTTPConnection inserted under,
+// whichever wrapper of the socket reported it.
+func (s *Server) releaseHTTPConnection(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.httpConns, connIdentity(conn))
+	s.mu.Unlock()
+	s.cfg.brutalSockets.forget(conn)
 }
 
 func (s *Server) closeTrackedHTTPConnections() error {
 	s.mu.Lock()
 	connections := make([]net.Conn, 0, len(s.httpConns))
-	for conn := range s.httpConns {
+	for _, conn := range s.httpConns {
 		connections = append(connections, conn)
-		delete(s.httpConns, conn)
 	}
+	s.httpConns = make(map[string]net.Conn)
 	s.mu.Unlock()
 
 	var errs []error

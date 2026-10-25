@@ -336,9 +336,9 @@ func classifyTunnelRequest(r *http.Request, cfg serverConfig, wtAvailable bool) 
 			}
 			return tunnelRequest{kind: kindWebTransport, transport: Transport(transportWT), network: network, target: target}
 		case masqueConnectProtocol(r) == protocolConnectTCP, masqueURISegment(r.URL.Path, masquePathBase(cfg.Path)) == "tcp":
-			return tunnelRequest{kind: kindMasqueTCP, transport: Transport(transportMasque), network: networkTCP, target: masqueRequestTarget("tcp", r, target)}
+			return tunnelRequest{kind: kindMasqueTCP, transport: Transport(transportMasque), network: networkTCP, target: masqueRequestTarget("tcp", r, cfg)}
 		case masqueConnectProtocol(r) == protocolConnectUDP, masqueURISegment(r.URL.Path, masquePathBase(cfg.Path)) == "udp":
-			return tunnelRequest{kind: kindMasqueUDP, transport: Transport(transportMasque), network: networkUDP, target: masqueRequestTarget("udp", r, target)}
+			return tunnelRequest{kind: kindMasqueUDP, transport: Transport(transportMasque), network: networkUDP, target: masqueRequestTarget("udp", r, cfg)}
 		default:
 			return tunnelRequest{}
 		}
@@ -360,18 +360,32 @@ func rawTunnelTarget(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-Target"))
 }
 
-// masqueRequestTarget resolves the MASQUE target: X-Target (logical service name)
-// first, then the RFC 9298 URI template, then X-Dst; if all miss it returns an
-// empty string and lets the handler decide to reject.
-func masqueRequestTarget(protocol string, r *http.Request, resolved string) string {
-	if resolved != "" {
-		return resolved
+// masqueRequestTarget resolves the MASQUE target: X-Target (logical service name
+// or address) first, then the RFC 9298 URI template. If neither yields a usable
+// target it returns an empty string and lets the handler reject the request.
+//
+// The legacy getXDst resolution is deliberately NOT consulted here, in either
+// direction. getXDst never returns an empty target: it substitutes 127.0.0.1:22
+// (tcp) or 127.0.0.1:53 (udp) for an empty OR invalid value. The old code read
+// that already-resolved value first, so a mistyped URI became a silent dial of
+// the server's own localhost SSH or DNS, and an X-Target the client mistyped
+// into garbage was replaced by the same loopback default. Both substitutes
+// cleared checkTargetIsAvailable and, over loopback, targetAllowedByRuntime's
+// LocalOnly check too, so no policy stopped them. The Brutal sentinel above is
+// guarded for exactly this reason; the MASQUE path was not.
+func masqueRequestTarget(protocol string, r *http.Request, cfg serverConfig) string {
+	target := strings.TrimSpace(r.Header.Get("X-Target"))
+	if target != "" {
+		if cfg.TargetDialer != nil || isValidTargetAddr(target) {
+			return target
+		}
+		// Not a dialer (logical) registry and not an address: the destination
+		// resolver would have substituted a loopback default for it.
 	}
 	if parsed, err := parseMasqueTarget(protocol, r.URL.Path); err == nil {
 		return parsed
 	}
-	_, dst := getXDst(r)
-	return dst
+	return ""
 }
 
 // masqueURISegment returns the protocol segment right after the base in a MASQUE

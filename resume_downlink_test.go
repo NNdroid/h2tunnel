@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -114,6 +115,80 @@ func TestResumeRecvLoopDownlinkWatermark(t *testing.T) {
 	runCase("reconnected stream starts at clientDownlink", 500, []uint64{500, 600, 700}, 800, nil)
 	// Gap: expects 0 but first frame is 500 → errGap, clientDownlink unchanged.
 	runCase("gap detected as ErrGap", 0, []uint64{500, 600, 700}, 0, errGap)
+}
+
+// TestResumeRecvLoopDeliversEveryByteOnAPartialWrite guards against reporting
+// bytes as delivered when the application never received them. A tunnel conn
+// whose Write returns a partial count must be drained, because the frame seq
+// is already correct and no continuity check can see the hole. The next stream
+// would resume from an offset past it and the lost bytes would never be
+// replayed.
+func TestResumeRecvLoopDeliversEveryByteOnAPartialWrite(t *testing.T) {
+	const seg = 64
+	const frames = 3
+	const limit = 21
+
+	for name, loop := range map[string]func(io.Reader, net.Conn, *uint64, *slog.Logger, *ClientStats) error{
+		"h2": resumeRecvLoop,
+		"WT": resumeRecvLoopWT,
+	} {
+		loop := loop
+		t.Run(name, func(t *testing.T) {
+			conn := &partialWriterConn{limit: limit}
+			in := newResumeDataFrameStream(seg, frames)
+			var clientDownlink uint64
+			recvErr := loop(in, conn, &clientDownlink, discardLogger, nil)
+			if recvErr != nil && !errorsIs(recvErr, io.EOF) {
+				t.Fatalf("err = %v, want clean end or EOF", recvErr)
+			}
+
+			want := seg * frames
+			if got := len(conn.written); got != want {
+				t.Fatalf("the application received %d bytes, want %d", got, want)
+			}
+			if clientDownlink != uint64(want) {
+				t.Fatalf("clientDownlink = %d, want %d", clientDownlink, want)
+			}
+			if conn.calls < frames {
+				t.Fatalf("only %d Write calls, want at least %d; the partial-write path was not exercised", conn.calls, frames)
+			}
+		})
+	}
+}
+
+// partialWriterConn accepts at most limit bytes per Write, so every call from
+// resumeRecvLoop returns a partial count.
+type partialWriterConn struct {
+	net.Conn
+	limit   int
+	written []byte
+	calls   int
+}
+
+func (w *partialWriterConn) Write(p []byte) (int, error) {
+	n := len(p)
+	if n > w.limit {
+		n = w.limit
+	}
+	w.calls++
+	w.written = append(w.written, p[:n]...)
+	return n, nil
+}
+
+func (w *partialWriterConn) Close() error { return nil }
+
+// newResumeDataFrameStream builds a reader of `frames` contiguous resume DATA
+// frames of `seg` bytes each, starting at seq 0, followed by EOF. It mirrors
+// the wire shape resumeRecvLoop consumes.
+func newResumeDataFrameStream(seg, frames int) *bytes.Reader {
+	var wire bytes.Buffer
+	data := bytes.Repeat([]byte("y"), seg)
+	for i := 0; i < frames; i++ {
+		if err := writeResumeFrame(&wire, uint64(i*seg), data, 0); err != nil {
+			panic(err)
+		}
+	}
+	return bytes.NewReader(wire.Bytes())
 }
 
 // errorsIs is a small wrapper to avoid import ambiguity with errors in test files.
