@@ -361,7 +361,7 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 		return false, err
 	}
 	hsBuf := make([]byte, 64*1024)
-	typ, _, _, err := readFrame(stream, hsBuf)
+	typ, _, n, err := readFrame(stream, hsBuf)
 	if err != nil {
 		lgWarnf(cfg.lg(), "[Resume/WT] ❌ failed to read HANDSHAKE-ACK: %v", err)
 		return false, err
@@ -370,7 +370,18 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 		lgWarnf(cfg.lg(), "[Resume/WT] ❌ expected HANDSHAKE-ACK, got frame 0x%02x", typ)
 		return false, errors.New("h2tunnel: invalid WebTransport handshake response")
 	}
-	lgInfof(cfg.lg(), "[Resume/WT] ✅ layer-B handshake confirmed (clientDownlink=%d)", *clientDownlink)
+	// The ACK payload is the server's committed uplink watermark. One WT session
+	// serves many business streams and each resumes from a different offset, so
+	// the value cannot live in the CONNECT headers — it arrives once per stream.
+	// Without it the client replays its ring from 0, and once the ring has rolled
+	// past 0 that is an unrecoverable gap rather than a wasted retransmit. An
+	// empty payload is a server that predates the field; keep the previous value.
+	if n > 0 {
+		if v, errParse := strconv.ParseUint(string(hsBuf[:n]), 10, 64); errParse == nil {
+			*serverUplink = v
+		}
+	}
+	lgInfof(cfg.lg(), "[Resume/WT] ✅ layer-B handshake confirmed (clientDownlink=%d serverUplink=%d)", *clientDownlink, *serverUplink)
 	if onReady != nil {
 		if budgetStop != nil {
 			budgetStop() // once ready the budget no longer constrains the data plane
@@ -603,10 +614,11 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 			// only after the layer-B handshake completes, so the downlinkPump
 			// never writes DATA frames into the new stream before the
 			// HANDSHAKE-ACK (the client's first frame must be HANDSHAKE-ACK).
+			serverUplink, hasServerUplink := sess.uplinkCommitted()
 			var clientDownlink uint64
 			handshakeDone := false
 			if !datagram {
-				cd, ok := doWTStreamHandshake(s, writer, params.handshakeAckMs, sID, sessions.lg())
+				cd, ok := doWTStreamHandshake(s, writer, params.handshakeAckMs, sID, serverUplink, hasServerUplink, sessions.lg())
 				if !ok {
 					return
 				}
@@ -624,7 +636,7 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 // refill point clientDownlink, because WT has no per-stream HTTP headers) and
 // reply HANDSHAKE-ACK. Returns the parsed clientDownlink and success. Timeout
 // / non-HANDSHAKE → false.
-func doWTStreamHandshake(s *webtransport.Stream, writer *resumeSessionWriter, timeoutMs int, sessionID string, lg *slog.Logger) (uint64, bool) {
+func doWTStreamHandshake(s *webtransport.Stream, writer *resumeSessionWriter, timeoutMs int, sessionID string, serverUplink uint64, hasServerUplink bool, lg *slog.Logger) (uint64, bool) {
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 3 * time.Second
@@ -667,12 +679,27 @@ func doWTStreamHandshake(s *webtransport.Stream, writer *resumeSessionWriter, ti
 		lgWarnf(lg, "[%s] ❌ WT HANDSHAKE timed out (%v)", sessionID, timeout)
 		return 0, false
 	}
-	if err := writer.writeControl(resumeFrameHandshakeAck, nil); err != nil {
+	// The HANDSHAKE payload carries clientDownlink (decimal string); the ACK
+	// payload carries the server's committed uplink watermark (decimal string).
+	// It is a reply, not an echo: each side announces the offset the other should
+	// start at, so both directions resume instead of retransmitting.
+	if err := writer.writeControl(resumeFrameHandshakeAck, handshakeAckPayload(serverUplink, hasServerUplink)); err != nil {
 		lgWarnf(lg, "[%s] ❌ failed to write WT HANDSHAKE-ACK: %v", sessionID, err)
 		return 0, false
 	}
-	lgDebugf(lg, "[%s] ✅ WT layer-B handshake confirmed (HANDSHAKE→HANDSHAKE-ACK, clientDownlink=%d)", sessionID, clientDownlink)
+	lgDebugf(lg, "[%s] ✅ WT layer-B handshake confirmed (HANDSHAKE→HANDSHAKE-ACK, clientDownlink=%d serverUplink=%d)", sessionID, clientDownlink, serverUplink)
 	return clientDownlink, true
+}
+
+// handshakeAckPayload renders the watermark the server asks the client to
+// resume from. Nil for datagram sessions, which have no seq coordinate system and
+// therefore nothing to resume. An old server sends nothing at all, and a client
+// reading that keeps its own offset — the additive direction of the change.
+func handshakeAckPayload(serverUplink uint64, present bool) []byte {
+	if !present {
+		return nil
+	}
+	return []byte(strconv.FormatUint(serverUplink, 10))
 }
 
 // runWTUDPDatagramLoop is the redial loop for the WT-UDP datagram plane. The

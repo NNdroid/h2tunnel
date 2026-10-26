@@ -347,6 +347,25 @@ func (s *tunnelSession) attachAndReplay(writer *resumeSessionWriter, fromSeq uin
 	return s.replayDownlinkLocked(writer, fromSeq)
 }
 
+// uplinkCommitted returns the highest contiguous uplink offset the session has
+// written to the target.
+//
+// WebTransport carries it in the HANDSHAKE-ACK payload rather than in the
+// CONNECT response headers: an http.ResponseWriter exists only once, for the
+// QUIC session, but the watermark moves on every business stream. A client that
+// cached the dial-time value would replay from a stale offset — and once its ring
+// has rolled past that offset, ReadAt returns errGap and the reconnect is
+// unrecoverable.
+// Datagram sessions have no seq coordinate system, so they report nothing.
+func (s *tunnelSession) uplinkCommitted() (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.datagram {
+		return 0, false
+	}
+	return s.uplinkRecv, true
+}
+
 // acceptUplinkSeq accepts one uplink frame's seq+data, checks continuity,
 // and — when contiguous — commits it to targetConn and advances uplinkRecv.
 // datagram mode: data is an already-decoded UDP packet, committed directly

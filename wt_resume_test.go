@@ -9,6 +9,7 @@ package h2tunnel
 // disconnect", not stopping at session failover.
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -211,4 +212,158 @@ func TestWTResumeReconnect(t *testing.T) {
 	}
 	t.Logf("✅ WT resume after disconnect succeeded: stream1=%dB, stream2=%dB, total=%dB, no gaps no duplicates",
 		len(part1), len(rest), len(full))
+}
+
+// TestUplinkReplayIsUnrecoverablePastTheWindow shows why the HANDSHAKE-ACK
+// watermark is mandatory rather than an optimisation. The client ring is
+// bounded (window_kb); once the server's committed offset passes the ring start
+// the bytes are gone from memory, so replaying from the zero the client held
+// before the fix is a permanent errGap, while replaying from the advertised
+// offset succeeds.
+func TestUplinkReplayIsUnrecoverablePastTheWindow(t *testing.T) {
+	b := newResumeClientRingBuf(1) // 1 KiB recovery window
+	for i := 0; i < 2; i++ {
+		buf := make([]byte, 1024)
+		for j := range buf {
+			buf[j] = byte(j % 251)
+		}
+		b.Append(buf)
+	}
+	if end := b.WindowEnd(); end != 2048 {
+		t.Fatalf("WindowEnd = %d, want 2048", end)
+	}
+
+	var stale bytes.Buffer
+	if _, err := b.ReplayFrom(0, &stale); !errors.Is(err, errGap) {
+		t.Fatalf("ReplayFrom(0) = %d bytes, %v; want errGap — the window rolled past 0", stale.Len(), err)
+	}
+	var live bytes.Buffer
+	if n, err := b.ReplayFrom(1024, &live); err != nil {
+		t.Fatalf("ReplayFrom(1024) = %d bytes, %v; want 1024 bytes no error", n, err)
+	} else if live.Len() != 1024 {
+		t.Fatalf("ReplayFrom(1024) wrote %d bytes, want 1024", live.Len())
+	}
+}
+
+// TestWTHandshakeAckCarriesTheUplinkWatermark pins the mechanism resume/2 WT
+// relies on to reconnect an uplink that has already rolled its ring.
+//
+// One WT (QUIC) session serves many business streams, so the CONNECT response
+// headers — written once per QUIC session — cannot carry the server's committed
+// uplink offset, which moves on every stream. The HANDSHAKE-ACK payload does:
+// stream1 commits N bytes to the target, and stream2's ACK must advertise N so
+// the client replays its ring from there. Without it the client resumes from 0,
+// which is a permanent failure once the ring has rolled (see
+// TestUplinkReplayIsUnrecoverablePastTheWindow).
+func TestWTHandshakeAckCarriesTheUplinkWatermark(t *testing.T) {
+	const (
+		serverAddr = "127.0.0.1:29745"
+		token      = "wt-uplink-watermark-token"
+		sent       = 8 * 1024
+		frame      = 512
+	)
+	certFile := "test_cert_wtuplink.pem"
+	keyFile := "test_key_wtuplink.pem"
+	generateTestCerts(certFile, keyFile)
+	defer os.Remove(certFile)
+	defer os.Remove(keyFile)
+
+	// Zero segments: writes nothing but holds the socket, so it is a pure sink
+	// for the client's uplink and the server's targetConn stays alive.
+	targetLn, err := fakeChunkedTarget("127.0.0.1:0", 0, 200)
+	if err != nil {
+		t.Fatalf("fake target: bind tcp %s: %v — another process owns the port, so no sink exists and the uplink would reach it", "127.0.0.1:0", err)
+	}
+	t.Cleanup(func() { _ = targetLn.Close() })
+	targetAddr := targetLn.Addr().String()
+
+	go startServerDirect(serverConfig{
+		ListenAddr:    serverAddr,
+		TLSCert:       certFile,
+		TLSKey:        keyFile,
+		EnableTLS:     true,
+		Path:          "/tunnel",
+		Transport:     transportWT,
+		Authenticator: tokenAuth(token),
+		LogLevel:      "error",
+		SessionWindow: 256,
+		Network:       "all",
+	})
+	waitUDPBound(t, serverAddr, 30*time.Second)
+
+	dialer := &webtransport.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{http3.NextProtoH3}},
+		QUICConfig:      getDefaultQUICConfig(),
+	}
+	sessionID := "wt-uplink-watermark-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	headers := resumeWTHeaders(sessionID, targetAddr)
+	headers.Set("X-Auth-Token", token)
+	_, sess, err := dialer.Dial(context.Background(), "https://"+serverAddr+"/tunnel", headers)
+	if err != nil {
+		t.Fatalf("WT dial failed: %v", err)
+	}
+	ctx := context.Background()
+	buf := make([]byte, 64*1024)
+
+	// ===== stream1: commit `sent` bytes of uplink to the target =====
+	st1, err := sess.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+	if err := writeFrame(st1, resumeFrameHandshake, 0, []byte("0"), 0); err != nil {
+		t.Fatalf("write HANDSHAKE: %v", err)
+	}
+	typ, _, n, err := readFrame(st1, buf)
+	if err != nil {
+		t.Fatalf("read HANDSHAKE-ACK: %v", err)
+	}
+	if typ != resumeFrameHandshakeAck {
+		t.Fatalf("expect HANDSHAKE-ACK got 0x%02x", typ)
+	}
+	got1, err := strconv.ParseUint(string(buf[:n]), 10, 64)
+	if err != nil {
+		t.Fatalf("stream1 ACK payload %q is not a decimal watermark: %v", buf[:n], err)
+	}
+	if got1 != 0 {
+		t.Fatalf("stream1 ACK watermark = %d, want 0 (nothing committed yet)", got1)
+	}
+
+	for seq := uint64(0); seq < sent; seq += uint64(frame) {
+		payload := make([]byte, frame)
+		for i := range payload {
+			payload[i] = byte((int(seq) + i) % 251)
+		}
+		if err := writeFrame(st1, resumeFrameData, seq, payload, 0); err != nil {
+			t.Fatalf("write DATA frame seq=%d: %v", seq, err)
+		}
+	}
+	_ = st1.Close()
+	// Let the server commit the last frames to the target and clear the
+	// activeWriter before stream2 snapshots the watermark.
+	time.Sleep(300 * time.Millisecond)
+
+	// ===== stream2: the ACK must advertise the offset stream1 committed =====
+	st2, err := sess.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+	defer st2.Close()
+	if err := writeFrame(st2, resumeFrameHandshake, 0, []byte("0"), 0); err != nil {
+		t.Fatalf("write HANDSHAKE: %v", err)
+	}
+	typ, _, n, err = readFrame(st2, buf)
+	if err != nil {
+		t.Fatalf("read HANDSHAKE-ACK: %v", err)
+	}
+	if typ != resumeFrameHandshakeAck {
+		t.Fatalf("expect HANDSHAKE-ACK got 0x%02x", typ)
+	}
+	got, err := strconv.ParseUint(string(buf[:n]), 10, 64)
+	if err != nil {
+		t.Fatalf("stream2 ACK payload %q is not a decimal watermark: %v", buf[:n], err)
+	}
+	if got != sent {
+		t.Fatalf("stream2 ACK watermark = %d, want %d (the uplink offset stream1 committed)", got, sent)
+	}
+	t.Logf("✅ WT HANDSHAKE-ACK advertises the committed uplink watermark: %d bytes", got)
 }

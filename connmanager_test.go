@@ -15,6 +15,47 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// reserveAddr binds one port in one namespace, closes the listener, and returns
+// the address. The listener goroutines of these tests never exit, so a fixed
+// port range collides with unrelated processes on developer hosts — and with
+// these tests the collision is silent, because a failed local bind does not
+// stop the tunnel from dialing the server.
+func reserveAddr(t *testing.T, network string) string {
+	t.Helper()
+	// UDP has no net.Listen flavour on every platform, so it must go through
+	// ListenPacket.
+	if network == "udp" {
+		pc, err := net.ListenPacket(network, "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve udp port: %v", err)
+		}
+		addr := pc.LocalAddr().String()
+		_ = pc.Close()
+		return addr
+	}
+	ln, err := net.Listen(network, "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve %s port: %v", network, err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+// reserveBoth returns an address free in both namespaces: the echo server binds
+// TCP and UDP, and transportAll opens a QUIC listener beside its TCP one. A
+// port free in only one of them still fails.
+func reserveBoth(t *testing.T) string {
+	t.Helper()
+	addr := reserveAddr(t, "udp")
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("reserve tcp port %s: %v", addr, err)
+	}
+	_ = ln.Close()
+	return addr
+}
+
 // =========================================
 // connmanager_test.go — full runnable tests for the L3 connection-manager layer
 //
@@ -34,10 +75,6 @@ import (
 // Run: go test -run 'ConnManager|connectionPolicy' -v ./...
 // =========================================
 
-// Port base: independent of backup_test(27000) and e2e_test(20000/22000).
-// Each test uses its own seq offset to avoid port conflicts from background goroutines that never exit.
-const connMgrPortBase = 29000
-
 // connManagerHTTPServer starts a tunnel server side with resume/backup enabled.
 func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echoAddr string) {
 	certFile := fmt.Sprintf("test_cert_connmgr_%d.pem", seq)
@@ -47,10 +84,9 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 	}
 	t.Cleanup(func() { os.Remove(certFile); os.Remove(keyFile) })
 
-	echoPort := connMgrPortBase + seq*2
-	serverPort := connMgrPortBase + 443 + seq*2
-	startEchoServer(t, fmt.Sprintf("127.0.0.1:%d", echoPort))
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
+	targetAddr := reserveBoth(t)
+	serverAddr := reserveBoth(t)
+	startEchoServer(t, targetAddr)
 	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
@@ -64,7 +100,7 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 		Network:       "all",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
-	return "https://" + serverAddr, fmt.Sprintf("127.0.0.1:%d", echoPort)
+	return "https://" + serverAddr, targetAddr
 }
 
 // connMgrClient builds a standard resume client config.
@@ -107,14 +143,9 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 	// against that foreign process for a full 6s before timing out. TCP/UDP/QUIC
 	// ephemeral ranges are reserved by the kernel, so a 0 bind cannot collide with
 	// them.
-	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("matrix: reserve echo port: %v", err)
-	}
-	targetAddr := echoLn.Addr().String()
-	_ = echoLn.Close()
+	targetAddr := reserveBoth(t)
+	serverAddr := reserveBoth(t)
 	startEchoServer(t, targetAddr)
-	serverAddr := "127.0.0.1:29543"
 	serverURL := "https://" + serverAddr
 	token := "matrix-token"
 	go startServerDirect(serverConfig{
@@ -133,24 +164,24 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 
 	cases := []struct {
 		name      string
-		port      int
+		listen    string
 		network   string
 		transport string
 	}{
-		{"H2_TCP_Resume", 29101, "tcp", transportH2},
-		{"gRPC_TCP_Resume", 29102, "tcp", transportGRPC},
-		{"H3_TCP_Resume", 29103, "tcp", transportH3},
-		{"WT_TCP_Resume", 29104, "tcp", transportWT},
-		{"MASQUE_TCP_Resume", 29105, "tcp", transportMasque},
-		{"H2_UDP_Resume", 29106, "udp", transportH2},
-		{"MASQUE_UDP_Resume", 29107, "udp", transportMasque},
+		{"H2_TCP_Resume", reserveAddr(t, "tcp"), "tcp", transportH2},
+		{"gRPC_TCP_Resume", reserveAddr(t, "tcp"), "tcp", transportGRPC},
+		{"H3_TCP_Resume", reserveAddr(t, "tcp"), "tcp", transportH3},
+		{"WT_TCP_Resume", reserveAddr(t, "tcp"), "tcp", transportWT},
+		{"MASQUE_TCP_Resume", reserveAddr(t, "tcp"), "tcp", transportMasque},
+		{"H2_UDP_Resume", reserveAddr(t, "udp"), "udp", transportH2},
+		{"MASQUE_UDP_Resume", reserveAddr(t, "udp"), "udp", transportMasque},
 	}
 
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			cc := connMgrClient(serverURL, targetAddr, token, tc.network)
-			cc.ListenAddr = fmt.Sprintf("127.0.0.1:%d", tc.port)
+			cc.ListenAddr = tc.listen
 			cc.Transport = tc.transport
 			go startClientDirect(cc)
 			if tc.network == "udp" {

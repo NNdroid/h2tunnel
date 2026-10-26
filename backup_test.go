@@ -12,17 +12,16 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// splitTestEnv parses the "https://addr|echoPort" returned by startBackupTestEnv.
+// splitTestEnv parses the "https://addr|echoAddr" returned by startBackupTestEnv.
 func splitTestEnv(s string) (serverURL, echoAddr string) {
 	parts := strings.Split(s, "|")
-	return parts[0], "127.0.0.1:" + parts[1]
+	return parts[0], parts[1]
 }
 
 // ================= 3. Primary/backup line integration tests =================
 
 // startBackupTestEnv starts the environment needed by the backup tests:
-// echo target + tunnel server. seq isolates the ports to avoid conflicts
-// between tests. Returns serverURL.
+// echo target + tunnel server. Returns serverURL|echoAddr.
 func startBackupTestEnv(t *testing.T, seq int) string {
 	certFile := fmt.Sprintf("test_cert_backup_%d.pem", seq)
 	keyFile := fmt.Sprintf("test_key_backup_%d.pem", seq)
@@ -31,13 +30,13 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 	}
 	t.Cleanup(func() { os.Remove(certFile); os.Remove(keyFile) })
 
-	// Port bases sit in the 27000 range to avoid colliding with hardcoded
-	// ranges such as e2e_test's StrictDemux (22000-22003) — the go startXxx
-	// background goroutines of each test never exit and hold their ports for a long time.
-	echoPort := 27000 + seq*2
-	serverPort := 27443 + seq*2
-	startEchoServer(t, fmt.Sprintf("127.0.0.1:%d", echoPort))
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
+	// Both ports are reserved with a :0 bind instead of derived from seq in a
+	// fixed range: the fixed bases collide with unrelated processes on
+	// developer hosts, and these servers run in goroutines that never exit, so
+	// every test held its ports for the whole run.
+	echoAddr := reserveBoth(t)
+	serverAddr := reserveBoth(t)
+	startEchoServer(t, echoAddr)
 	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
 		TLSCert:       certFile,
@@ -51,7 +50,7 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 		Network:       "all",
 	})
 	waitTCPOrTLSReady(t, serverAddr, 30*time.Second)
-	return "https://" + serverAddr + "|" + fmt.Sprintf("%d", echoPort)
+	return "https://" + serverAddr + "|" + echoAddr
 }
 
 func newInsecureHTTPClient() *http.Client {
