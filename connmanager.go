@@ -252,14 +252,22 @@ func (m *connectionManager) WaitClient(ctx context.Context, typ string) (*http.C
 			return nil, net.ErrClosed
 		}
 		if bl, ok := m.primaries[lookup]; ok {
-			state := bl.State()
-			if state == backupAlive {
-				if c := bl.Client(); c != nil {
-					m.mu.Unlock()
-					return c, nil
+			switch bl.State() {
+			case backupAlive:
+				// reconcile() collects lanes to close under m.mu but closes them
+				// only after releasing it, so a lane can be closed while still
+				// reachable here in state backupAlive. Its dedicated transport was
+				// just Closed(), so handing its client out would hand out a dead
+				// transport; and with no replacement lane yet dialed this would
+				// otherwise spin until the 10s pick timeout. Treat it as not yet
+				// ready, the same way reconcile treats a closed lane.
+				if !bl.IsClosed() {
+					if c := bl.Client(); c != nil {
+						m.mu.Unlock()
+						return c, nil
+					}
 				}
-			}
-			if state == backupFailed {
+			case backupFailed:
 				err := bl.Err()
 				m.mu.Unlock()
 				if err == nil {
@@ -293,6 +301,13 @@ func (m *connectionManager) WaitAnyClient(ctx context.Context) (*http.Client, er
 			}
 			switch line.State() {
 			case backupAlive:
+				// See WaitClient: a lane being torn down is still backupAlive here
+				// and its transport has already been closed, so it must not be
+				// handed out. Skipping it (rather than counting it failed) keeps it
+				// waiting for reconcile to refill instead of failing over early.
+				if line.IsClosed() {
+					continue
+				}
 				client := line.Client()
 				m.mu.Unlock()
 				if client == nil {

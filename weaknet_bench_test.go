@@ -64,6 +64,13 @@ const weakNetBenchEnv = "H2TUNNEL_WEAKNET_BENCH"
 // weakNetBenchmarkSeconds is the wall-clock stretch each benchmark measures.
 const weakNetBenchmarkSeconds = 2
 
+// weakNetDialTimeout caps the time a transport may take to establish through the
+// simulated link. It exists to bound a wedged leg, not to time a healthy one.
+const weakNetDialTimeout = 20 * time.Second
+
+// weakNetRoundCushion is the headroom after the measured stretch.
+const weakNetRoundCushion = 30 * time.Second
+
 // weakNetToken authenticates the weak-network tunnel pairs.
 const weakNetToken = "weaknet-token"
 
@@ -491,15 +498,38 @@ func listenUDP(t testing.TB, addr string) net.PacketConn {
 	return pc
 }
 
-// weakNetEnv is one tunnel server plus a proxied endpoint per namespace. The
-// server reaches its echo target over plain loopback, so only the client leg
-// is degraded and a clean run and a degraded run are directly comparable.
+// weakNetEnv is one tunnel server. The server reaches its echo target over
+// plain loopback, so only the client leg is degraded and a clean run and a
+// degraded run are directly comparable.
 type weakNetEnv struct {
-	tcp string
-	udp string
+	serverTCP string   // the server's own TCP listen address
+	serverUDP net.Addr // the server's own UDP listen address
 }
 
-func newWeakNetEnv(t testing.TB, profile weakProfile) *weakNetEnv {
+// endpoint returns a proxied address for one client. The proxy is created per
+// client rather than shared across a profile's legs, because the UDP reply path
+// is learned from whichever datagram arrives first and the pipe goroutines of an
+// earlier subtest are deliberately not joined: a lingering sender from the
+// previous leg would latch replyTo and every reply of this client would be sent
+// to a socket nobody reads. That is what made MASQUE over a lossy link look
+// intermittently ten times slower than H3 on the very same link, and then fail
+// to complete a round at all -- until it was measured in isolation, where it
+// came in level with H3. tcpProxy would not show the symptom (it builds a fresh
+// link pair per accepted connection) and was made per-client too, so the two
+// namespaces behave the same way.
+func (e *weakNetEnv) endpoint(t testing.TB, profile weakProfile, udp bool) string {
+	t.Helper()
+	var p *weakNetProxy
+	if udp {
+		p = udpProxy(t, profile, e.serverUDP)
+	} else {
+		p = tcpProxy(t, profile, e.serverTCP)
+	}
+	t.Cleanup(p.close)
+	return p.clientAddr
+}
+
+func newWeakNetEnv(t testing.TB) *weakNetEnv {
 	t.Helper()
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -552,17 +582,12 @@ func newWeakNetEnv(t testing.TB, profile weakProfile) *weakNetEnv {
 		_ = udpEcho.Close()
 	})
 
-	tcpProxyLn := tcpProxy(t, profile, tcpLn.Addr().String())
-	udpProxyLn := udpProxy(t, profile, udpLn.LocalAddr())
-	t.Cleanup(func() {
-		tcpProxyLn.close()
-		udpProxyLn.close()
-	})
-	return &weakNetEnv{tcp: tcpProxyLn.clientAddr, udp: udpProxyLn.clientAddr}
+	return &weakNetEnv{serverTCP: tcpLn.Addr().String(), serverUDP: udpLn.LocalAddr()}
 }
 
-func newWeakNetClient(t testing.TB, endpoint string, transport h2tunnel.Transport) *h2tunnel.Client {
+func newWeakNetClient(t testing.TB, env *weakNetEnv, profile weakProfile, transport h2tunnel.Transport, udp bool) *h2tunnel.Client {
 	t.Helper()
+	endpoint := env.endpoint(t, profile, udp)
 	creds, err := h2tunnel.NewTokenCredentials(weakNetToken)
 	if err != nil {
 		t.Fatalf("weaknet: creds: %v", err)
@@ -596,12 +621,9 @@ func TestWeakNetDelayIsObserved(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			const rtt = 150 * time.Millisecond
-			env := newWeakNetEnv(t, weakProfile{name: tc.name, rtt: rtt})
-			endpoint := env.tcp
-			if tc.udp {
-				endpoint = env.udp
-			}
-			observed, err := measureEchoRTT(t, newWeakNetClient(t, endpoint, tc.transport), 5)
+			link := weakProfile{name: tc.name, rtt: rtt}
+			env := newWeakNetEnv(t)
+			observed, err := measureEchoRTT(t, newWeakNetClient(t, env, link, tc.transport, tc.udp), 5)
 			if err != nil {
 				t.Fatalf("echo through the %s leg: %v", tc.name, err)
 			}
@@ -649,10 +671,11 @@ func TestWeakNetRateCapSlowsTheLeg(t *testing.T) {
 		{name: "Uncapped", rateBps: 0},
 		{name: "Capped", rateBps: capBps},
 	} {
-		env := newWeakNetEnv(t, weakProfile{
+		link := weakProfile{
 			name: cap.name, rtt: delay, rateBps: cap.rateBps,
-		})
-		conn, err := newWeakNetClient(t, env.tcp, h2tunnel.TransportH2).
+		}
+		env := newWeakNetEnv(t)
+		conn, err := newWeakNetClient(t, env, link, h2tunnel.TransportH2, false).
 			DialContext(context.WithoutCancel(context.Background()), h2tunnel.NetworkTCP, "weaknet-tcp")
 		if err != nil {
 			t.Skipf("h2 unavailable through the proxy: %v", err)
@@ -736,15 +759,11 @@ func BenchmarkWeakNetEchoIntegrity(b *testing.B) {
 		}},
 	} {
 		b.Run(row.link.name, func(b *testing.B) {
-			env := newWeakNetEnv(b, row.link)
+			env := newWeakNetEnv(b)
 			for _, leg := range row.legs {
 				leg := leg
 				b.Run(leg.name, func(b *testing.B) {
-					endpoint := env.tcp
-					if leg.udp {
-						endpoint = env.udp
-					}
-					benchmarkWeakNetEcho(b, newWeakNetClient(b, endpoint, leg.transport), payload)
+					benchmarkWeakNetEcho(b, newWeakNetClient(b, env, row.link, leg.transport, leg.udp), payload)
 				})
 			}
 		})
@@ -763,7 +782,13 @@ func BenchmarkWeakNetEchoIntegrity(b *testing.B) {
 // link is reported as unavailable rather than turning the job red.
 func benchmarkWeakNetEcho(b *testing.B, client *h2tunnel.Client, payload []byte) {
 	b.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// These bounds are generous relative to the link, not the other way round:
+	// the slowest profile injects 120ms one-way plus 25ms jitter, so a handshake
+	// and a round both complete in well under a second, and the slowest
+	// subtest measured so far has taken 10s. What the bounds must cap is a
+	// genuinely wedged leg -- an unbounded dial once cost ~90s per skipped
+	// subtest, turning a 65s matrix into a 4-minute one.
+	ctx, cancel := context.WithTimeout(context.Background(), weakNetDialTimeout)
 	defer cancel()
 	conn, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "weaknet-tcp")
 	if err != nil {
@@ -774,9 +799,9 @@ func benchmarkWeakNetEcho(b *testing.B, client *h2tunnel.Client, payload []byte)
 	got := make([]byte, len(payload))
 	stretch := time.Duration(weakNetBenchmarkSeconds) * time.Second
 	// One round must be able to finish at all, or the whole budget is wasted.
-	// Generous: the stretch plus room for a transport that paces its first
-	// writes against the RFC 9002 1s RTT estimate before it learns the real one.
-	if err := conn.SetDeadline(time.Now().Add(stretch + 90*time.Second)); err != nil {
+	// The cushion covers a transport that paces its first writes against the
+	// RFC 9002 1s RTT estimate before it learns the real one.
+	if err := conn.SetDeadline(time.Now().Add(stretch + weakNetRoundCushion)); err != nil {
 		b.Fatalf("set deadline: %v", err)
 	}
 

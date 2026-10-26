@@ -3,7 +3,6 @@ package h2tunnel
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -275,15 +274,6 @@ func setTunnelRequestHeaders(h http.Header) {
 	h.Set("User-Agent", clientUserAgent)
 	h.Set("Accept-Encoding", "identity")
 	h.Set("Cache-Control", "no-store, no-transform")
-}
-
-// secureEqual is a constant-time string comparison (run to completion even on a
-// length mismatch, to avoid a length side channel).
-func secureEqual(a, b string) bool {
-	if a == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // clientIP recovers the real client IP.

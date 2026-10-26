@@ -1,6 +1,7 @@
 package h2tunnel
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -547,6 +548,52 @@ func TestConnectionPolicyPrimaryTypes(t *testing.T) {
 		t.Fatalf("shard types should include tcp+udp, got %v", types)
 	}
 	t.Logf("✅ primaryTypes shard set correct")
+}
+
+// TestConnManagerWaitClientSkipsClosedLane is the regression guard for a lane
+// that is torn down while still recorded as backupAlive. reconcile() collects
+// lanes to close under m.mu but closes them only after releasing it, so there is
+// a real window in which the manager still maps a kind to a lane whose state is
+// backupAlive while its dedicated transport has already been closed. Both
+// waiters must treat that lane as not yet ready, not hand out the dead client.
+// Without the IsClosed checks, WaitClient returned the closed lane's client
+// immediately and WaitAnyClient kept spinning until the caller's deadline.
+func TestConnManagerWaitClientSkipsClosedLane(t *testing.T) {
+	m := newConnectionManager(connectionPolicy{}, clientConfig{}, "/tunnel", &http.Client{}, "CM")
+	// More than one kind keeps WaitClient on the type-demux lookup path, so
+	// "tcp" is looked up as "tcp" rather than being remapped to "default".
+	m.mu.Lock()
+	m.primaryKinds = []string{"tcp", "udp"}
+	m.mu.Unlock()
+
+	newLane := func() *backupLine {
+		bl := newManagedLine("cm-wait", roleBackup, "tcp", clientConfig{}, "/tunnel", &http.Client{}, &http.Client{}, 0)
+		bl.setState(backupAlive)
+		return bl
+	}
+	lane := newLane()
+	m.mu.Lock()
+	m.primaries["tcp"] = lane
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if c, err := m.WaitClient(ctx, "tcp"); err != nil || c == nil {
+		t.Fatalf("a live lane was not returned: client=%v err=%v", c, err)
+	}
+	if c, err := m.WaitAnyClient(ctx); err != nil || c == nil {
+		t.Fatalf("WaitAnyClient did not return a live lane: client=%v err=%v", c, err)
+	}
+
+	lane.close()
+	ctx, cancel = context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if c, err := m.WaitClient(ctx, "tcp"); err == nil || c != nil {
+		t.Fatalf("WaitClient handed out a closed lane's client: client=%v err=%v", c, err)
+	}
+	if c, err := m.WaitAnyClient(ctx); err == nil || c != nil {
+		t.Fatalf("WaitAnyClient handed out a closed lane's client: client=%v err=%v", c, err)
+	}
 }
 
 // keep the io and sync packages used (connection/goroutine concurrency scenarios)

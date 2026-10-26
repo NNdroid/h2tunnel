@@ -337,6 +337,20 @@ func NewTokenCredentials(token string) (CredentialProvider, error) {
 	}, nil
 }
 
+// bearerToken extracts the token from an Authorization header, or "" when the
+// header is absent, has no space after the scheme, or uses a different scheme.
+// The scheme name matches case-insensitively: RFC 6750 section 2.1 says auth
+// scheme tokens are case-insensitive, so "bearer" and "BEARER" authenticate
+// exactly as "Bearer" does.
+func bearerToken(auth string) string {
+	const scheme = "Bearer"
+	auth = strings.TrimSpace(auth)
+	if len(auth) <= len(scheme)+1 || auth[len(scheme)] != ' ' || !strings.EqualFold(auth[:len(scheme)], scheme) {
+		return ""
+	}
+	return strings.TrimSpace(auth[len(scheme)+1:])
+}
+
 // NewTokenAuthenticator creates a constant-time pre-shared-token
 // authenticator. Both the canonical Authorization header and the CDN-safe
 // X-Auth-Token header are accepted.
@@ -348,7 +362,7 @@ func NewTokenAuthenticator(token string) (Authenticator, error) {
 	return func(_ context.Context, r *http.Request) (Principal, error) {
 		candidate := strings.TrimSpace(r.Header.Get("X-Auth-Token"))
 		if candidate == "" {
-			candidate = strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			candidate = bearerToken(r.Header.Get("Authorization"))
 		}
 		if len(candidate) != len(token) || subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) != 1 {
 			return Principal{}, ErrUnauthenticated

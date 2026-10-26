@@ -454,16 +454,13 @@ func brutalGroupSeed(r *http.Request) string {
 
 // brutalTokenFromHeaders reads the presented token, mirroring the sources
 // NewTokenAuthenticator accepts: X-Auth-Token, then "Authorization: Bearer ".
+// The Bearer extraction is shared with the authenticator so the two cannot drift
+// apart on the scheme name again.
 func brutalTokenFromHeaders(h http.Header) string {
 	if v := strings.TrimSpace(h.Get("X-Auth-Token")); v != "" {
 		return v
 	}
-	auth := strings.TrimSpace(h.Get("Authorization"))
-	const prefix = "Bearer "
-	if len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
-		return strings.TrimSpace(auth[len(prefix):])
-	}
-	return ""
+	return bearerToken(h.Get("Authorization"))
 }
 
 func newBrutalNonce() string {

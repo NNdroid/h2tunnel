@@ -83,11 +83,15 @@ func BenchmarkReadFrame32KB(b *testing.B) {
 	const frames = 512
 	stream := benchFrameBuffer(b, frames)
 	payload := make([]byte, benchChunk)
+	// The reader is reused: building a fresh bytes.Reader per iteration would
+	// charge a one-off heap allocation to a hot path that the real call sites
+	// never pay. Reset is two field stores and does not allocate.
+	r := bytes.NewReader(stream)
 	b.SetBytes(int64((resumeHeaderLen + benchChunk) * frames))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r := bytes.NewReader(stream)
+		r.Reset(stream)
 		for {
 			if _, _, _, err := readFrame(r, payload); err != nil {
 				if err == io.EOF {
