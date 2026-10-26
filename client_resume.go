@@ -482,6 +482,19 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 	}()
 
 	wg.Wait()
+	// An unrecoverable resume gap is terminal, and it must not be collapsed into
+	// a normal end or a context cancel. Both sides can produce it while the other
+	// is still clean: Phase-A replay returns errGap before any live byte moves,
+	// and a recv-side gap triggers cancel() above, so the ctx check alone would
+	// report context.Canceled. Either way errGap was being dropped, which made
+	// the (false, errGap) result promised by the comment above unreachable and
+	// made "my recovery window was overrun" indistinguishable from "the peer
+	// ended". isPermanentTunnelError already treats errGap as permanent, so
+	// returning it truthfully is what lets the caller stop redialing and report
+	// TunnelDeathDataGap instead.
+	if errors.Is(sendErr, errGap) || errors.Is(recvErr, errGap) {
+		return false, errGap
+	}
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}

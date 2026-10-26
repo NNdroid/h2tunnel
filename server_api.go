@@ -174,6 +174,7 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if s.sessions.idleTimeout <= 0 {
 		s.sessions.idleTimeout = sessionIdleTimeout
 	}
+	warnSessionIdleBelowHeartbeat(s.log, s.sessions.idleTimeout)
 	s.rootHandler = s.buildRootHandler()
 	if cfg.EnableH3 {
 		s.wtServer = newH3WTServer("", s.rootHandler, cfg.TLSConfig)

@@ -36,9 +36,28 @@ import (
 // =========================================
 
 const (
-	sessionIdleTimeout = 60 * time.Second // max retention without an active stream
+	// sessionIdleTimeout is the max retention without an active stream. It must
+	// outlive heartbeatMax, the longest heartbeat a client may configure, because
+	// the data-plane KEEPALIVE *is* the heartbeat: nothing else touches the
+	// session while it is idle. A session reaped before the next heartbeat
+	// arrives is torn down while the client still believes it is alive, and the
+	// next request then opens a fresh session instead of attaching to the
+	// surviving one. heartbeatMax is clamped at 5min, so one extra minute leaves
+	// room for a heartbeat delayed by the link.
+	sessionIdleTimeout = heartbeatMax + time.Minute
 	sessionCleanupTick = 10 * time.Second
 )
+
+// warnSessionIdleBelowHeartbeat warns when the effective session retention is
+// shorter than heartbeatMax, the longest heartbeat a client may configure. The
+// default already clears it, so this only fires for an operator who lowered it
+// explicitly.
+func warnSessionIdleBelowHeartbeat(lg *slog.Logger, idleTimeout time.Duration) {
+	if lg == nil || idleTimeout > heartbeatMax {
+		return
+	}
+	lgWarnf(lg, "⚠️ session idle retention %s is below the maximum client heartbeat %s: any client using a longer heartbeat has its session reaped between heartbeats and resumes a fresh session on the next request. Keep retention above %s, or keep client heartbeats at or below %s", idleTimeout, heartbeatMax, heartbeatMax, idleTimeout)
+}
 
 // tunnelSession is a server-side session.
 //
@@ -735,10 +754,11 @@ func (s *tunnelSession) downlinkPump() {
 	defer pool.Put(bufPtr)
 	defer s.close()
 
-	// Give targetConn a 5-minute read deadline backstop. The idle reaper closes
-	// the session after 60s without activity, so a continuously-reading session
-	// still needs a live deadline — but we only refresh it as it approaches
-	// expiry rather than paying a SetReadDeadline syscall on every packet.
+	// Give targetConn a 5-minute read deadline backstop. Idle retention is a
+	// separate mechanism driven by heartbeat activity, so a continuously-reading
+	// session still needs a live deadline to notice a target that went silent —
+	// but we only refresh it as it approaches expiry rather than paying a
+	// SetReadDeadline syscall on every packet.
 	readDeadline := time.Now().Add(5 * time.Minute)
 	_ = s.targetConn.SetReadDeadline(readDeadline)
 	for {

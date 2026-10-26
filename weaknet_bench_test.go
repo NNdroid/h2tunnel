@@ -32,6 +32,20 @@ package h2tunnel_test
 //     run `-bench .` -- never pick them up: lossy QUIC under qemu-user takes
 //     minutes per subtest.
 //
+//   - On the datagram legs the absolute number is bounded by the OS, not the
+//     link. The pipe's own channels are sized well past the bandwidth-delay
+//     product, but the proxy's sockets are not: the client->server write blocks
+//     once the server's UDP receive buffer is full, and restoreOrder blocks once
+//     the 512-packet out queue is. So a clean 40ms QUIC leg reports whatever the
+//     runner's socket buffers allow -- tens of MB/s on an idle machine, a couple
+//     on a loaded one -- while the TCP legs sit at a stable ~100 MB/s because a
+//     byte-stream proxy is drained by the kernel as a stream. Read the datagram
+//     rows as relative to each other and against their own cap and loss rows,
+//     not as a machine-wide constant, and never as a comparison with the TCP
+//     rows. Raising SO_RCVBUF would move the ceiling, but only via platform
+//     socket-option code, which is disproportionate for a benchmark that reports
+//     rather than asserts.
+//
 // TestWeakNetDelayIsObserved is deliberately NOT gated: it is the proof that
 // the simulator injects delay at all, and a silently no-op simulator would
 // otherwise let every benchmark below report clean-loopback numbers and still
@@ -43,6 +57,7 @@ package h2tunnel_test
 // =========================================
 
 import (
+	"container/heap"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -52,6 +67,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,6 +87,42 @@ const weakNetDialTimeout = 20 * time.Second
 // weakNetRoundCushion is the headroom after the measured stretch.
 const weakNetRoundCushion = 30 * time.Second
 
+// weakNetDrainTail bounds how long a back-pressured writer may sit blocked after
+// the measured stretch. The writer stops on its own once the stretch ends, so
+// this only ever bites when the transport cannot absorb what it is given.
+const weakNetDrainTail = 10 * time.Second
+
+// weakNetWarmupRounds caps how many echo rounds a benchmark spends settling a
+// connection before the clock starts. A QUIC or WebTransport connection does its
+// handshake on the first write, and quic-go opens from the RFC 9002 1s RTT
+// estimate, so on a 40ms link the first round trips pace themselves to a second
+// of RTT -- well below line rate. Starting the clock inside that transient makes
+// a healthy leg look stalled. TCP legs converge on the second round and pay no
+// more than two.
+const weakNetWarmupRounds = 6
+
+// weakNetWarmupConvergeRatio is how close the last two warm-up round trips must
+// be for the connection to count as settled. It is generous on purpose: it must
+// absorb measurement noise on a loaded runner, but the cold-start gap from 1s
+// down to the injected RTT is far wider than it.
+const weakNetWarmupConvergeRatio = 3
+
+// weakNetFlapWindow is how long TestWeakNetFlapSurvives holds the link
+// black-holed. It must sit well under the QUIC idle timeout (30s), so the
+// connection under test is expected to outlast the partition rather than
+// rebuild itself: the assertion is survival, not reconnection.
+const weakNetFlapWindow = 3 * time.Second
+
+// weakNetFlapRecoverTimeout bounds how long the tunnel may take to carry
+// traffic again after the link comes back. Recovery is paced by QUIC's
+// retransmission backoff, which outlives the partition itself, so this needs
+// headroom on a loaded runner.
+const weakNetFlapRecoverTimeout = 30 * time.Second
+
+// weakNetFlapBudget bounds the test as a whole, so a permanently wedged write
+// becomes a failed test instead of a hung one.
+const weakNetFlapBudget = 60 * time.Second
+
 // weakNetToken authenticates the weak-network tunnel pairs.
 const weakNetToken = "weaknet-token"
 
@@ -84,6 +136,13 @@ type weakProfile struct {
 	jitter  time.Duration
 	reorder int
 	rateBps int64
+
+	// lossNow, when set, decides per packet whether to drop instead of the
+	// constant `loss` fraction. A fixed fraction can only model a link that is
+	// steady; this is how a test drives the same link from healthy to
+	// black-holed and back while traffic is in flight. Profiles are values, so
+	// the knob carries a closure rather than a second copy of the pipe.
+	lossNow func() bool
 }
 
 // weakNetProfiles is the matrix. Loss and reorder are observable only on the
@@ -112,6 +171,7 @@ func requireWeakNetBench(b testing.TB) {
 type weakNetPipe struct {
 	delay   time.Duration
 	loss    float64
+	lossNow func() bool
 	jitter  time.Duration
 	reorder int
 	rateBps int64
@@ -130,6 +190,7 @@ func newWeakNetPipe(p weakProfile) *weakNetPipe {
 	pipe := &weakNetPipe{
 		delay:   p.rtt / 2,
 		loss:    p.loss,
+		lossNow: p.lossNow,
 		jitter:  p.jitter,
 		reorder: p.reorder,
 		rateBps: p.rateBps,
@@ -141,57 +202,58 @@ func newWeakNetPipe(p weakProfile) *weakNetPipe {
 	return pipe
 }
 
-// stagedPacket is a packet carrying the order it entered the link, so a
-// parallel delay stage can hand them back in the order they arrived.
+// weakNetDelayBuffer sizes the hand-off from the delay stage to the reorder or
+// restore stage. It must be large: when it is full the scheduler blocks, which
+// back-pressures the in queue and then the client, so an undersized value turns
+// the link into a fixed worker pool again and the datagram legs collapse toward
+// the 0.08MB/s the old 256-worker design reported. A pipelined leg keeps well
+// under this many packets in flight, so it never binds on its own -- the real
+// ceilings are the out queue and, on the datagram legs, the OS socket buffers.
+const weakNetDelayBuffer = 1 << 20
+
+// stagedPacket is a packet carrying the order it entered the link and the time
+// it is due for delivery, so a reordered delay stage can hand them back in the
+// order they arrived.
 type stagedPacket struct {
 	seq uint64
+	at  time.Time
 	pkt []byte
 }
 
-// run is the pipeline: drop, then rate-limit and delay in parallel, then
-// reorder or restore order. One dispatcher owns the read side so the sequence
-// number is stamped in the order packets entered the link; the delay itself is
-// parallel so a burst does not queue behind itself.
+// delayHeap is a min-heap of packets waiting for their scheduled delivery time.
+//
+// A clock-driven heap replaced two earlier designs, each of which corrupted the
+// measurement rather than the product. One goroutine per packet leaked: a
+// pipelined leg emits tens of thousands of packets, and a goroutine that is
+// still sleeping when its subtest's reader is gone blocks on a full
+// `delayed` forever, starving the legs that run behind it. A fixed worker pool
+// did not leak, but the pool size then became the in-flight budget: 256 workers
+// at a 20ms one-way delay admit about 15MB/s, well below the bandwidth-delay
+// product a QUIC leg wants, so the UDP legs reported 0.08MB/s where they
+// delivered 77MB/s. A heap has no such budget: it grows to whatever the in and
+// out queues admit, so depth follows back-pressure instead of a constant, which
+// is what a real link does.
+type delayHeap []stagedPacket
+
+func (h delayHeap) Len() int           { return len(h) }
+func (h delayHeap) Less(i, j int) bool { return h[i].at.Before(h[j].at) }
+func (h delayHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *delayHeap) Push(x any)        { *h = append(*h, x.(stagedPacket)) }
+func (h *delayHeap) Pop() any {
+	old := *h
+	n := len(old) - 1
+	x := old[n]
+	old[n] = stagedPacket{}
+	*h = old[:n]
+	return x
+}
+
+// run is the pipeline: drop, then rate-limit and delay, then reorder or
+// restore order. The scheduler owns the sequence number, so it is stamped in
+// the order packets entered the link.
 func (p *weakNetPipe) run() {
-	delayed := make(chan stagedPacket, 512)
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		var (
-			wg  sync.WaitGroup
-			seq uint64
-		)
-		defer wg.Wait()
-		for {
-			var (
-				pkt []byte
-				ok  bool
-			)
-			select {
-			case pkt, ok = <-p.in:
-				if !ok {
-					return
-				}
-			case <-p.stop:
-				return
-			}
-			if p.loss > 0 && mrand.Float64() < p.loss {
-				continue
-			}
-			wg.Add(1)
-			go func(s stagedPacket) {
-				defer wg.Done()
-				p.pace(int64(len(s.pkt)))
-				time.Sleep(p.delay + time.Duration(mrand.Int64N(int64(p.jitter)+1)))
-				delayed <- s
-			}(stagedPacket{seq: seq, pkt: pkt})
-			seq++
-		}
-	}()
-	go func() {
-		<-finished
-		close(delayed)
-	}()
+	delayed := make(chan stagedPacket, weakNetDelayBuffer)
+	go p.schedule(delayed)
 
 	if p.reorder == 0 && p.loss == 0 {
 		p.restoreOrder(delayed)
@@ -220,6 +282,73 @@ func (p *weakNetPipe) run() {
 		held = held[1:]
 	}
 	close(p.out)
+}
+
+// schedule is the rate limit and the delay: one goroutine owns both the heap
+// and the clock. A packet admitted now is delivered when its scheduled time
+// arrives, so the delay is exact instead of spread across whatever a pool of
+// sleepers happened to be doing. Pacing happens at admission rather than
+// delivery because the token bucket caps the rate the link admits; a bursty
+// delivery pattern is invisible to a throughput measurement, and this keeps the
+// goroutine count at one.
+func (p *weakNetPipe) schedule(out chan<- stagedPacket) {
+	var (
+		h   delayHeap
+		seq uint64
+	)
+	timer := time.NewTimer(0)
+	timer.Stop()
+
+	for {
+		for h.Len() > 0 && !h[0].at.After(time.Now()) {
+			out <- heap.Pop(&h).(stagedPacket)
+		}
+
+		var due <-chan time.Time
+		if h.Len() > 0 {
+			until := time.Until(h[0].at)
+			if until > 0 {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(until)
+				due = timer.C
+			}
+		}
+
+		select {
+		case pkt, ok := <-p.in:
+			if !ok {
+				p.drainStage(&h, out)
+				return
+			}
+			if p.drops() {
+				continue
+			}
+			// Stamp before incrementing: restoreOrder looks for sequence 0
+			// first, so the first packet admitted must carry 0.
+			p.pace(int64(len(pkt)))
+			at := time.Now().Add(p.delay + time.Duration(mrand.Int64N(int64(p.jitter)+1)))
+			heap.Push(&h, stagedPacket{seq: seq, at: at, pkt: pkt})
+			seq++
+		case <-p.stop:
+			p.drainStage(&h, out)
+			return
+		case <-due:
+		}
+	}
+}
+
+// drainStage releases whatever is still scheduled, so the tail of a flow is not
+// lost, then closes the channel the reorder stage ranges over.
+func (p *weakNetPipe) drainStage(h *delayHeap, out chan<- stagedPacket) {
+	for h.Len() > 0 {
+		out <- heap.Pop(h).(stagedPacket)
+	}
+	close(out)
 }
 
 // restoreOrder hands packets back in the order they entered the link. A
@@ -277,11 +406,18 @@ func (p *weakNetPipe) finish() {
 	p.once.Do(func() { close(p.stop) })
 }
 
+// drops decides whether this packet is lost. The live knob wins over the static
+// fraction, which is what lets a test hold a link black-holed for a bounded
+// window and then let it recover under existing traffic.
+func (p *weakNetPipe) drops() bool {
+	if f := p.lossNow; f != nil {
+		return f()
+	}
+	return p.loss > 0 && mrand.Float64() < p.loss
+}
+
 // pace enforces the link's byte rate. Both directions of a link get their own
-// pipe and therefore their own bucket, so the cap applies per direction. The
-// burst is deliberately small: a large burst would let a whole flow get through
-// before pacing ever engages, which is the opposite of what a rate cap should
-// do to a bursty benchmark.
+// pipe and therefore their own bucket, so the cap applies per direction.
 func (p *weakNetPipe) pace(want int64) {
 	if p.rateBps <= 0 || want <= 0 {
 		return
@@ -289,30 +425,52 @@ func (p *weakNetPipe) pace(want int64) {
 	p.rateMu.Lock()
 	now := time.Now()
 	if p.rateAt.IsZero() {
+		// Start the bucket full so a flow may open with a burst instead of
+		// the first packet being charged for the whole burst.
 		p.rateAt = now
+		p.tokens = p.burst()
 	}
 	available := now.Sub(p.rateAt).Nanoseconds() * p.rateBps / int64(time.Second)
 	if available < 0 {
 		available = 0
 	}
 	p.tokens += available
-	burst := int64(4 * 1024)
-	if r := p.rateBps / 100; r > burst {
-		burst = r
-	}
-	if p.tokens > burst {
-		p.tokens = burst
+	if b := p.burst(); p.tokens > b {
+		p.tokens = b
 	}
 	var wait time.Duration
 	if want > p.tokens {
+		// Pay the deficit from the future: it becomes sleep, the bucket is
+		// emptied, and the refill clock is anchored past it. Tokens must
+		// never go negative -- the old accounting subtracted `want` either
+		// way, so each deficit stacked on the last and the waits grew
+		// without bound, letting a 32KiB/s cap pass a megabyte a second.
 		wait = time.Duration((want - p.tokens) * int64(time.Second) / p.rateBps)
+		p.tokens = 0
+		p.rateAt = now.Add(wait)
+	} else {
+		p.tokens -= want
+		// The elapsed time was just folded into the bucket, so now is the
+		// new anchor; keeping the old one would re-credit it.
+		p.rateAt = now
 	}
-	p.tokens -= want
-	p.rateAt = now.Add(wait)
 	p.rateMu.Unlock()
 	if wait > 0 {
 		time.Sleep(wait)
 	}
+}
+
+// burst is how many bytes a single admission may take without waiting: at
+// least one 4KiB packet and at least one 10ms window of the configured rate,
+// whichever is larger. It is deliberately small -- a large burst would let a
+// whole flow through before pacing ever engages, the opposite of what a rate
+// cap should do to a bursty benchmark.
+func (p *weakNetPipe) burst() int64 {
+	burst := int64(4 * 1024)
+	if r := p.rateBps / 100; r > burst {
+		burst = r
+	}
+	return burst
 }
 
 // pump copies src -> pipe -> dst and reports when it stops.
@@ -648,9 +806,9 @@ func TestWeakNetDelayIsObserved(t *testing.T) {
 // does. Relative, so it survives a noisy runner.
 //
 // The delay is short on purpose. A cap only binds when the RTT-limited rate is
-// above it, and an h2 tunnel over a 40 ms link tops out near 80 KiB/s -- below
-// the 64 KiB/s cap, so the cap would sit idle and the assertion could not
-// distinguish "the cap works" from "the cap is ignored".
+// well above it, otherwise the cap sits idle and the assertion cannot tell
+// "the cap works" from "the cap is ignored". A serial 4 KiB echo over a 20 ms
+// link moves 200 KiB/s -- ten times the 16 KiB/s cap here.
 func TestWeakNetRateCapSlowsTheLeg(t *testing.T) {
 	requireWeakNetBench(t)
 	payload := make([]byte, 4*1024)
@@ -689,6 +847,97 @@ func TestWeakNetRateCapSlowsTheLeg(t *testing.T) {
 	t.Logf("uncapped %v/s, capped %v/s", results[0].rate, results[1].rate)
 }
 
+// TestWeakNetFlapSurvives black-holes a live tunnel for a few seconds and
+// asserts it carries traffic again once the link comes back, with the same
+// bytes intact.
+//
+// Every matrix profile holds its loss fixed for the whole run, so it can only
+// model a link that is steady. The link that reaches a user goes bad and then
+// recovers, and nothing else in this file covers that shape: a transport that
+// wedges on a partition would show up here and never in a constant profile.
+// Both directions share one knob, so the tunnel sees a symmetric partition
+// rather than a one-way stall.
+func TestWeakNetFlapSurvives(t *testing.T) {
+	requireWeakNetBench(t)
+
+	var blackHoled atomic.Bool
+	link := weakProfile{
+		name:    "Flap_160ms",
+		rtt:     160 * time.Millisecond,
+		lossNow: blackHoled.Load,
+	}
+	env := newWeakNetEnv(t)
+	client := newWeakNetClient(t, env, link, h2tunnel.TransportH2, false)
+
+	payload := make([]byte, 4*1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	got := make([]byte, len(payload))
+	ctx, cancel := context.WithTimeout(context.Background(), weakNetDialTimeout)
+	defer cancel()
+	conn, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "weaknet-tcp")
+	if err != nil {
+		t.Skipf("h2 unavailable through the proxy: %v", err)
+	}
+	defer conn.Close()
+
+	// echoOnce is one round trip on its own clock, so a wedged tunnel fails this
+	// call instead of hanging the test. The deadline is cleared on the way out,
+	// so the writer in flight below keeps its own generous budget.
+	echoOnce := func(timeout time.Duration) error {
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
+		defer conn.SetDeadline(time.Time{})
+		if _, err := conn.Write(payload); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		if _, err := io.ReadFull(conn, got); err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+		if !slices.Equal(got, payload) {
+			return fmt.Errorf("echoed chunk differs")
+		}
+		return nil
+	}
+
+	if err := echoOnce(20 * time.Second); err != nil {
+		t.Fatalf("baseline echo: %v", err)
+	}
+	t.Log("leg healthy; partitioning the link")
+
+	// An echo round trip started inside the partition cannot complete until the
+	// link returns: the reply has nowhere to come from. That is what makes the
+	// next check non-trivial, so a silently no-op partition knob cannot pass it.
+	partitioned := time.Now()
+	blackHoled.Store(true)
+	inflight := make(chan struct{})
+	go func() {
+		defer close(inflight)
+		if err := echoOnce(weakNetFlapBudget); err != nil {
+			t.Logf("echo across the partition: %v", err)
+		}
+	}()
+	time.Sleep(weakNetFlapWindow)
+	blackHoled.Store(false)
+	t.Log("link restored")
+
+	select {
+	case <-inflight:
+	case <-time.After(weakNetFlapRecoverTimeout):
+		t.Fatal("a round trip started inside the partition never completed after the link recovered")
+	}
+	if settled := time.Since(partitioned); settled < weakNetFlapWindow {
+		t.Fatalf("a round trip across the partition settled in %s, before the link was restored: the black hole never took effect", settled)
+	}
+
+	if err := echoOnce(weakNetFlapRecoverTimeout); err != nil {
+		t.Fatalf("echo after the partition: %v", err)
+	}
+	t.Logf("tunnel survived a %s black hole and resumed", weakNetFlapWindow)
+}
+
 // BenchmarkWeakNetEchoIntegrity is the weak-network throughput matrix. Every
 // profile asserts byte integrity on each echoed chunk and reports the
 // throughput that resulted -- slowness is a result, not a failure, so a
@@ -701,73 +950,133 @@ func TestWeakNetRateCapSlowsTheLeg(t *testing.T) {
 // The lossy and reorder rows carry the transports that actually reach them.
 func BenchmarkWeakNetEchoIntegrity(b *testing.B) {
 	requireWeakNetBench(b)
+	benchmarkWeakNetMatrix(b, weakNetEchoPayload(), benchmarkWeakNetEcho)
+}
+
+// BenchmarkWeakNetPipelinedThroughput measures the same matrix with writes
+// outstanding while the echo is still being read.
+//
+// BenchmarkWeakNetEchoIntegrity is serial: one 4KiB write, then a blocking read
+// of the echo, then the next write. At most one chunk is ever in flight, so it
+// reports payload/RTT -- a latency ceiling -- and a pipelining, write-coalescing
+// or flow-control change produces a byte-identical number there. Nothing in the
+// suite could have caught such a change, because this benchmark is the only one
+// that combines a degraded link with bytes in flight. The writer and the reader
+// run concurrently here: the writer pushes until the stretch ends while the
+// reader verifies, so bytes sit outstanding inside the transport and the number
+// tracks throughput rather than RTT.
+func BenchmarkWeakNetPipelinedThroughput(b *testing.B) {
+	requireWeakNetBench(b)
+	benchmarkWeakNetMatrix(b, weakNetEchoPayload(), benchmarkWeakNetPipelined)
+}
+
+func weakNetEchoPayload() []byte {
 	payload := make([]byte, 4*1024)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	for _, row := range []struct {
-		link weakProfile
-		legs []struct {
-			name      string
-			transport h2tunnel.Transport
-			udp       bool
-		}
-	}{
-		{weakNetProfiles[0], []struct {
-			name      string
-			transport h2tunnel.Transport
-			udp       bool
-		}{
+	return payload
+}
+
+// weakNetLeg is one transport over the simulated link. udp selects the proxied
+// UDP namespace; the TCP legs and the QUIC legs cannot share one profile
+// address because they are independent namespaces.
+type weakNetLeg struct {
+	name      string
+	transport h2tunnel.Transport
+	udp       bool
+}
+
+// weakNetRow is one link profile with the transports that reach it.
+type weakNetRow struct {
+	link weakProfile
+	legs []weakNetLeg
+}
+
+// weakNetMatrix is the (link, legs) pairs every weak-network benchmark runs:
+// Clean covers all five transports, the rate cap the two TCP legs, and the lossy
+// and reorder links only the QUIC legs that actually reach them.
+func weakNetMatrix() []weakNetRow {
+	return []weakNetRow{
+		{weakNetProfiles[0], []weakNetLeg{
 			{"H2_TCP", h2tunnel.TransportH2, false},
 			{"gRPC_TCP", h2tunnel.TransportGRPC, false},
 			{"H3_UDP", h2tunnel.TransportH3, true},
 			{"WT_UDP", h2tunnel.TransportWebTransport, true},
 			{"MASQUE_H3_UDP", h2tunnel.TransportMASQUE, true},
 		}},
-		{weakNetProfiles[1], []struct {
-			name      string
-			transport h2tunnel.Transport
-			udp       bool
-		}{
+		{weakNetProfiles[1], []weakNetLeg{
 			{"H2_TCP", h2tunnel.TransportH2, false},
 			{"gRPC_TCP", h2tunnel.TransportGRPC, false},
 		}},
-		{weakNetProfiles[2], []struct {
-			name      string
-			transport h2tunnel.Transport
-			udp       bool
-		}{
+		{weakNetProfiles[2], []weakNetLeg{
 			{"H3_UDP", h2tunnel.TransportH3, true},
 			{"WT_UDP", h2tunnel.TransportWebTransport, true},
 			{"MASQUE_H3_UDP", h2tunnel.TransportMASQUE, true},
 		}},
-		{weakNetProfiles[3], []struct {
-			name      string
-			transport h2tunnel.Transport
-			udp       bool
-		}{
+		{weakNetProfiles[3], []weakNetLeg{
 			{"H3_UDP", h2tunnel.TransportH3, true},
 			{"WT_UDP", h2tunnel.TransportWebTransport, true},
 		}},
-		{weakNetProfiles[4], []struct {
-			name      string
-			transport h2tunnel.Transport
-			udp       bool
-		}{
+		{weakNetProfiles[4], []weakNetLeg{
 			{"H3_UDP", h2tunnel.TransportH3, true},
 			{"WT_UDP", h2tunnel.TransportWebTransport, true},
 		}},
-	} {
+	}
+}
+
+// benchmarkWeakNetMatrix runs one runner per (profile, leg) pair against a fresh
+// environment per profile. Each profile stands up one server and shares it across
+// the legs that dial it, so a 25-row matrix costs 5 environments.
+func benchmarkWeakNetMatrix(b *testing.B, payload []byte, run func(*testing.B, *h2tunnel.Client, []byte)) {
+	b.Helper()
+	for _, row := range weakNetMatrix() {
+		row := row
 		b.Run(row.link.name, func(b *testing.B) {
 			env := newWeakNetEnv(b)
 			for _, leg := range row.legs {
 				leg := leg
 				b.Run(leg.name, func(b *testing.B) {
-					benchmarkWeakNetEcho(b, newWeakNetClient(b, env, row.link, leg.transport, leg.udp), payload)
+					run(b, newWeakNetClient(b, env, row.link, leg.transport, leg.udp), payload)
 				})
 			}
 		})
 	}
+}
+
+// warmUpEcho drives a fresh connection to steady state before the measured
+// stretch starts, then returns the last round trip it observed.
+//
+// Two costs must land outside the measured window, and a single warm-up round
+// guarantees neither. A QUIC or WebTransport connection does its handshake on
+// the first write. And quic-go opens from the RFC 9002 1s RTT estimate, so on a
+// 40ms link the first round trips run at a fraction of line rate. Echo until the
+// round trip stops falling within the convergence ratio; a TCP leg converges on
+// the second round and pays no more than two.
+//
+// A round that fails skips the subtest, matching the runners: a transport that
+// cannot carry a round through this link is unavailable, not broken.
+func warmUpEcho(b testing.TB, conn net.Conn, payload, got []byte) time.Duration {
+	b.Helper()
+	var prev time.Duration
+	for i := 0; i < weakNetWarmupRounds; i++ {
+		start := time.Now()
+		if _, err := conn.Write(payload); err != nil {
+			b.Skipf("transport could not write through this link: %v", err)
+		}
+		if _, err := io.ReadFull(conn, got); err != nil {
+			b.Skipf("echo did not come back through this link: %v", err)
+		}
+		if !slices.Equal(got, payload) {
+			b.Fatal("warmed-up echo chunk differs")
+		}
+		rtt := time.Since(start)
+		if prev > 0 && rtt >= prev/weakNetWarmupConvergeRatio && rtt <= prev*weakNetWarmupConvergeRatio {
+			break
+		}
+		prev = rtt
+	}
+	return prev
 }
 
 // benchmarkWeakNetEcho measures a fixed wall-clock stretch instead of b.N
@@ -798,24 +1107,15 @@ func benchmarkWeakNetEcho(b *testing.B, client *h2tunnel.Client, payload []byte)
 
 	got := make([]byte, len(payload))
 	stretch := time.Duration(weakNetBenchmarkSeconds) * time.Second
+
+	// Warm up before starting the clock. The deadline is set afterwards: it
+	// bounds the measured rounds, not the settling rounds above, so a slow cold
+	// start cannot eat into the cushion a wedged round is meant to burn.
+	warmUpEcho(b, conn, payload, got)
+
 	// One round must be able to finish at all, or the whole budget is wasted.
-	// The cushion covers a transport that paces its first writes against the
-	// RFC 9002 1s RTT estimate before it learns the real one.
 	if err := conn.SetDeadline(time.Now().Add(stretch + weakNetRoundCushion)); err != nil {
 		b.Fatalf("set deadline: %v", err)
-	}
-
-	// Warm up before starting the clock: a QUIC/WT connection does its handshake
-	// on the first write, and charging that to the measured window would make a
-	// slow first round look like a stalled link.
-	if _, err := conn.Write(payload); err != nil {
-		b.Skipf("transport could not write through this link: %v", err)
-	}
-	if _, err := io.ReadFull(conn, got); err != nil {
-		b.Skipf("echo did not come back through this link: %v", err)
-	}
-	if !slices.Equal(got, payload) {
-		b.Fatal("warmed-up echo chunk differs")
 	}
 
 	rounds := 0
@@ -834,7 +1134,10 @@ func benchmarkWeakNetEcho(b *testing.B, client *h2tunnel.Client, payload []byte)
 			b.Fatalf("echoed chunk differs after %d rounds through the weak link", rounds+1)
 		}
 		rounds++
-		total += int64(len(payload)) * 2
+		// Only the client->server leg is charged: the echo returns over the
+		// server's own clean loopback path to the echo target, so counting it
+		// would double a byte that never crossed the simulated link.
+		total += int64(len(payload))
 	}
 	if rounds == 0 {
 		b.Skipf("no round completed in %s", stretch)
@@ -845,6 +1148,103 @@ func benchmarkWeakNetEcho(b *testing.B, client *h2tunnel.Client, payload []byte)
 	if rounds < 4 {
 		b.Logf("only %d rounds in %s: this link cannot sustain the transport", rounds, stretch)
 	}
+}
+
+// benchmarkWeakNetPipelined keeps a writer and a reader running at once over one
+// connection, so chunks are outstanding inside the transport instead of one
+// being in flight at a time. The same fixed-stretch reporting applies: bytes
+// verified over the stretch, b.N forced to 1.
+//
+// Only byte integrity fails the subtest. A broken stream skips, matching the
+// serial variant, so a transport that cannot carry pipelined traffic through a
+// harsh link is reported as unavailable rather than turning the job red.
+func benchmarkWeakNetPipelined(b *testing.B, client *h2tunnel.Client, payload []byte) {
+	b.Helper()
+	stretch := time.Duration(weakNetBenchmarkSeconds) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), weakNetDialTimeout)
+	defer cancel()
+	conn, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "weaknet-tcp")
+	if err != nil {
+		b.Skipf("transport unavailable through the proxy: %v", err)
+	}
+	defer conn.Close()
+
+	got := make([]byte, len(payload))
+
+	// Warm up before the clock. The deadline is set afterwards: it bounds the
+	// writer after the measured stretch, not the settling rounds above, so a slow
+	// cold start cannot eat into the cushion a wedged writer is meant to burn.
+	warmUpEcho(b, conn, payload, got)
+
+	// The deadline bounds the writer after the stretch, so a back-pressured
+	// writer cannot hold the subtest hostage waiting for a write that never
+	// drains. It does not bound the reader: the reader stops on the stretch.
+	if err := conn.SetDeadline(time.Now().Add(stretch + weakNetDrainTail)); err != nil {
+		b.Fatalf("set deadline: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	start := time.Now()
+
+	type writerResult struct {
+		wrote int64
+		err   error
+	}
+	done := make(chan writerResult, 1)
+	go func() {
+		var wrote int64
+		for time.Since(start) < stretch {
+			if _, err := conn.Write(payload); err != nil {
+				done <- writerResult{wrote, fmt.Errorf("writer: %w", err)}
+				return
+			}
+			wrote += int64(len(payload))
+		}
+		done <- writerResult{wrote, nil}
+	}()
+
+	// The reader stops on the stretch, so the measured window is the stretch
+	// regardless of how long the last in-flight bytes take to land. Verified
+	// bytes are what the link actually delivered, which is the number that
+	// tracks throughput: a back-pressured writer sends less, and that shows up
+	// here rather than being hidden inside the transport.
+	var verified int64
+	for time.Since(start) < stretch {
+		_, err := io.ReadFull(conn, got)
+		if err != nil {
+			// A hard error before the stretch ends means the stream broke, which
+			// is what the serial variant skips on too.
+			if !isTimeoutErr(err) {
+				b.Skipf("pipelined echo stopped after %d verified bytes: %v", verified, err)
+			}
+			break
+		}
+		if !slices.Equal(got, payload) {
+			b.Fatalf("pipelined echo chunk differs after %d verified bytes", verified)
+		}
+		verified += int64(len(payload))
+	}
+
+	// The measured window is over; let the writer unwind unmeasured.
+	b.StopTimer()
+	res := <-done // the writer sends before returning, so wrote is settled here
+	if res.err != nil {
+		b.Logf("pipelined writer could not keep up: %v", res.err)
+	}
+	if verified == 0 {
+		b.Skipf("no pipelined byte completed in %s", stretch)
+	}
+	b.SetBytes(verified)
+	b.N = 1
+	b.ReportMetric(float64(res.wrote), "sent")
+}
+
+// isTimeoutErr reports an i/o timeout without importing errors: the conn
+// deadline is the intended end of a measured stretch, not a failure.
+func isTimeoutErr(err error) bool {
+	ne, ok := err.(interface{ Timeout() bool })
+	return ok && ne.Timeout()
 }
 
 // measureEchoRate moves a fixed wall-clock stretch of echoed chunks and
@@ -867,7 +1267,7 @@ func measureEchoRate(t testing.TB, conn net.Conn, payload []byte) float64 {
 			t.Fatal("echoed chunk differs")
 		}
 		rounds++
-		total += int64(len(payload)) * 2
+		total += int64(len(payload))
 	}
 	elapsed := time.Since(start)
 	t.Logf("echoed %d chunks of %d bytes in %s", rounds, len(payload), elapsed.Round(time.Millisecond))

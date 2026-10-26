@@ -342,12 +342,32 @@ func TestPauseDetachedTargetReads(t *testing.T) {
 
 func TestQUICReceiveWindowValidationAndWiring(t *testing.T) {
 	for _, bad := range []QUICReceiveWindowTuning{
-		{MaxStreamBytes: 257 << 20}, {MaxStreamBytes: 1},
-		{InitialStreamBytes: 9 << 20}, {InitialConnectionBytes: 21 << 20},
-		{MaxStreamBytes: 24 << 20}, {InitialStreamBytes: 1 << 20},
+		// over the per-stream / per-connection bound
+		{MaxStreamBytes: 257 << 20},
+		{InitialConnectionBytes: 300 << 20},
+		// an initial window larger than the maximum leaves a window that
+		// cannot grow
+		{InitialStreamBytes: 9 << 20, MaxStreamBytes: 8 << 20},
+		{InitialStreamBytes: 9 << 20},
+		// a connection window too small to hold one stream window, at either
+		// size: one stream then owns all of the connection's credit
+		{MaxStreamBytes: 24 << 20},
+		{InitialStreamBytes: 24 << 20},
 	} {
 		if err := bad.Validate(); err == nil {
 			t.Fatalf("accepted invalid windows: %+v", bad)
+		}
+	}
+	for _, half := range []QUICReceiveWindowTuning{
+		// raising only the maximum is the common case and must stay valid:
+		// the initial inherits the maximum instead of falling back to
+		// quic-go's 512KiB
+		{MaxStreamBytes: 1 << 20},
+		{MaxStreamBytes: 1 << 20, MaxConnectionBytes: 4 << 20},
+		{InitialStreamBytes: 2 << 20},
+	} {
+		if err := half.Validate(); err != nil {
+			t.Fatalf("rejected a valid partial window set %+v: %v", half, err)
 		}
 	}
 	w := QUICReceiveWindowTuning{InitialStreamBytes: 1 << 20, InitialConnectionBytes: 2 << 20, MaxStreamBytes: 16 << 20, MaxConnectionBytes: 32 << 20}
@@ -358,8 +378,13 @@ func TestQUICReceiveWindowValidationAndWiring(t *testing.T) {
 	if c.InitialStreamReceiveWindow != w.InitialStreamBytes || c.InitialConnectionReceiveWindow != w.InitialConnectionBytes || c.MaxStreamReceiveWindow != w.MaxStreamBytes || c.MaxConnectionReceiveWindow != w.MaxConnectionBytes {
 		t.Fatal("QUIC tuning lost")
 	}
-	if d := (QUICReceiveWindowTuning{}).config(); d.MaxStreamReceiveWindow != 8<<20 || d.MaxConnectionReceiveWindow != 20<<20 || d.InitialStreamReceiveWindow != 0 || d.InitialConnectionReceiveWindow != 0 {
-		t.Fatal("default windows changed")
+	// An unset initial inherits the max rather than quic-go's 512KiB / 768KiB,
+	// so a fresh connection opens with full credit.
+	if d := (QUICReceiveWindowTuning{}).config(); d.InitialStreamReceiveWindow != 8<<20 || d.MaxStreamReceiveWindow != 8<<20 || d.InitialConnectionReceiveWindow != 20<<20 || d.MaxConnectionReceiveWindow != 20<<20 {
+		t.Fatalf("default windows changed: %+v", d)
+	}
+	if h := (QUICReceiveWindowTuning{MaxStreamBytes: 1 << 20}).config(); h.InitialStreamReceiveWindow != 1<<20 || h.MaxStreamReceiveWindow != 1<<20 {
+		t.Fatalf("initial did not inherit the max: %+v", h)
 	}
 	tlsConfig, err := SelfSignedTLSConfig("localhost")
 	if err != nil {
