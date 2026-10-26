@@ -222,6 +222,98 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # weaknet: the weak-link benchmark suite, in its own job so its run time does
+  # not add to the main matrix.
+  #
+  # The link is simulated in userspace (see weaknet_bench_test.go for why): a
+  # kernel qdisc cannot inject loss into a TCP leg at all, because the kernel
+  # retransmitter hides it from a byte stream. Userspace injection reaches the
+  # QUIC legs at datagram granularity and stays honest about the TCP legs, where
+  # the visible effect is added latency rather than drops. The kernel's own view
+  # lives in the weaknet-kernel job.
+  #
+  # This is a gate, not a diagnostic: every assertion is byte integrity or a
+  # relative comparison, and the only skip paths are "this transport cannot
+  # establish through this link". What it reports is the data; what it fails on
+  # is corruption.
+  #
+  # Only two weak-net tests run without the opt-in env var: TestWeakNetDelayIsObserved
+  # is the always-on proof that the simulator injects at all, and everything else
+  # is gated on H2TUNNEL_WEAKNET_BENCH so `-bench .` in the jobs above never
+  # picks the profiles up -- lossy QUIC under qemu-user takes minutes per
+  # subtest.
+  weaknet:
+    name: Weak network (userspace link)
+    runs-on: ubuntu-latest
+    env:
+      GODEBUG: http2xconnect=1
+      H2TUNNEL_WEAKNET_BENCH: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Prove the simulator injects and that the rate cap bites
+        # The delay test is the harness self-check: without it a silently no-op
+        # simulator would let every number below look green. The rate-cap test
+        # asserts the cap produces under half the uncapped rate, which is the
+        # only way to tell "the cap works" from "the cap is ignored".
+        shell: bash
+        run: go test -run '^TestWeakNet' -count=1 -timeout 15m -v .
+
+      - name: Throughput matrix over the simulated links
+        shell: bash
+        run: go test -run '^$' -bench '^BenchmarkWeakNet' -count=1 -timeout 25m .
+
+  # weaknet-kernel: the kernel's view of a degraded link, via a netem qdisc on
+  # loopback. Complements the userspace job -- here the kernel retransmitter
+  # absorbs the loss, so the measured cost is retransmission overhead rather
+  # than datagram drops. Reference numbers only, and gated on a capability the
+  # runner may refuse, so it never blocks a merge.
+  weaknet-kernel:
+    name: Weak network (kernel netem)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      GODEBUG: http2xconnect=1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Queue netem delay and loss on loopback
+        id: netem
+        shell: bash
+        run: |
+          set -uo pipefail
+          if sudo tc qdisc add dev lo root netem delay 20ms loss 2%; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            sudo tc -s qdisc show dev lo
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::netem is unavailable on this runner; skipping the kernel view"
+          fi
+
+      - name: Throughput over the netem'd loopback
+        if: steps.netem.outputs.enabled == 'true'
+        shell: bash
+        run: go test -run '^$' -bench '^BenchmarkProtocolThroughput$' -benchtime 3s -timeout 20m .
+
+      - name: Tear down the qdisc
+        if: always()
+        shell: bash
+        run: sudo tc qdisc del dev lo root 2>/dev/null || true
+
   profile:
     name: Profile (flamegraph)
     runs-on: ubuntu-latest
