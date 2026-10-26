@@ -21,7 +21,7 @@ func TestH2Tunnel_Network_DualStack_All(t *testing.T) {
 	defer os.Remove(keyFile)
 
 	targetAddr := "127.0.0.1:23000"
-	startEchoServer(targetAddr)
+	startEchoServer(t, targetAddr)
 
 	serverAddr := "127.0.0.1:23443"
 	serverURL := "https://" + serverAddr
@@ -111,7 +111,7 @@ func TestH2Tunnel_Network_StrictGating_UDP_Only(t *testing.T) {
 	defer os.Remove(keyFile)
 
 	targetAddr := "127.0.0.1:24000"
-	startEchoServer(targetAddr)
+	startEchoServer(t, targetAddr)
 
 	serverAddr := "127.0.0.1:24443"
 	serverURL := "https://" + serverAddr
@@ -206,7 +206,7 @@ func TestH2Tunnel_Transport_StrictGating_H2_Only(t *testing.T) {
 	defer os.Remove(keyFile)
 
 	targetAddr := "127.0.0.1:25000"
-	startEchoServer(targetAddr)
+	startEchoServer(t, targetAddr)
 
 	serverAddr := "127.0.0.1:25443"
 	serverURL := "https://" + serverAddr
@@ -333,7 +333,7 @@ func TestH2Tunnel_LocalOnly_SecurityPolicy(t *testing.T) {
 	defer os.Remove(keyFile)
 
 	targetAddr := "127.0.0.1:26000"
-	startEchoServer(targetAddr)
+	startEchoServer(t, targetAddr)
 
 	serverAddr := "127.0.0.1:26443"
 	serverURL := "https://" + serverAddr

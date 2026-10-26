@@ -15,6 +15,9 @@ This file records notable changes for library users. Dates are release dates (UT
 ### Operational
 - **The server now warns at startup when no token is set.** An empty token is a documented default — the bare config must stay usable for local development — so it stays a valid configuration and not a validation error. But it is the difference between an authenticated tunnel and an open one: every request authenticates as one shared `"anonymous"` principal, so all clients share a session bucket, a per-principal cap and a Brutal connection group. The warning says that at startup rather than letting it look deliberate later.
 
+### Test infrastructure
+- **The shared echo server no longer swallows a bind failure.** `startEchoServer` bound TCP and UDP inside two fire-and-forget goroutines that returned on error, so on a host where another process owned the port the echo server silently never existed — and the tunnel dialed that address anyway, because the address was simply occupied. Every test then measured traffic against a foreign process and reported success. `TestConnManagerTransportResumeMatrix` hit exactly this: it hardcoded `127.0.0.1:29100`, which one developer host had handed to an unrelated download client, so all five TCP cases timed out at a deterministic 6.2s while the two UDP cases passed — TCP and UDP are separate namespaces, so only the TCP bind failed. The binds now run in the calling goroutine and fail the test, and the matrix reserves its echo port with a `:0` bind. The remaining hardcoded ranges are still latent in the same way (`e2e_test` at `20000`/`21000`/`22000`, `features_test` at `23000`–`26000`, `backup_test` at `27000`, the matrix's own client listeners at `29101`–`29107`, and the matrix server at `29543`) — the matrix server at least panics loudly on a bind failure, but the client listeners do not.
+
 ## 2026-09-21
 
 ### Documentation

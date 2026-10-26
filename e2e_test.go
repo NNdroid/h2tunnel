@@ -139,16 +139,31 @@ func waitUDPBound(t *testing.T, clientAddr string, timeout time.Duration) {
 	t.Fatalf("udp client %s not bound within %v", clientAddr, timeout)
 }
 
-func startEchoServer(addr string) { // TCP Echo
+// startEchoServer starts TCP and UDP echo servers on one address.
+//
+// The binds run in the calling goroutine so a collision fails the test instead of
+// being swallowed. Both listeners used to bind inside fire-and-forget goroutines
+// that returned on error, so on any host where another process owned the port the
+// echo server silently never existed — and the tunnel dialed it anyway, because the
+// address was simply occupied. Every test then measured traffic against that foreign
+// process and reported success. The bind errors below are the only place that fact
+// can be surfaced; t.Fatal must be called here, not from those goroutines.
+func startEchoServer(t *testing.T, addr string) {
+	t.Helper()
+	tcpLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("echo server: bind tcp %s: %v — another process owns the port, so no echo server exists and tunnel traffic would reach it", addr, err)
+	}
+	udpLn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Fatalf("echo server: bind udp %s: %v — another process owns the port, so no echo server exists and tunnel traffic would reach it", addr, err)
+	}
+
 	go func() {
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			return
-		}
 		for {
-			conn, err := l.Accept()
+			conn, err := tcpLn.Accept()
 			if err != nil {
-				continue
+				return
 			}
 			go func(c net.Conn) { defer c.Close(); io.Copy(c, c) }(conn)
 		}
@@ -156,19 +171,14 @@ func startEchoServer(addr string) { // TCP Echo
 
 	// UDP Echo (buffer enlarged to 64KB to prevent large-packet truncation deadlock)
 	go func() {
-		uAddr, _ := net.ResolveUDPAddr("udp", addr)
-		conn, err := net.ListenUDP("udp", uAddr)
-		if err != nil {
-			return
-		}
-
-		// 🚨 The 65536 here is critical! It must be larger than the load-test payloadSize (16384)
+		// The 65536 here is critical! It must be larger than the load-test payloadSize (16384)
 		buf := make([]byte, 65536)
 		for {
-			n, cAddr, err := conn.ReadFromUDP(buf)
-			if err == nil {
-				conn.WriteToUDP(buf[:n], cAddr)
+			n, cAddr, err := udpLn.ReadFrom(buf)
+			if err != nil {
+				return
 			}
+			_, _ = udpLn.WriteTo(buf[:n], cAddr)
 		}
 	}()
 }
@@ -185,7 +195,7 @@ func TestH2TunnelAllModes(t *testing.T) {
 	defer os.Remove(keyFile)
 
 	targetAddr := "127.0.0.1:20000"
-	startEchoServer(targetAddr)
+	startEchoServer(t, targetAddr)
 
 	serverAddr := "127.0.0.1:18443"
 	serverURL := "https://" + serverAddr
@@ -430,7 +440,7 @@ func TestH2Tunnel_StrictDemux(t *testing.T) {
 	defer os.Remove(keyFile)
 
 	targetAddr := "127.0.0.1:22000"
-	startEchoServer(targetAddr)
+	startEchoServer(t, targetAddr)
 
 	serverAddr := "127.0.0.1:22443"
 	serverURL := "https://" + serverAddr

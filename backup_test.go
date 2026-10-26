@@ -36,7 +36,7 @@ func startBackupTestEnv(t *testing.T, seq int) string {
 	// background goroutines of each test never exit and hold their ports for a long time.
 	echoPort := 27000 + seq*2
 	serverPort := 27443 + seq*2
-	startEchoServer(fmt.Sprintf("127.0.0.1:%d", echoPort))
+	startEchoServer(t, fmt.Sprintf("127.0.0.1:%d", echoPort))
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
 	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,

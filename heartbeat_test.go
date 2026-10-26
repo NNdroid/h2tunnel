@@ -33,7 +33,7 @@ func TestHeartbeatIdleTunnelE2E(t *testing.T) {
 	defer os.Remove(keyFile)
 
 	targetAddr := "127.0.0.1:20900"
-	startEchoServer(targetAddr)
+	startEchoServer(t, targetAddr)
 
 	serverAddr := "127.0.0.1:20901"
 	testToken := "hb-e2e-token"

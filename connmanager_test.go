@@ -49,7 +49,7 @@ func connManagerHTTPServer(t *testing.T, seq int, token string) (serverURL, echo
 
 	echoPort := connMgrPortBase + seq*2
 	serverPort := connMgrPortBase + 443 + seq*2
-	startEchoServer(fmt.Sprintf("127.0.0.1:%d", echoPort))
+	startEchoServer(t, fmt.Sprintf("127.0.0.1:%d", echoPort))
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", serverPort)
 	go startServerDirect(serverConfig{
 		ListenAddr:    serverAddr,
@@ -100,8 +100,20 @@ func TestConnManagerTransportResumeMatrix(t *testing.T) {
 	defer os.Remove(certFile)
 	defer os.Remove(keyFile)
 
-	targetAddr := "127.0.0.1:29100"
-	startEchoServer(targetAddr)
+	// The echo target is not a fixed port. This test used to hardcode 29100, which
+	// was already held by an unrelated process on one developer host; startEchoServer
+	// binds TCP and UDP as separate namespaces, so the TCP bind failed while the UDP
+	// one succeeded, and every TCP case in the matrix silently measured traffic
+	// against that foreign process for a full 6s before timing out. TCP/UDP/QUIC
+	// ephemeral ranges are reserved by the kernel, so a 0 bind cannot collide with
+	// them.
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("matrix: reserve echo port: %v", err)
+	}
+	targetAddr := echoLn.Addr().String()
+	_ = echoLn.Close()
+	startEchoServer(t, targetAddr)
 	serverAddr := "127.0.0.1:29543"
 	serverURL := "https://" + serverAddr
 	token := "matrix-token"
