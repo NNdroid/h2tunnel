@@ -32,19 +32,31 @@ package h2tunnel_test
 //     run `-bench .` -- never pick them up: lossy QUIC under qemu-user takes
 //     minutes per subtest.
 //
-//   - On the datagram legs the absolute number is bounded by the OS, not the
-//     link. The pipe's own channels are sized well past the bandwidth-delay
-//     product, but the proxy's sockets are not: the client->server write blocks
-//     once the server's UDP receive buffer is full, and restoreOrder blocks once
-//     the 512-packet out queue is. So a clean 40ms QUIC leg reports whatever the
-//     runner's socket buffers allow -- tens of MB/s on an idle machine, a couple
-//     on a loaded one -- while the TCP legs sit at a stable ~100 MB/s because a
-//     byte-stream proxy is drained by the kernel as a stream. Read the datagram
-//     rows as relative to each other and against their own cap and loss rows,
-//     not as a machine-wide constant, and never as a comparison with the TCP
-//     rows. Raising SO_RCVBUF would move the ceiling, but only via platform
-//     socket-option code, which is disproportionate for a benchmark that reports
-//     rather than asserts.
+//   - The datagram rows are not comparable with the TCP rows, and never were.
+//     A byte-stream proxy is drained by the kernel as a stream, so the TCP legs
+//     sit at a stable ~100 MB/s no matter how deep the pipelining. A datagram
+//     proxy is not: each direction has its own bounded socket pair, and a
+//     QUIC connection only pushes as far as its congestion window and its
+//     peer's advertised flow credit, which on a fresh connection ramps up over
+//     the first round trips. So a clean 40ms QUIC leg measures QUIC startup and
+//     the runner's noise as much as the simulated link. Read the datagram rows
+//     against each other and against their own cap and loss rows, not as a
+//     machine-wide constant and never against the TCP rows.
+//
+//   - The proxy's own sockets are no longer the limit, and the residual
+//     variance is not their fault. listenUDP requests weakNetUdpSocketBuffer
+//     for them; before that the client->server write blocked the moment the
+//     server's 64 KiB receive buffer filled, which was the binding constraint
+//     once the leg outran the default. Measured after the raise, on the same
+//     box and the same three rounds: the h3 floor went from 1.5 to 29 MB/s and
+//     its mean from 47 to 76, the wt floor went from 1.5 to 105 but its mean
+//     only from 74 to 84, and one round per leg still landed at about 1.5 MB/s.
+//     A 1.5 MB/s round reports `sent` near 10 MiB against 256 MiB in a good
+//     round, so the writer was back-pressured almost to a standstill -- that is
+//     a stall on this shared machine, not a buffer that is too small. So this
+//     harness can only tell you which direction moved; it cannot pin a single
+//     run to a cause. The QUIC stacks' own sockets are set by quic-go, and
+//     those are not the harness's to tune.
 //
 // TestWeakNetDelayIsObserved is deliberately NOT gated: it is the proof that
 // the simulator injects delay at all, and a silently no-op simulator would
@@ -91,6 +103,22 @@ const weakNetRoundCushion = 30 * time.Second
 // the measured stretch. The writer stops on its own once the stretch ends, so
 // this only ever bites when the transport cannot absorb what it is given.
 const weakNetDrainTail = 10 * time.Second
+
+// weakNetUdpSocketBuffer is the receive and send buffer requested for each of
+// the proxy's datagram sockets. The pipe's own channels are already sized past
+// the bandwidth-delay product, but the sockets are not: a WriteTo into a full
+// receive buffer blocks the writer, and that was the binding limit on the
+// datagram legs, not the simulated link. The bandwidth-delay product for a
+// clean 40ms leg at about 115MB/s is under 5MiB in total, so 8MiB per direction
+// leaves the transport to set the ceiling. The kernel may grant less than
+// requested -- Linux clamps to rmem_max/wmem_max and silently halves the
+// effective figure, and a raised limit is a privilege -- so this is a best-
+// effort request that can only move the ceiling up, never pin it. RawConn's
+// Control callback has no return value and RawControl reports no error, so the
+// grant is unobservable from inside the request; a host that ignores it just
+// keeps its old ceiling, which is why the rows are read as direction, not as a
+// fixed number.
+const weakNetUdpSocketBuffer = 8 << 20
 
 // weakNetWarmupRounds caps how many echo rounds a benchmark spends settling a
 // connection before the clock starts. A QUIC or WebTransport connection does its
@@ -653,6 +681,7 @@ func listenUDP(t testing.TB, addr string) net.PacketConn {
 	if err != nil {
 		t.Fatalf("weaknet: udp listen %s: %v", addr, err)
 	}
+	setWeakNetUdpBuffers(pc)
 	return pc
 }
 
