@@ -273,11 +273,22 @@ jobs:
   # weaknet-kernel: the kernel's view of a degraded link, via a netem qdisc on
   # loopback. Complements the userspace job -- here the kernel retransmitter
   # absorbs the loss, so the measured cost is retransmission overhead rather
-  # than datagram drops. Reference numbers only, and gated on a capability the
-  # runner may refuse, so it never blocks a merge.
+  # than datagram drops. Reference numbers only.
+  #
+  # Manual-only, and that is deliberate. In every run that has included this
+  # job -- all five -- the throughput step has been killed by the job-level
+  # wall-clock limit without its own -20m test timeout ever firing, which
+  # points at the host rather than at a slow benchmark: the runner counts wall
+  # time without running. It has produced no number at all, and because a job
+  # killed by timeout-minutes is *cancelled* rather than *failed*,
+  # continue-on-error does not rescue it, so it turned every one of those runs
+  # cancelled. A skipped job does not affect the run conclusion, so keeping the
+  # view reachable from the Actions page while taking it off push is what lets
+  # the push runs stay green.
   weaknet-kernel:
     name: Weak network (kernel netem)
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
     continue-on-error: true
     # Backstop against a wedged runner, not against a slow benchmark. The
     # benchmark step already caps the test binary at -timeout 20m, so a healthy
