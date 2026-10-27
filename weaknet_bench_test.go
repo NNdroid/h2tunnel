@@ -45,12 +45,13 @@ package h2tunnel_test
 //
 //   - The proxy's own sockets are no longer the limit, and the residual
 //     variance is not their fault. listenUDP requests weakNetUdpSocketBuffer
-//     for them; before that the client->server write blocked the moment the
-//     server's 64 KiB receive buffer filled, which was the binding constraint
-//     once the leg outran the default. Measured after the raise, on the same
-//     box and the same three rounds: the h3 floor went from 1.5 to 29 MB/s and
-//     its mean from 47 to 76, the wt floor went from 1.5 to 105 but its mean
-//     only from 74 to 84, and one round per leg still landed at about 1.5 MB/s.
+//     for them while the profiles are opted in; before that the client->server
+//     write blocked the moment the server's 64 KiB receive buffer filled, which
+//     was the binding constraint once the leg outran the default. Measured before
+//     and after on the same box, same three rounds: the h3 floor went from 1.5
+//     to 29 MB/s and its mean from 47 to 76, the wt floor went from 1.5 to 105
+//     but its mean only from 74 to 84, and one round per leg still landed at
+//     about 1.5 MB/s.
 //     A 1.5 MB/s round reports `sent` near 10 MiB against 256 MiB in a good
 //     round, so the writer was back-pressured almost to a standstill -- that is
 //     a stall on this shared machine, not a buffer that is too small. So this
@@ -681,7 +682,13 @@ func listenUDP(t testing.TB, addr string) net.PacketConn {
 	if err != nil {
 		t.Fatalf("weaknet: udp listen %s: %v", addr, err)
 	}
-	setWeakNetUdpBuffers(pc)
+	// Only with the profiles opted in. TestWeakNetDelayIsObserved calls this from
+	// the ungated test job, and the raise is a throughput-ceiling knob for the
+	// benchmark, not part of the correctness self-check's environment: the
+	// always-on job should keep the OS's own socket sizes.
+	if os.Getenv(weakNetBenchEnv) != "" {
+		setWeakNetUdpBuffers(pc)
+	}
 	return pc
 }
 

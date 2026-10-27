@@ -279,6 +279,13 @@ jobs:
     name: Weak network (kernel netem)
     runs-on: ubuntu-latest
     continue-on-error: true
+    # Backstop against a wedged runner, not against a slow benchmark. The
+    # benchmark step already caps the test binary at -timeout 20m, so a healthy
+    # run needs well under 30 minutes end to end. Without this the job has sat
+    # at the 6-hour GitHub default on every push: the last four runs were all
+    # killed at exactly 360 minutes, which no -timeout inside the step would
+    # have prevented, because a frozen runner counts wall time without running.
+    timeout-minutes: 30
     env:
       GODEBUG: http2xconnect=1
     steps:
