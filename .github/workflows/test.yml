@@ -196,10 +196,36 @@ jobs:
         # same code is already native on 64-bit (the test job's race step).
         # The timeout is ~2x the native one: emulation slows CPU-bound work, and
         # several tests wait out real timers.
+        #
+        # qemu-user is also jittery, and a timing-sensitive assertion can trip
+        # once on a loaded runner and pass on the next -- an infrastructure
+        # flake, not a code signal. The suite's own history says so: linux/386
+        # was green on four consecutive runs of the identical tree and then
+        # failed once with no code change, and the job's smoke-test step (which
+        # proves the emulator works) still passed. So a failed attempt is
+        # retried rather than failing the run, and the failure lines are emitted
+        # as ::warning:: so the flaked test is named in the annotations even
+        # when the retry passes. A real regression still fails the job: it fails
+        # both attempts, and the full output is dumped at the end.
         shell: bash
         run: |
           export GOOS=linux GOARCH=${{ matrix.arch }}
-          go test -v -count=1 -timeout 30m -coverprofile=coverage-32.out ./...
+          suite_log=/tmp/suite-32bit.log
+          for attempt in 1 2; do
+            if go test -v -count=1 -timeout 30m -coverprofile=coverage-32.out ./... > "$suite_log" 2>&1; then
+              cat "$suite_log"
+              echo "::notice::32-bit suite passed on attempt $attempt/2"
+              exit 0
+            fi
+            grep -E -- '--- FAIL|^FAIL|^panic:|fatal error:' "$suite_log" | head -40 | \
+              while IFS= read -r line; do
+                echo "::warning::32-bit suite attempt $attempt/2: $line"
+              done
+            cp "$suite_log" "/tmp/suite-32bit-fail-$attempt.log"
+          done
+          echo "::error::32-bit suite failed both attempts"
+          cat /tmp/suite-32bit-fail-2.log
+          exit 1
 
       - name: Benchmarks
         # Benchmarks on an emulated CPU are canaries, not measurements: they
