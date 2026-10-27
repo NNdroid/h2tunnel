@@ -275,22 +275,27 @@ jobs:
   # absorbs the loss, so the measured cost is retransmission overhead rather
   # than datagram drops. Reference numbers only.
   #
-  # Reference numbers only, so it never blocks a merge. That is why it stays on
-  # push despite having never once produced a number: in every one of its five
-  # runs the benchmark step was killed at the job-level wall clock without its
-  # own -20m test timeout ever firing, so the process never ran far enough to be
-  # timed out. It has been burning six hours of runner time per push with
-  # nothing to show for it, and because a job killed by timeout-minutes is
-  # *cancelled* rather than *failed*, continue-on-error cannot rescue it --
-  # which is why the last few pushes read "cancelled" with every real job green.
+  # Reference numbers only, so it never blocks a merge. It has never once
+  # produced a number. Its first five runs were killed at the job-level wall
+  # clock, which read as "the runner starved the benchmark" -- the probe below
+  # was written to test that. Run 71 tested it and disproved it: the probe
+  # returned in under a second, so the host and its control channel were
+  # healthy, and the benchmark still could not finish in 25 minutes. The cause
+  # is in the benchmark, not the runner: the matrix has 16 legs, each allowed a
+  # 1-minute dial and a 10-minute stream read, and the datagram leg sets no
+  # deadline at all, so one echo dropped by the qdisc parks that read forever.
+  # H2TUNNEL_WEAKNET_BENCH below turns those into 15s/10s bounds, so a genuinely
+  # stuck leg fails in seconds instead of hanging to the job timeout.
   #
-  # The probe below is what changes that. If the qdisc on loopback starves the
-  # runner's own control channel the probe cannot complete and the job fails in
-  # seconds; a *failed* job is covered by continue-on-error, so the run stays
-  # green and the log says why. If the probe passes but the benchmark still
-  # crawls, the hard `timeout` fails the step the same way. Only a runner that
-  # freezes outright still cancels the run, and nothing in this repository can
-  # do anything about that.
+  # Why continue-on-error rather than just deleting the job: a job killed by
+  # timeout-minutes is *cancelled* rather than *failed*, and continue-on-error
+  # cannot rescue a cancellation -- which is why the pushes before the probe
+  # read "cancelled" with every real job green and the loss burned six hours of
+  # runner time per push. The probe and the hard `timeout` turn that into a
+  # *failed* step in a bounded time, which continue-on-error does cover, so the
+  # run stays green and the log says why. Only a runner that freezes outright
+  # still cancels the run, and nothing in this repository can do anything about
+  # that.
   weaknet-kernel:
     name: Weak network (kernel netem)
     runs-on: ubuntu-latest
@@ -304,6 +309,11 @@ jobs:
     timeout-minutes: 30
     env:
       GODEBUG: http2xconnect=1
+      # Bounded per-leg timeouts, engaged only by this job (see the bounds at
+      # the top of benchmarkProtocolThroughput). Without it the matrix's
+      # unbounded waits -- 1m dial, 10m stream read, and no deadline on the
+      # datagram read at all -- can never terminate under a lossy qdisc.
+      H2TUNNEL_WEAKNET_BENCH: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4

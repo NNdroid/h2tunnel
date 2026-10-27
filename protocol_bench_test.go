@@ -16,8 +16,10 @@ package h2tunnel_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -52,6 +54,25 @@ func BenchmarkProtocolThroughputPadding600To1200(b *testing.B) {
 }
 
 func benchmarkProtocolThroughput(b *testing.B, padding h2tunnel.PaddingTuning) {
+	// The matrix has 16 legs, and on a healthy host every leg establishes and
+	// finishes in a couple of seconds, so generous bounds are fine for the
+	// always-on jobs (which never set the weak-net env). Under the weak-network
+	// profiles the same generous bounds are what made the kernel-netem job
+	// unable to terminate: a single stuck leg could burn a minute of dial
+	// budget, hold its stream open for a 10-minute read deadline, or (on the
+	// datagram leg, which has no deadline at all) block forever on one echo
+	// datagram that the 2% netem loss dropped. The short bounds below only cap
+	// how long a genuinely stuck leg can stall before the suite fails visibly
+	// instead of hanging to the job timeout; they never change what a healthy
+	// host measures.
+	dialTimeout, connDeadline := time.Minute, 10*time.Minute
+	readWait := time.Minute // unused unless lossy
+	lossy := os.Getenv(weakNetBenchEnv) != ""
+	if lossy {
+		dialTimeout, connDeadline = 15*time.Second, 10*time.Second
+		readWait = time.Second
+	}
+
 	env := newProtocolEnvWithPadding(b, padding)
 	cases := []struct {
 		name      string
@@ -85,7 +106,7 @@ func benchmarkProtocolThroughput(b *testing.B, padding h2tunnel.PaddingTuning) {
 		c := c
 		b.Run(c.name, func(b *testing.B) {
 			client := newProtocolClientWithPaddingALPN(b, env, c.transport, padding, c.alpn)
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 			defer cancel()
 
 			if !c.udp {
@@ -100,7 +121,7 @@ func benchmarkProtocolThroughput(b *testing.B, padding h2tunnel.PaddingTuning) {
 					b.Fatal(err)
 				}
 				defer conn.Close()
-				_ = conn.SetDeadline(time.Now().Add(10 * time.Minute))
+				_ = conn.SetDeadline(time.Now().Add(connDeadline))
 
 				payload := make([]byte, benchTCPChunk)
 				for i := range payload {
@@ -135,8 +156,48 @@ func benchmarkProtocolThroughput(b *testing.B, padding h2tunnel.PaddingTuning) {
 				payload[i] = byte(i)
 			}
 			got := make([]byte, len(payload))
-			b.SetBytes(int64(len(payload)))
 			b.ReportAllocs()
+
+			if lossy {
+				// The datagram path has no app-level retransmission, so one echo
+				// dropped by the qdisc is gone for good -- with no deadline the
+				// read parks it until the job is killed, which is exactly what
+				// run 71 showed: a healthy host, probe under a second, and the
+				// benchmark still unable to finish in 25 minutes. Drops are the
+				// impairment here, not a regression, so measure what actually
+				// completes against a wall-clock budget and let the harness derive
+				// the rate, the same fixed-stretch pattern the weak-network suite
+				// uses. Per-read waits are short because a lost datagram is known
+				// to be lost; the budget is not, since a fully wedged leg has to
+				// be able to report 0 instead of running forever.
+				b.ResetTimer()
+				budget := time.Now().Add(3 * time.Second)
+				var completed int64
+				for time.Now().Before(budget) {
+					if _, err := packetConn.Write(payload); err != nil {
+						b.Fatal(err)
+					}
+					_ = packetConn.SetReadDeadline(time.Now().Add(readWait))
+					n, err := packetConn.Read(got)
+					if err != nil {
+						var netErr net.Error
+						if errors.As(err, &netErr) && netErr.Timeout() {
+							continue
+						}
+						b.Fatalf("read echo: err=%v", err)
+					}
+					if n != len(payload) {
+						b.Fatalf("read echo: n=%d want %d", n, len(payload))
+					}
+					completed++
+				}
+				b.StopTimer()
+				b.N = 1
+				b.SetBytes(completed * int64(len(payload)))
+				return
+			}
+
+			b.SetBytes(int64(len(payload)))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				if _, err := packetConn.Write(payload); err != nil {
