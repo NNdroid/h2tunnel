@@ -275,20 +275,25 @@ jobs:
   # absorbs the loss, so the measured cost is retransmission overhead rather
   # than datagram drops. Reference numbers only.
   #
-  # Manual-only, and that is deliberate. In every run that has included this
-  # job -- all five -- the throughput step has been killed by the job-level
-  # wall-clock limit without its own -20m test timeout ever firing, which
-  # points at the host rather than at a slow benchmark: the runner counts wall
-  # time without running. It has produced no number at all, and because a job
-  # killed by timeout-minutes is *cancelled* rather than *failed*,
-  # continue-on-error does not rescue it, so it turned every one of those runs
-  # cancelled. A skipped job does not affect the run conclusion, so keeping the
-  # view reachable from the Actions page while taking it off push is what lets
-  # the push runs stay green.
+  # Reference numbers only, so it never blocks a merge. That is why it stays on
+  # push despite having never once produced a number: in every one of its five
+  # runs the benchmark step was killed at the job-level wall clock without its
+  # own -20m test timeout ever firing, so the process never ran far enough to be
+  # timed out. It has been burning six hours of runner time per push with
+  # nothing to show for it, and because a job killed by timeout-minutes is
+  # *cancelled* rather than *failed*, continue-on-error cannot rescue it --
+  # which is why the last few pushes read "cancelled" with every real job green.
+  #
+  # The probe below is what changes that. If the qdisc on loopback starves the
+  # runner's own control channel the probe cannot complete and the job fails in
+  # seconds; a *failed* job is covered by continue-on-error, so the run stays
+  # green and the log says why. If the probe passes but the benchmark still
+  # crawls, the hard `timeout` fails the step the same way. Only a runner that
+  # freezes outright still cancels the run, and nothing in this repository can
+  # do anything about that.
   weaknet-kernel:
     name: Weak network (kernel netem)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     continue-on-error: true
     # Backstop against a wedged runner, not against a slow benchmark. The
     # benchmark step already caps the test binary at -timeout 20m, so a healthy
@@ -322,10 +327,43 @@ jobs:
             echo "::warning::netem is unavailable on this runner; skipping the kernel view"
           fi
 
-      - name: Throughput over the netem'd loopback
+      - name: Probe the control channel under netem
+        # Distinguishes the two ways this job has died, which no wall-clock
+        # limit can. In every one of its runs the benchmark step was killed at
+        # the job timeout without its own -20m firing, so the process never ran
+        # far enough to be timed out. Most likely the qdisc on loopback starves
+        # the runner's own control channel; if so the probe is impossible and the
+        # benchmark would never terminate, so netem on loopback is simply the
+        # wrong measurement target here and the view is skipped. If the probe
+        # passes and the benchmark still hangs, the host froze for another
+        # reason and the hard `timeout` below reports it.
         if: steps.netem.outputs.enabled == 'true'
+        id: reach
         shell: bash
-        run: go test -run '^$' -bench '^BenchmarkProtocolThroughput$' -benchtime 3s -timeout 20m .
+        run: |
+          echo "::group::control-channel reachability under netem"
+          if curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null \
+              https://api.github.com/ >/dev/null 2>&1; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "reachable: running the benchmark over the netem'd loopback"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "unreachable within 10s: netem on loopback is starving the host"
+            echo "control channel, so a benchmark here could never terminate"
+            echo "::warning::netem starved the control channel; skipping the kernel view"
+          fi
+          echo "::endgroup::"
+
+      - name: Throughput over the netem'd loopback
+        if: steps.reach.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          # The outer `timeout` exists because -timeout 20m only fires while the
+          # test process can still run, and this step has never been allowed to.
+          # A hard kill fails the step with a readable message instead of the
+          # job being cancelled with none.
+          timeout 25m go test -run '^$' -bench '^BenchmarkProtocolThroughput$' \
+            -benchtime 3s -timeout 20m .
 
       - name: Tear down the qdisc
         if: always()
