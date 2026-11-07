@@ -221,6 +221,7 @@ Self-heal tuning (`ClientTuning`):
 - `AutoRedial: true` — continues after redial exhaustion (16 attempts) during transient outages; when off, exhaustion terminates the tunnel and dispatches a `TunnelDied` event. Authentication / policy rejection (401/403/407) and incompatible protocol versions (426) stop immediately in both modes. Change credentials/policy/version and dial again. Retries use jitter; a stream that ran successfully for 30 seconds resets the backoff cadence.
 - `RedialBudget` — per-attempt dial budget for stream setup + handshake, tightening the abandon pace during outages; the timer stops once the tunnel is ready and never affects established streams.
 - `SessionWindowBytes` — when outage duration × downlink rate exceeds the window, the gap is unrecoverable; raise it for long outages / high throughput.
+- `H2StreamReceiveWindowBytes` — raises the client's HTTP/2 per-stream download window above the fixed 4 MiB x/net default (≈40 MB/s at 100 ms RTT). High-BDP CDN paths only; see PERFORMANCE.md.
 
 ### 4. Make `http.Client` reach services uniformly through the tunnel
 
