@@ -127,6 +127,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if err := options.Tuning.QUICReceiveWindow.Validate(); err != nil {
 		return nil, err
 	}
+	if options.Tuning.H2StreamReceiveWindowBytes < 0 {
+		return nil, fmt.Errorf("h2tunnel: H2StreamReceiveWindowBytes must be non-negative")
+	}
 	windowKB, err := windowBytesToKB(options.Tuning.SessionWindowBytes)
 	if err != nil {
 		return nil, err
@@ -162,27 +165,28 @@ func NewClient(options ClientOptions) (*Client, error) {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	cfg := clientConfig{
-		QUICReceiveWindow: options.Tuning.QUICReceiveWindow,
-		ServerUrl:         strings.TrimRight(endpoint, "/"),
-		Path:              normalizeTunnelPath(options.Path),
-		CustomHost:        strings.TrimSpace(options.Host),
-		Transport:         transport,
-		Network:           networkAll,
-		HeartbeatInterval: heartbeat,
-		SessionWindow:     windowKB,
-		HandshakeAckMs:    handshakeMs,
-		KeepaliveSec:      keepaliveSec,
-		Credentials:       options.Credentials,
-		TLSConfig:         tlsConfig,
-		LogicalTargets:    true,
-		Dialer:            options.Dialer,
-		QUICDialer:        options.QUICDialer,
-		DatagramQueueSize: options.Tuning.DatagramQueueSize,
-		AutoRedial:        options.Tuning.AutoRedial,
-		RedialBudget:      options.Tuning.RedialBudget,
-		Padding:           padding,
-		MasqueALPN:        alpn,
-		Brutal:            brutal,
+		QUICReceiveWindow:     options.Tuning.QUICReceiveWindow,
+		H2StreamReceiveWindow: resolveH2StreamReceiveWindow(options.Tuning.H2StreamReceiveWindowBytes),
+		ServerUrl:             strings.TrimRight(endpoint, "/"),
+		Path:                  normalizeTunnelPath(options.Path),
+		CustomHost:            strings.TrimSpace(options.Host),
+		Transport:             transport,
+		Network:               networkAll,
+		HeartbeatInterval:     heartbeat,
+		SessionWindow:         windowKB,
+		HandshakeAckMs:        handshakeMs,
+		KeepaliveSec:          keepaliveSec,
+		Credentials:           options.Credentials,
+		TLSConfig:             tlsConfig,
+		LogicalTargets:        true,
+		Dialer:                options.Dialer,
+		QUICDialer:            options.QUICDialer,
+		DatagramQueueSize:     options.Tuning.DatagramQueueSize,
+		AutoRedial:            options.Tuning.AutoRedial,
+		RedialBudget:          options.Tuning.RedialBudget,
+		Padding:               padding,
+		MasqueALPN:            alpn,
+		Brutal:                brutal,
 		// One random value per Client instance, sent as X-Client-Group so every
 		// lane of this client lands in the same Brutal connection group. It is
 		// stable across TCP-leg migration, which is why it replaces the remote IP.
@@ -437,6 +441,34 @@ func (c *Client) NegotiateBrutal(ctx context.Context) (BrutalTuning, error) {
 // custom-socket dialer converge); shared by the masque h2 leg and h2/grpc.
 func (c *Client) newHTTP2Transport() *http2.Transport {
 	t2 := &http2.Transport{ReadIdleTimeout: 15 * time.Second, PingTimeout: 10 * time.Second}
+	// The standalone http2.Transport hardcodes its per-stream receive window to
+	// x/net's 4MiB transportDefaultStreamFlow — on a 100ms-RTT CDN link that is
+	// a ≈40MB/s single-stream download ceiling, and x/net exposes no field for
+	// it. Binding the transport to a net/http Transport via ConfigureTransports
+	// routes t1.HTTP2.MaxReceiveBufferPerStream into the client's
+	// SETTINGS_INITIAL_WINDOW_SIZE (configFromTransport merges it when t1 is
+	// set). A 64KiB MAX_FRAME_SIZE (spec default 16KiB) additionally halves the
+	// DATA-frame count for every 32KiB pump chunk. Only an explicitly tuned
+	// window changes the wire behavior; 0 keeps the stock defaults.
+	if c.cfg.H2StreamReceiveWindow > 0 {
+		t1 := &http.Transport{
+			HTTP2: &http.HTTP2Config{
+				MaxReceiveBufferPerStream: c.cfg.H2StreamReceiveWindow,
+				MaxReadFrameSize:          64 << 10,
+			},
+		}
+		bound, err := http2.ConfigureTransports(t1)
+		if err == nil {
+			// ConfigureTransports installs a no-dial conn pool (it expects
+			// net/http to dial and hand conns over). We use the transport
+			// standalone, so restore the default dialing pool before the lazy
+			// init runs; the t1 binding that carries the window config stays.
+			bound.ConnPool = nil
+			t2 = bound
+		} else {
+			lgWarnf(c.cfg.lg(), "[Client] ⚠️ H2 stream window binding failed (%v); keeping the 4MiB default", err)
+		}
+	}
 	if strings.HasPrefix(c.reqURL, "https://") {
 		if c.tlsConfig != nil {
 			tlsConfig := c.tlsConfig.Clone()

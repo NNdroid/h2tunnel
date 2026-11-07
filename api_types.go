@@ -152,6 +152,15 @@ type ClientOptions struct {
 type ClientTuning struct {
 	// QUIC receive credit; zero preserves the current H3/WT/MASQUE defaults.
 	QUICReceiveWindow QUICReceiveWindowTuning
+	// H2StreamReceiveWindowBytes overrides the client's HTTP/2 stream-level
+	// receive window for downloads. 0 = the x/net default (4MiB, which the
+	// standalone http2.Transport does not expose as a field). The default caps
+	// single-stream download at ≈4MiB/RTT — ≈40MB/s at 100ms RTT — so high-BDP
+	// CDN paths should raise it. Values are clamped to [64KiB, 256MiB] (the
+	// same ceiling as the QUIC receive windows). Applies to h2/h2c/grpc and the
+	// MASQUE H2 carrier, on every rebuilt transport. The server's
+	// MaxUploadBufferPerStream must also cover the window for it to matter.
+	H2StreamReceiveWindowBytes int
 	// Session-recovery ring window size (bytes). 0 = default 256KB, capped at
 	// 64MB (larger errors). Outage-recovery note: outage duration × downlink rate
 	// > window ⇒ the gap is unrecoverable and the session terminates. Raise it for

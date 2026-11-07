@@ -438,17 +438,20 @@ type serverConfig struct {
 // programmatically (zero-value fields take defaults automatically).
 type clientConfig struct {
 	QUICReceiveWindow QUICReceiveWindowTuning `json:"-"`
-	ListenAddr        string                  `json:"listen"`
-	ServerUrl         string                  `json:"server"`
-	Path              string                  `json:"path"`
-	TargetAddr        string                  `json:"target"`
-	Insecure          bool                    `json:"insecure"`
-	CustomHost        string                  `json:"host"`
-	ServerName        string                  `json:"sni"`
-	Transport         string                  `json:"transport"`
-	Network           string                  `json:"network"` // "all", "tcp", "udp"
-	LogLevel          string                  `json:"log_level"`
-	Token             string                  `json:"token"`
+	// H2StreamReceiveWindow is the client's HTTP/2 stream receive window in
+	// bytes; 0 keeps the x/net 4MiB default (see resolveH2StreamReceiveWindow).
+	H2StreamReceiveWindow int    `json:"-"`
+	ListenAddr            string `json:"listen"`
+	ServerUrl             string `json:"server"`
+	Path                  string `json:"path"`
+	TargetAddr            string `json:"target"`
+	Insecure              bool   `json:"insecure"`
+	CustomHost            string `json:"host"`
+	ServerName            string `json:"sni"`
+	Transport             string `json:"transport"`
+	Network               string `json:"network"` // "all", "tcp", "udp"
+	LogLevel              string `json:"log_level"`
+	Token                 string `json:"token"`
 
 	// The two fields below are client-side keep-alive and drain parameters, same semantics as serverConfig
 	HeartbeatInterval time.Duration `json:"-"`
@@ -564,6 +567,32 @@ func resolveSessionWindow(kb int) int {
 		return sessionWindowDefaultKB
 	}
 	return kb
+}
+
+// H2 stream receive window bounds. 0 keeps the x/net
+// transportDefaultStreamFlow default (4MiB); any explicit value is clamped
+// into [64KiB, 256MiB] — the same ceiling as the QUIC receive windows. The
+// floor is the HTTP/2 spec's initial window so a typo cannot strangle every
+// stream.
+const (
+	h2StreamWindowDefault = 4 << 20
+	h2StreamWindowMin     = 64 << 10
+	h2StreamWindowMax     = 256 << 20
+)
+
+// resolveH2StreamReceiveWindow normalizes the client H2 stream receive window.
+// 0 = keep the x/net default; otherwise clamp.
+func resolveH2StreamReceiveWindow(bytes int) int {
+	if bytes == 0 {
+		return 0
+	}
+	if bytes < h2StreamWindowMin {
+		return h2StreamWindowMin
+	}
+	if bytes > h2StreamWindowMax {
+		return h2StreamWindowMax
+	}
+	return bytes
 }
 
 // Session-table caps: bounds memory / per-principal resource use under a flood

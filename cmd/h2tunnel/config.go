@@ -37,13 +37,17 @@ type config struct {
 	LocalOnly bool   `json:"local_only"`
 	LogLevel  string `json:"log_level"`
 
-	HeartbeatSec    int           `json:"heartbeat_sec"`
-	DrainTimeoutSec int           `json:"drain_timeout_sec"`
-	SessionWindowKB int           `json:"session_window_kb"`
-	HandshakeAckMS  int           `json:"handshake_ack_ms"`
-	KeepaliveSec    int           `json:"keepalive_sec"`
-	StandbyCount    int           `json:"standby_connections"`
-	Padding         paddingConfig `json:"padding"`
+	HeartbeatSec    int `json:"heartbeat_sec"`
+	DrainTimeoutSec int `json:"drain_timeout_sec"`
+	SessionWindowKB int `json:"session_window_kb"`
+	// H2StreamReceiveWindowKB overrides the client's HTTP/2 stream receive
+	// window (client mode only; 0 = x/net 4MiB default, clamped to
+	// [64KiB, 256MiB]). See h2tunnel.ClientTuning.H2StreamReceiveWindowBytes.
+	H2StreamReceiveWindowKB int           `json:"h2_stream_receive_window_kb"`
+	HandshakeAckMS          int           `json:"handshake_ack_ms"`
+	KeepaliveSec            int           `json:"keepalive_sec"`
+	StandbyCount            int           `json:"standby_connections"`
+	Padding                 paddingConfig `json:"padding"`
 	// MasqueALPN selects the MASQUE carrier: ""=auto (h3 first, pin h2 on
 	// failure), "h2", "h3".
 	MasqueALPN string `json:"masque_alpn"`
@@ -180,7 +184,7 @@ func (cfg *config) validate() error {
 	default:
 		return fmt.Errorf("unsupported log_level %q", cfg.LogLevel)
 	}
-	if cfg.DrainTimeoutSec < 0 || cfg.SessionWindowKB < 0 || cfg.HandshakeAckMS < 0 || cfg.KeepaliveSec < 0 || cfg.StandbyCount < 0 {
+	if cfg.DrainTimeoutSec < 0 || cfg.SessionWindowKB < 0 || cfg.H2StreamReceiveWindowKB < 0 || cfg.HandshakeAckMS < 0 || cfg.KeepaliveSec < 0 || cfg.StandbyCount < 0 {
 		return errors.New("duration, window, and standby fields must be non-negative")
 	}
 	if cfg.SessionMax < 0 || cfg.SessionMaxPerPrincipal < 0 {
@@ -208,7 +212,7 @@ func (cfg *config) validate() error {
 		if cfg.Network == "" {
 			cfg.Network = "tcp"
 		}
-		if cfg.Server != "" || cfg.Target != "" || cfg.Insecure || cfg.Host != "" || cfg.SNI != "" || cfg.UtlxFingerprint != "" || cfg.HeartbeatSec != 0 || cfg.HandshakeAckMS != 0 || cfg.KeepaliveSec != 0 || cfg.StandbyCount != 0 {
+		if cfg.Server != "" || cfg.Target != "" || cfg.Insecure || cfg.Host != "" || cfg.SNI != "" || cfg.UtlxFingerprint != "" || cfg.HeartbeatSec != 0 || cfg.H2StreamReceiveWindowKB != 0 || cfg.HandshakeAckMS != 0 || cfg.KeepaliveSec != 0 || cfg.StandbyCount != 0 {
 			return errors.New("server config contains client-only fields")
 		}
 	} else {
@@ -333,16 +337,17 @@ func applyEnvironment(cfg *config) error {
 		cfg.Brutal.Negotiate = &parsed
 	}
 	ints := map[string]*int{
-		"H2TUNNEL_HEARTBEAT_SEC":             &cfg.HeartbeatSec,
-		"H2TUNNEL_DRAIN_TIMEOUT_SEC":         &cfg.DrainTimeoutSec,
-		"H2TUNNEL_SESSION_WINDOW_KB":         &cfg.SessionWindowKB,
-		"H2TUNNEL_HANDSHAKE_ACK_MS":          &cfg.HandshakeAckMS,
-		"H2TUNNEL_KEEPALIVE_SEC":             &cfg.KeepaliveSec,
-		"H2TUNNEL_STANDBY_CONNECTIONS":       &cfg.StandbyCount,
-		"H2TUNNEL_PADDING_MIN_RECORD_BYTES":  &cfg.Padding.MinRecordBytes,
-		"H2TUNNEL_PADDING_MAX_RECORD_BYTES":  &cfg.Padding.MaxRecordBytes,
-		"H2TUNNEL_SESSION_MAX":               &cfg.SessionMax,
-		"H2TUNNEL_SESSION_MAX_PER_PRINCIPAL": &cfg.SessionMaxPerPrincipal,
+		"H2TUNNEL_HEARTBEAT_SEC":               &cfg.HeartbeatSec,
+		"H2TUNNEL_DRAIN_TIMEOUT_SEC":           &cfg.DrainTimeoutSec,
+		"H2TUNNEL_SESSION_WINDOW_KB":           &cfg.SessionWindowKB,
+		"H2TUNNEL_H2_STREAM_RECEIVE_WINDOW_KB": &cfg.H2StreamReceiveWindowKB,
+		"H2TUNNEL_HANDSHAKE_ACK_MS":            &cfg.HandshakeAckMS,
+		"H2TUNNEL_KEEPALIVE_SEC":               &cfg.KeepaliveSec,
+		"H2TUNNEL_STANDBY_CONNECTIONS":         &cfg.StandbyCount,
+		"H2TUNNEL_PADDING_MIN_RECORD_BYTES":    &cfg.Padding.MinRecordBytes,
+		"H2TUNNEL_PADDING_MAX_RECORD_BYTES":    &cfg.Padding.MaxRecordBytes,
+		"H2TUNNEL_SESSION_MAX":                 &cfg.SessionMax,
+		"H2TUNNEL_SESSION_MAX_PER_PRINCIPAL":   &cfg.SessionMaxPerPrincipal,
 	}
 	for key, destination := range ints {
 		if value, ok := os.LookupEnv(key); ok {
