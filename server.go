@@ -327,7 +327,16 @@ func serveResumeDataPlane(sess *tunnelSession, up io.Reader, writer *resumeSessi
 		return
 	}
 
-	payloadBuf := make([]byte, 64*1024)
+	// The buffer is held for the stream's lifetime and returned on exit; slices
+	// of it are passed to acceptUplinkSeq synchronously, never retained.
+	payloadBufPtr := getFrameBuf()
+	payloadBuf := *payloadBufPtr
+	defer putFrameBuf(payloadBufPtr)
+	// Push any batched-but-unflushed uplink before leaving, so the target sees
+	// every accepted byte even when the stream ends without a flush trigger
+	// (END frame, read error). Bytes that fail to flush stay uncommitted and
+	// the client replays them; the error is intentionally ignored here.
+	defer func() { _ = sess.flushPendingUplink() }()
 	for {
 		var (
 			typ byte
@@ -400,8 +409,9 @@ func doServerHandshakeAck(up io.Reader, writer *resumeSessionWriter, timeoutMs i
 	}
 	done := make(chan readResult, 1)
 	go func() {
-		payloadBuf := make([]byte, 64*1024)
-		typ, _, n, err := readFrame(up, payloadBuf)
+		payloadBufPtr := getFrameBuf()
+		defer putFrameBuf(payloadBufPtr)
+		typ, _, n, err := readFrame(up, *payloadBufPtr)
 		done <- readResult{typ, n, err}
 	}()
 	select {
@@ -437,9 +447,13 @@ func serveBackupKeepaliveOnly(up io.Reader, writer *resumeSessionWriter, params 
 			err error
 		}
 		done := make(chan readResult, 1)
-		payloadBuf := make([]byte, 64*1024)
+		// The goroutine owns the pooled buffer: on a keepalive timeout this read
+		// may still be in flight while the next iteration spawns another, so
+		// each iteration gets its own and the goroutine returns it.
+		payloadBufPtr := getFrameBuf()
 		go func() {
-			typ, _, _, err := readFrame(up, payloadBuf)
+			defer putFrameBuf(payloadBufPtr)
+			typ, _, _, err := readFrame(up, *payloadBufPtr)
 			done <- readResult{typ, err}
 		}()
 		select {

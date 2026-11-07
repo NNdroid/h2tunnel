@@ -48,6 +48,26 @@ const (
 	sessionCleanupTick = 10 * time.Second
 )
 
+// Uplink write batching (stream mode). The client's pump delivers 32KiB frames;
+// writing each one to the target is one syscall per frame. Frames are batched
+// under writeMu and flushed at whichever comes first:
+//   - uplinkFlushTargetBytes buffered (≈4 bulk frames per syscall),
+//   - uplinkFlushDelay since the first pending byte, enforced by a timer armed
+//     per batch plus a per-frame expiry check (the timer is what covers a
+//     request that ENDS mid-batch: no further frame ever arrives to run the
+//     check, and the tail would otherwise sit unflushed until the application
+//     writes again — fatal for request-response traffic),
+//   - the next small (interactive) frame, which also drains the batch ahead of
+//     itself to keep target-side ordering.
+//
+// uplinkRecv only ever counts bytes the target confirmed (see flushUplinkLocked),
+// so a resume replayed from the watermark can never duplicate a buffered byte.
+const (
+	uplinkFlushTargetBytes = 128 << 10
+	uplinkFlushDelay       = time.Millisecond
+	uplinkSmallFrameBytes  = 8 << 10
+)
+
 // warnSessionIdleBelowHeartbeat warns when the effective session retention is
 // shorter than heartbeatMax, the longest heartbeat a client may configure. The
 // default already clears it, so this only fires for an operator who lowered it
@@ -102,10 +122,33 @@ type tunnelSession struct {
 	// s.mu.
 	writeMu sync.Mutex
 
+	// Uplink batch buffer (stream mode only; datagram writes bypass it). Held
+	// under writeMu. The 128KiB backing array is allocated lazily on the first
+	// bulk frame and reused for the session's lifetime — per-session memory in
+	// line with the 256KiB default replay ring, and zero for sessions that only
+	// ever send small frames.
+	uplinkBuf     []byte
+	uplinkFlushAt time.Time
+
+	// uplinkAccepted is the continuity reference for incoming uplink seqs: the
+	// highest accepted frame end, advancing as frames are admitted (before they
+	// are written). uplinkRecv is the resume watermark: bytes the target
+	// confirmed. Between the two lives the batch buffer (accepted - committed);
+	// a failed flush rolls accepted back to recv so the client replays exactly
+	// the bytes the target never saw. Both are guarded by s.mu; writes by
+	// writeMu.
+	uplinkAccepted uint64
+	uplinkRecv     uint64
+
 	// downlink: server targetConn → HTTP stream / ring buffer
-	downlinkSent      uint64 // bytes written to the client, cumulative
-	downlinkRing      *ringBuffer
-	activeWriter      *resumeSessionWriter // downlink writer of the current active stream; nil = no stream
+	downlinkSent uint64 // bytes written to the client, cumulative
+	downlinkRing *ringBuffer
+	// activeWriter is the downlink writer of the current active stream; nil = no
+	// stream. It is an atomic pointer so the per-chunk hot path (writeDownlink)
+	// reads it lock-free: s.mu only guards the ring append + seq allocation, and
+	// the generation re-read under downlinkMu (reconnects replace the writer)
+	// stays lock-free too.
+	activeWriter      atomic.Pointer[resumeSessionWriter]
 	closed            bool
 	pauseDetachedRead bool
 	writerChanged     chan struct{}
@@ -119,8 +162,8 @@ type tunnelSession struct {
 	frameSentSeq uint64
 
 	// uplink: client → targetConn, accumulated in seq order (gaps are
-	// unrecoverable). Unused in datagram mode (UDP has no ordering).
-	uplinkRecv uint64
+	// unrecoverable). Unused in datagram mode (UDP has no ordering). The
+	// uplinkAccepted / uplinkRecv coordinates live with the batch buffer above.
 
 	// frameW / frameR data-plane wrappers: stream mode is nil (uses
 	// writeResumeFrame / readResumeFrame + seq checks), datagram mode is
@@ -157,7 +200,7 @@ func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 		s.mu.Unlock()
 		return 0, net.ErrClosed
 	}
-	writer := s.activeWriter
+	writer := s.activeWriter.Load()
 	datagram := s.datagram
 	if datagram {
 		// UDP: wrap into a wire frame and write the active stream; drop with
@@ -168,14 +211,14 @@ func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 			return len(data), nil
 		}
 		s.downlinkMu.Lock()
-		s.mu.Lock()
-		writer = s.activeWriter
-		s.mu.Unlock()
+		// A reconnect can replace the writer while this chunk waits: send on
+		// the current generation, never the obsolete stream captured above.
+		writer = s.activeWriter.Load()
 		if writer == nil {
 			s.downlinkMu.Unlock()
 			return len(data), nil
 		}
-		err := s.frameW(&resumeWriterAdapter{w: writer}, data)
+		err := s.frameW(writer, data)
 		s.downlinkMu.Unlock()
 		if err != nil {
 			s.clearActiveWriter(writer)
@@ -203,9 +246,7 @@ func (s *tunnelSession) writeDownlink(data []byte) (int, error) {
 	s.downlinkMu.Lock()
 	// A reconnect can replace the writer while this chunk waits behind replay.
 	// Send on the current generation, never the obsolete stream captured above.
-	s.mu.Lock()
-	writer = s.activeWriter
-	s.mu.Unlock()
+	writer = s.activeWriter.Load()
 	if writer == nil {
 		s.downlinkMu.Unlock()
 		return len(data), nil
@@ -254,16 +295,17 @@ func (s *tunnelSession) lg() *slog.Logger {
 func (s *tunnelSession) setActiveWriter(w *resumeSessionWriter) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.activeWriter = w
+	s.activeWriter.Store(w)
 	s.signalWriterChangedLocked()
 }
 
 // clearActiveWriter clears it when the stream closes.
 func (s *tunnelSession) clearActiveWriter(w *resumeSessionWriter) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.activeWriter == w {
-		s.activeWriter = nil
+	// CAS so a reconnect that already installed a newer writer is not clobbered
+	// by a stale stream dying late; the wake signal only fires on a real swap.
+	if s.activeWriter.CompareAndSwap(w, nil) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		s.signalWriterChangedLocked()
 	}
 }
@@ -285,7 +327,7 @@ func (s *tunnelSession) waitActiveWriter() bool {
 			s.mu.Unlock()
 			return false
 		}
-		if s.activeWriter != nil {
+		if s.activeWriter.Load() != nil {
 			s.mu.Unlock()
 			return true
 		}
@@ -320,7 +362,11 @@ func (s *tunnelSession) replayDownlinkLocked(w *resumeSessionWriter, fromSeq uin
 	if fromSeq >= target {
 		return nil
 	}
-	tmp := make([]byte, 8192)
+	// A pooled scratch buffer (larger than the old 8KiB stack slice) means fewer
+	// ReadAt round-trips per replayed window; it is released when the replay ends.
+	tmpPtr := getFrameBuf()
+	tmp := *tmpPtr
+	defer putFrameBuf(tmpPtr)
 	seq := fromSeq
 	for seq < target {
 		// A concurrent pump may append while replay writes block. Do not read
@@ -376,7 +422,13 @@ func (s *tunnelSession) attachAndReplay(writer *resumeSessionWriter, fromSeq uin
 // has rolled past that offset, ReadAt returns errGap and the reconnect is
 // unrecoverable.
 // Datagram sessions have no seq coordinate system, so they report nothing.
+//
+// Any batched-but-unflushed uplink is drained first: the watermark must cover
+// every byte already accepted from the client, or the resumed stream would
+// replay bytes that are still sitting in the batch buffer and the target would
+// receive them twice.
 func (s *tunnelSession) uplinkCommitted() (uint64, bool) {
+	_ = s.flushPendingUplink()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.datagram {
@@ -415,11 +467,13 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 		}
 		return err
 	}
-	expected := s.uplinkRecv
+	expected := s.uplinkAccepted
 	switch {
 	case seq < expected:
 		// The client re-sent bytes already received (early in recovery);
-		// trim the duplicated head as expected.
+		// trim the duplicated head as expected. Bytes in [uplinkRecv,
+		// uplinkAccepted) are still batched: the duplicate is skipped, not
+		// double-written.
 		skip := expected - seq
 		if skip >= uint64(len(data)) {
 			s.lastSeen.Store(time.Now().UnixNano())
@@ -432,28 +486,153 @@ func (s *tunnelSession) acceptUplinkSeq(seq uint64, data []byte) error {
 		s.mu.Unlock()
 		return errResumeBadSeq
 	}
+	// Admit the frame into the accepted coordinate before writing: the next
+	// frame chains from it even while this one sits batched. A failed write
+	// rolls the accepted coordinate back (writeUplinkConfirmed), so the client
+	// replays exactly what the target never confirmed.
+	s.uplinkAccepted += uint64(len(data))
+	s.lastSeen.Store(time.Now().UnixNano())
 	conn := s.targetConn
 	s.mu.Unlock()
-	for len(data) > 0 {
-		n, err := conn.Write(data)
-		if n < 0 || n > len(data) {
-			return io.ErrShortWrite
+	return s.appendUplinkLocked(conn, data)
+}
+
+// appendUplinkLocked buffers one accepted uplink frame and flushes per the
+// batching policy (see the uplinkFlush* constants). Caller must hold writeMu;
+// conn is the targetConn snapshot taken under s.mu.
+func (s *tunnelSession) appendUplinkLocked(conn net.Conn, data []byte) error {
+	if len(data) < uplinkSmallFrameBytes {
+		if len(s.uplinkBuf) > 0 {
+			// Interactive frame: coalesce whatever is pending ahead of it into
+			// the same write so ordering holds and nothing waits.
+			s.uplinkBuf = append(s.uplinkBuf, data...)
+			return s.flushUplinkLocked(conn)
 		}
-		if n > 0 {
-			s.mu.Lock()
-			s.uplinkRecv += uint64(n)
-			s.mu.Unlock()
-			s.lastSeen.Store(time.Now().UnixNano())
-			data = data[n:]
-		}
-		if err != nil {
+		return s.writeUplinkConfirmed(conn, data)
+	}
+	now := time.Now()
+	if len(s.uplinkBuf) > 0 && !now.Before(s.uplinkFlushAt) {
+		// The batch is older than the latency cap: flush before appending.
+		if err := s.flushUplinkLocked(conn); err != nil {
 			return err
 		}
-		if n == 0 {
-			return io.ErrShortWrite
+	} else if len(s.uplinkBuf)+len(data) > uplinkFlushTargetBytes {
+		if err := s.flushUplinkLocked(conn); err != nil {
+			return err
 		}
 	}
+	if cap(s.uplinkBuf) == 0 {
+		s.uplinkBuf = make([]byte, 0, uplinkFlushTargetBytes)
+	}
+	if len(s.uplinkBuf) == 0 {
+		s.uplinkFlushAt = now.Add(uplinkFlushDelay)
+		// Arm the tail flush (see the policy comment above): without it a
+		// request that ends mid-batch stalls the target until the app writes
+		// again. At bulk rates the 128KiB size flush fires long before this
+		// timer, so it only ever runs for the sub-target tail.
+		time.AfterFunc(uplinkFlushDelay, s.flushExpiredUplink)
+	}
+	s.uplinkBuf = append(s.uplinkBuf, data...)
+	if len(s.uplinkBuf) >= uplinkFlushTargetBytes {
+		return s.flushUplinkLocked(conn)
+	}
 	return nil
+}
+
+// writeUplinkConfirmed writes data to the target and keeps the two uplink
+// coordinates consistent: uplinkRecv (the resume watermark) advances by the
+// confirmed prefix, and uplinkAccepted rolls back the bytes the target did not
+// accept, so the client replays exactly what it never confirmed. Caller must
+// hold writeMu.
+func (s *tunnelSession) writeUplinkConfirmed(conn net.Conn, data []byte) error {
+	written := 0
+	var err error
+	for written < len(data) {
+		n, wErr := conn.Write(data[written:])
+		if n < 0 || n > len(data)-written {
+			err = io.ErrShortWrite
+			break
+		}
+		written += n
+		if wErr != nil {
+			err = wErr
+			break
+		}
+		if n == 0 {
+			err = io.ErrShortWrite
+			break
+		}
+	}
+	if written > 0 || err != nil {
+		s.mu.Lock()
+		if written > 0 {
+			s.uplinkRecv += uint64(written)
+		}
+		if err != nil && written < len(data) {
+			s.uplinkAccepted -= uint64(len(data) - written)
+		}
+		s.mu.Unlock()
+		s.lastSeen.Store(time.Now().UnixNano())
+	}
+	return err
+}
+
+// flushUplinkLocked writes the pending batch to the target through
+// writeUplinkConfirmed. On error the unwritten tail is dropped: the watermark
+// covers only the confirmed prefix, so the client replays the remainder on the
+// next stream. Caller must hold writeMu.
+func (s *tunnelSession) flushUplinkLocked(conn net.Conn) error {
+	if len(s.uplinkBuf) == 0 {
+		return nil
+	}
+	data := s.uplinkBuf
+	s.uplinkBuf = s.uplinkBuf[:0]
+	return s.writeUplinkConfirmed(conn, data)
+}
+
+// flushExpiredUplink is the batch timer callback: it flushes a batch that has
+// outlived uplinkFlushDelay. TryLock keeps the callback out of the way when a
+// writer is active (it flushes anyway) and prevents timer goroutines from
+// piling up behind a stalled target write. Best effort: bytes that cannot be
+// flushed stay uncommitted and the client replays them.
+func (s *tunnelSession) flushExpiredUplink() {
+	if !s.writeMu.TryLock() {
+		return
+	}
+	defer s.writeMu.Unlock()
+	if len(s.uplinkBuf) == 0 || time.Now().Before(s.uplinkFlushAt) {
+		return
+	}
+	s.mu.Lock()
+	conn := s.targetConn
+	s.mu.Unlock()
+	if conn == nil {
+		s.uplinkBuf = s.uplinkBuf[:0]
+		return
+	}
+	_ = s.flushUplinkLocked(conn)
+}
+
+// flushPendingUplink drains the batch buffer if one exists. It is a no-op in
+// datagram mode and when nothing is buffered. Callers that flush opportunistically
+// (before a resume watermark snapshot, on stream teardown) may ignore the error:
+// a failed flush leaves those bytes uncommitted, and the client replays them.
+func (s *tunnelSession) flushPendingUplink() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if len(s.uplinkBuf) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	conn := s.targetConn
+	s.mu.Unlock()
+	if conn == nil {
+		// Target gone: the batch cannot be delivered; uplinkRecv never counted
+		// it, so the client replays it on resume.
+		s.uplinkBuf = s.uplinkBuf[:0]
+		return net.ErrClosed
+	}
+	return s.flushUplinkLocked(conn)
 }
 
 // sessionTable is the server-side session table (instance-level, owned by a
@@ -793,8 +972,8 @@ func (s *tunnelSession) downlinkPump() {
 			// datagrams, an END frame would be parsed as an invalid packet and
 			// corrupt the stream); the client reads stream EOF and reconnects.
 			if !s.datagram {
+				writer := s.activeWriter.Load()
 				s.mu.Lock()
-				writer := s.activeWriter
 				closed := s.closed
 				s.mu.Unlock()
 				if writer != nil && !closed {
@@ -822,15 +1001,13 @@ type resumeSessionWriter struct {
 	padding paddingPolicy
 }
 
-// resumeWriterAdapter adapts resumeSessionWriter into an io.Writer for the
-// datagram data plane's frameW (writeUDPPacket / writeUDPCapsule). Uses
-// writeRaw (UDP packets self-wrap, no resume frame on top).
-type resumeWriterAdapter struct {
-	w *resumeSessionWriter
-}
-
-func (a *resumeWriterAdapter) Write(p []byte) (int, error) {
-	return a.w.writeRaw(p)
+// Write adapts resumeSessionWriter into an io.Writer for the datagram data
+// plane's frameW (writeUDPPacket / writeUDPCapsule): UDP packets self-wrap, so
+// the raw path is used and no resume frame is added on top. Passing the writer
+// directly to frameW (instead of a per-packet adapter) keeps the datagram hot
+// path allocation-free.
+func (w *resumeSessionWriter) Write(p []byte) (int, error) {
+	return w.writeRaw(p)
 }
 
 // writeFrame writes one resume frame on the stream (stream-mode downlink)

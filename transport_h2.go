@@ -197,9 +197,10 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 	}
 
 	clientDownlink := parseResumeDownlink(r)
-	sess.mu.Lock()
-	serverUplink := sess.uplinkRecv
-	sess.mu.Unlock()
+	// uplinkCommitted drains any batched-but-unflushed uplink first: the echoed
+	// watermark must cover every accepted byte, or the resumed stream replays
+	// bytes still sitting in the batch buffer and the target sees them twice.
+	serverUplink, _ := sess.uplinkCommitted()
 
 	flusher, _ := w.(http.Flusher)
 	writer := &resumeSessionWriter{w: w, flusher: flusher, padding: cfg.Padding}
