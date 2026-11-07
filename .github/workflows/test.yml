@@ -155,10 +155,14 @@ jobs:
       - name: Register qemu-user as the go cross-exec wrapper
         # qemu-user-static provides the static emulators and needs no binfmt
         # registration to be driven explicitly, which is what the wrapper does.
+        # Ubuntu 26.04 runners dropped the qemu-user-static package ("no
+        # installation candidate"); qemu-user ships the same emulators without
+        # the -static suffix, which the fallback below already handles.
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user-static
+          sudo apt-get install -y --no-install-recommends qemu-user-static \
+            || sudo apt-get install -y --no-install-recommends qemu-user
           QEMU=/usr/bin/qemu-${{ matrix.qemu }}-static
           [ -x "$QEMU" ] || QEMU=/usr/bin/qemu-${{ matrix.qemu }}
           if [ ! -x "$QEMU" ]; then
