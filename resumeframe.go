@@ -345,7 +345,9 @@ func (b *resumeClientRingBuf) WindowEnd() uint64 { return b.rb.WindowEnd() }
 // total bytes written and any error encountered (errGap means the gap is
 // unrecoverable).
 func (b *resumeClientRingBuf) ReplayFrom(seq uint64, w io.Writer) (int64, error) {
-	tmp := make([]byte, 8192)
+	tmpPtr := getFrameBuf()
+	tmp := *tmpPtr
+	defer putFrameBuf(tmpPtr)
 	var total int64
 	for {
 		n, err := b.rb.ReadAt(seq, tmp)

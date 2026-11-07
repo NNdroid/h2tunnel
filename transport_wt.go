@@ -360,8 +360,16 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 		lgWarnf(cfg.lg(), "[Resume/WT] ❌ failed to write HANDSHAKE control frame: %v", err)
 		return false, err
 	}
-	hsBuf := make([]byte, 64*1024)
+	hsBufPtr := getFrameBuf()
+	hsBuf := *hsBufPtr
 	typ, _, n, err := readFrame(stream, hsBuf)
+	// Copy the payload out before the buffer returns to the pool: another
+	// goroutine may overwrite it the moment it is handed back.
+	var ackPayload string
+	if n > 0 {
+		ackPayload = string(hsBuf[:n])
+	}
+	putFrameBuf(hsBufPtr)
 	if err != nil {
 		lgWarnf(cfg.lg(), "[Resume/WT] ❌ failed to read HANDSHAKE-ACK: %v", err)
 		return false, err
@@ -376,8 +384,8 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 	// Without it the client replays its ring from 0, and once the ring has rolled
 	// past 0 that is an unrecoverable gap rather than a wasted retransmit. An
 	// empty payload is a server that predates the field; keep the previous value.
-	if n > 0 {
-		if v, errParse := strconv.ParseUint(string(hsBuf[:n]), 10, 64); errParse == nil {
+	if ackPayload != "" {
+		if v, errParse := strconv.ParseUint(ackPayload, 10, 64); errParse == nil {
 			*serverUplink = v
 		}
 	}
@@ -426,7 +434,9 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 // HANDSHAKE payload and the server refills the gap from there. An END frame
 // → half-close locally and return normally.
 func resumeRecvLoopWT(stream io.Reader, localConn net.Conn, clientDownlink *uint64, lg *slog.Logger, st *ClientStats) error {
-	payloadBuf := make([]byte, 64*1024)
+	payloadBufPtr := getFrameBuf()
+	payloadBuf := *payloadBufPtr
+	defer putFrameBuf(payloadBufPtr)
 	expected := *clientDownlink // the downlink coordinate space is continuous across streams: the first frame seq after reconnect must equal the bytes already received
 	for {
 		typ, seq, n, err := readFrame(stream, payloadBuf)
@@ -818,7 +828,11 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 		}()
 		go func() {
 			defer close(downExited)
-			buf := make([]byte, 64*1024)
+			// deliver() copies, so a pooled scratch buffer is safe here; it lives
+			// only as long as this goroutine.
+			bufPtr := getFrameBuf()
+			buf := *bufPtr
+			defer putFrameBuf(bufPtr)
 			for {
 				n, err := readUDPPacket(stream, buf)
 				if err != nil {

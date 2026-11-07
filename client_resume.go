@@ -430,8 +430,10 @@ func runResumeAttemptContext(parent context.Context, sessID string, serverUplink
 		lgWarnf(cfg.lg(), "[Resume] ❌ failed to write HANDSHAKE control frame: %v", err)
 		return false, err
 	}
-	hsBuf := make([]byte, 64*1024)
+	hsBufPtr := getFrameBuf()
+	hsBuf := *hsBufPtr
 	typ, _, _, err := readFrame(resp.Body, hsBuf)
+	putFrameBuf(hsBufPtr)
 	if err != nil {
 		lgWarnf(cfg.lg(), "[Resume] ❌ failed to read HANDSHAKE-ACK: %v", err)
 		return false, err
@@ -540,12 +542,19 @@ func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBu
 	bufPtr := tcpBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer tcpBufPool.Put(bufPtr)
+	// The heartbeat deadline is refreshed only when it has actually expired, not
+	// on every chunk: the same trick the server-side downlinkPump uses to avoid
+	// a SetReadDeadline syscall per read. An expired deadline fires once (that
+	// is the keepalive trigger), the next loop iteration resets it. While data
+	// flows, a stale future deadline behaves identically to a fresh one.
+	readDeadline := time.Time{}
 	for {
 		// A TCP Read has no select case. A bounded read deadline lets this sole
 		// writer wake during an idle period and send a resume KEEPALIVE without
 		// adding a competing writer to the HTTP request body.
-		if heartbeat > 0 {
-			_ = localConn.SetReadDeadline(time.Now().Add(heartbeat))
+		if heartbeat > 0 && (readDeadline.IsZero() || !time.Now().Before(readDeadline)) {
+			readDeadline = time.Now().Add(heartbeat)
+			_ = localConn.SetReadDeadline(readDeadline)
 		}
 		// Re-check after the deadline update: cancellation may have set an
 		// immediate deadline just before the heartbeat overwrote it.
@@ -600,7 +609,11 @@ func resumeSendLoop(w io.Writer, localConn net.Conn, ringBuf *resumeClientRingBu
 // (0 for the first stream, last received count for a reconnect), otherwise the gap is unrecoverable.
 // An END frame -> local half-close and normal return; a read error -> return err so the outer loop redials.
 func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64, lg *slog.Logger, st *ClientStats) error {
-	payloadBuf := make([]byte, 64*1024)
+	// Held for the stream's lifetime; frames are handed to writeAll synchronously
+	// before the buffer is returned on exit.
+	payloadBufPtr := getFrameBuf()
+	payloadBuf := *payloadBufPtr
+	defer putFrameBuf(payloadBufPtr)
 	expected := *clientDownlink
 	for {
 		typ, seq, n, err := readFrame(body, payloadBuf)

@@ -32,17 +32,14 @@ type ringBuffer struct {
 	head           int    // physical offset of the window start in buf
 	length         int    // current number of valid bytes
 	windowStartSeq uint64 // global seq corresponding to buf[head]
-	notify         *sync.Cond
 }
 
 func newRingBuffer(sizeKB int) *ringBuffer {
 	sizeKB = resolveSessionWindow(sizeKB)
-	rb := &ringBuffer{
+	return &ringBuffer{
 		buf:  make([]byte, sizeKB*1024),
 		size: sizeKB * 1024,
 	}
-	rb.notify = sync.NewCond(&rb.mu)
-	return rb
 }
 
 // Append writes a run of bytes. When full it overwrites the oldest ring-wise and
@@ -98,7 +95,6 @@ func (rb *ringBuffer) Append(p []byte) {
 		rb.length += n
 		p = p[n:]
 	}
-	rb.notify.Broadcast()
 }
 
 // ReadAt reads up to len(p) bytes starting at the global seq, returning the count
@@ -137,15 +133,6 @@ func (rb *ringBuffer) WindowEnd() uint64 {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	return rb.windowStartSeq + uint64(rb.length)
-}
-
-// WaitNewData blocks until the window end passes seq (consumers waiting for new data).
-func (rb *ringBuffer) WaitNewData(seq uint64) {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	for rb.windowStartSeq+uint64(rb.length) <= seq {
-		rb.notify.Wait()
-	}
 }
 
 // WindowStartSeq returns the current window-start seq.
