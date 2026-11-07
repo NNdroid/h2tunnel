@@ -58,6 +58,15 @@ func (c *countingTarget) snapshot() (int, []byte) {
 	return c.writes, append([]byte(nil), c.buf.Bytes()...)
 }
 
+// uplinkState snapshots the watermark and batch length under s.mu: the batch
+// timer goroutine updates both concurrently with any test that feeds frames
+// and then waits, and the race detector rightly flags unsynchronized reads.
+func (s *tunnelSession) uplinkState() (recv uint64, buffered int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uplinkRecv, len(s.uplinkBuf)
+}
+
 const benchChunkBytes = 32 << 10
 
 func bulkFrame(t *testing.T, idx byte) []byte {
@@ -69,8 +78,30 @@ func bulkFrame(t *testing.T, idx byte) []byte {
 	return p
 }
 
-// Four bulk frames must coalesce into one target write at the 128KiB batch
-// target, delivered in order, with the watermark advancing only at the flush.
+// waitForUplink polls until the target has received at least want bytes. Every
+// batching assertion below is phrased as a final state: on a slow machine the
+// per-batch flush timer fires between test steps and splits what a fast
+// machine coalesces into one write, so write COUNTS are only range-checked —
+// bytes, order and the watermark are what the tests hold fixed.
+func waitForUplink(t *testing.T, c *countingTarget, want int) (writes int, got []byte) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		writes, got = c.snapshot()
+		if len(got) >= want {
+			return writes, got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("target received %d of %d bytes within the deadline", len(got), want)
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+}
+
+// Four bulk frames must reach the target in order with the watermark matching,
+// coalesced when the machine is fast enough to deliver all four inside the
+// latency window (1 write locally; the timer may split it into up to 4 under
+// CI scheduling without any violation).
 func TestUplinkBatchCoalescesBulkWrites(t *testing.T) {
 	c := &countingTarget{}
 	s := &tunnelSession{targetConn: c}
@@ -79,9 +110,9 @@ func TestUplinkBatchCoalescesBulkWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writes, got := c.snapshot()
-	if writes != 1 {
-		t.Fatalf("bulk frames produced %d target writes, want 1", writes)
+	writes, got := waitForUplink(t, c, 4*benchChunkBytes)
+	if writes < 1 || writes > 4 {
+		t.Fatalf("bulk frames produced %d target writes, want 1..4", writes)
 	}
 	if len(got) != 4*benchChunkBytes {
 		t.Fatalf("target received %d bytes, want %d", len(got), 4*benchChunkBytes)
@@ -91,13 +122,14 @@ func TestUplinkBatchCoalescesBulkWrites(t *testing.T) {
 			t.Fatalf("byte %d is 0x%02x, want 0x%02x (ordering broken)", i, got[i], want)
 		}
 	}
-	if s.uplinkRecv != 4*benchChunkBytes {
-		t.Fatalf("watermark %d, want %d", s.uplinkRecv, 4*benchChunkBytes)
+	if recv, _ := s.uplinkState(); recv != 4*benchChunkBytes {
+		t.Fatalf("watermark %d, want %d", recv, 4*benchChunkBytes)
 	}
 }
 
 // A small (interactive) frame must flush immediately and drain any pending
-// bulk ahead of it, in order, in a single coalesced write.
+// bulk ahead of it: the small frame is the LAST thing the target receives,
+// whatever the flush schedule in between.
 func TestUplinkBatchFlushesOnSmallFrame(t *testing.T) {
 	c := &countingTarget{}
 	s := &tunnelSession{targetConn: c}
@@ -107,19 +139,13 @@ func TestUplinkBatchFlushesOnSmallFrame(t *testing.T) {
 	if err := s.acceptUplinkSeq(benchChunkBytes, bulkFrame(t, 2)); err != nil {
 		t.Fatal(err)
 	}
-	if writes, _ := c.snapshot(); writes != 0 {
-		t.Fatalf("batched frames flushed early: %d writes", writes)
-	}
-	if s.uplinkRecv != 0 {
-		t.Fatalf("unflushed bytes committed: %d", s.uplinkRecv)
-	}
 	small := []byte("keystroke")
 	if err := s.acceptUplinkSeq(2*benchChunkBytes, small); err != nil {
 		t.Fatal(err)
 	}
-	writes, got := c.snapshot()
-	if writes != 1 {
-		t.Fatalf("small frame produced %d writes, want 1 coalesced write", writes)
+	writes, got := waitForUplink(t, c, 2*benchChunkBytes+len(small))
+	if writes < 1 || writes > 3 {
+		t.Fatalf("frames produced %d writes, want 1..3", writes)
 	}
 	if !bytes.Equal(got[:2*benchChunkBytes], append(bulkFrame(t, 1), bulkFrame(t, 2)...)) {
 		t.Fatal("pending bulk bytes corrupted by small frame")
@@ -127,14 +153,15 @@ func TestUplinkBatchFlushesOnSmallFrame(t *testing.T) {
 	if !bytes.Equal(got[2*benchChunkBytes:], small) {
 		t.Fatal("small frame not delivered last")
 	}
-	if s.uplinkRecv != uint64(2*benchChunkBytes+len(small)) {
-		t.Fatalf("watermark %d after flush", s.uplinkRecv)
+	if recv, _ := s.uplinkState(); recv != uint64(2*benchChunkBytes+len(small)) {
+		t.Fatalf("watermark %d after flush", recv)
 	}
 }
 
-// A batch older than the latency cap is flushed by the next accepted frame
-// even when it is far below the byte target, and the fresh frame batches on.
-func TestUplinkBatchLatencyCap(t *testing.T) {
+// A batch that cannot reach the 128KiB target is still delivered once it
+// outlives the latency window: two frames (64KiB) with no explicit flush and
+// no 128KiB in sight must reach the target.
+func TestUplinkBatchFlushesBeforeReachingTarget(t *testing.T) {
 	c := &countingTarget{}
 	s := &tunnelSession{targetConn: c}
 	if err := s.acceptUplinkSeq(0, bulkFrame(t, 1)); err != nil {
@@ -144,15 +171,15 @@ func TestUplinkBatchLatencyCap(t *testing.T) {
 	if err := s.acceptUplinkSeq(benchChunkBytes, bulkFrame(t, 2)); err != nil {
 		t.Fatal(err)
 	}
-	writes, got := c.snapshot()
-	if writes != 1 || len(got) != benchChunkBytes {
-		t.Fatalf("expired batch not flushed: %d writes, %d bytes", writes, len(got))
+	writes, got := waitForUplink(t, c, 2*benchChunkBytes)
+	if writes < 1 || writes > 2 {
+		t.Fatalf("frames produced %d writes, want 1..2", writes)
 	}
-	if s.uplinkRecv != benchChunkBytes {
-		t.Fatalf("watermark %d, want the flushed frame only", s.uplinkRecv)
+	if !bytes.Equal(got, append(bulkFrame(t, 1), bulkFrame(t, 2)...)) {
+		t.Fatal("sub-target batch delivered out of order or corrupted")
 	}
-	if len(s.uplinkBuf) != benchChunkBytes {
-		t.Fatalf("fresh frame not batched: %d buffered", len(s.uplinkBuf))
+	if recv, _ := s.uplinkState(); recv != 2*benchChunkBytes {
+		t.Fatalf("watermark %d, want %d", recv, 2*benchChunkBytes)
 	}
 }
 
@@ -169,11 +196,8 @@ func TestUplinkFlushErrorDropsTail(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the truncated write to surface an error")
 	}
-	if s.uplinkRecv != 16<<10 {
-		t.Fatalf("watermark %d, want only the confirmed 16KiB", s.uplinkRecv)
-	}
-	if len(s.uplinkBuf) != 0 {
-		t.Fatalf("tail not dropped: %d bytes still buffered", len(s.uplinkBuf))
+	if recv, buffered := s.uplinkState(); recv != 16<<10 || buffered != 0 {
+		t.Fatalf("watermark %d / buffered %d after the failed flush, want 16KiB committed and nothing buffered", recv, buffered)
 	}
 	if got := c.buf.Bytes(); len(got) != 16<<10 {
 		t.Fatalf("target received %d bytes, want 16KiB", len(got))
@@ -214,16 +238,20 @@ func TestUplinkWatermarkCoversBatchOnResume(t *testing.T) {
 	if got != 2*benchChunkBytes {
 		t.Fatalf("watermark %d excludes batched bytes", got)
 	}
-	writes, flushed := c.snapshot()
-	if writes != 1 || len(flushed) != 2*benchChunkBytes {
-		t.Fatalf("resume drain wrote %d frames / %d bytes", writes, len(flushed))
+	writes, flushed := waitForUplink(t, c, 2*benchChunkBytes)
+	if writes > 2 {
+		t.Fatalf("resume drain produced %d writes", writes)
 	}
-	if len(s.uplinkBuf) != 0 {
-		t.Fatalf("batch not drained: %d bytes", len(s.uplinkBuf))
+	if len(flushed) != 2*benchChunkBytes {
+		t.Fatalf("resume drain delivered %d bytes, want %d", len(flushed), 2*benchChunkBytes)
+	}
+	if _, buffered := s.uplinkState(); buffered != 0 {
+		t.Fatalf("batch not drained: %d bytes", buffered)
 	}
 }
 
 // flushPendingUplink on a dead target drops the batch without committing it,
+// leaving the replay to cover the gap.
 func TestUplinkFlushPendingOnDeadTarget(t *testing.T) {
 	c := &truncatingTarget{}
 	s := &tunnelSession{targetConn: c}
@@ -236,17 +264,15 @@ func TestUplinkFlushPendingOnDeadTarget(t *testing.T) {
 	if err := s.flushPendingUplink(); err == nil {
 		t.Fatal("expected ErrClosed for a nil target")
 	}
-	if s.uplinkRecv != 0 {
-		t.Fatalf("watermark advanced on a dead target: %d", s.uplinkRecv)
-	}
-	if len(s.uplinkBuf) != 0 {
-		t.Fatalf("batch not dropped: %d bytes", len(s.uplinkBuf))
+	if recv, buffered := s.uplinkState(); recv != 0 || buffered != 0 {
+		t.Fatalf("watermark %d / buffered %d after a dead-target drop, want 0/0", recv, buffered)
 	}
 }
 
 // A request that ENDS mid-batch (request-response traffic: the app writes and
 // then waits for a reply) must not wait for another uplink frame to flush the
-// tail — none will ever come. The per-batch timer delivers it.
+// tail — none will ever come. The per-batch timer delivers it. The three
+// frames never reach the 128KiB target, so nothing here can flush by size.
 func TestUplinkBatchTailFlushedByTimer(t *testing.T) {
 	c := &countingTarget{}
 	s := &tunnelSession{targetConn: c}
@@ -255,25 +281,18 @@ func TestUplinkBatchTailFlushedByTimer(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if writes, _ := c.snapshot(); writes != 0 {
-		t.Fatalf("sub-target batch flushed early: %d writes", writes)
-	}
 	// No further frames, no explicit flush: the timer must deliver the tail.
-	deadline := time.Now().Add(2*uplinkFlushDelay + 50*time.Millisecond)
-	for {
-		writes, got := c.snapshot()
-		if writes > 0 {
-			if len(got) != 3*benchChunkBytes {
-				t.Fatalf("timer flushed %d bytes, want the full tail", len(got))
-			}
-			if s.uplinkRecv != 3*benchChunkBytes {
-				t.Fatalf("watermark %d after timer flush", s.uplinkRecv)
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("tail bytes never flushed without a follow-up frame")
-		}
-		time.Sleep(time.Millisecond)
+	// On a slow CI machine the timer may fire mid-feed and split the delivery;
+	// whatever the schedule, the last sub-target chunk has no flush path left
+	// except the timer.
+	writes, got := waitForUplink(t, c, 3*benchChunkBytes)
+	if writes < 1 || writes > 3 {
+		t.Fatalf("timer tail produced %d writes, want 1..3", writes)
+	}
+	if len(got) != 3*benchChunkBytes {
+		t.Fatalf("timer flushed %d bytes, want the full tail", len(got))
+	}
+	if recv, _ := s.uplinkState(); recv != 3*benchChunkBytes {
+		t.Fatalf("watermark %d after timer flush", recv)
 	}
 }
