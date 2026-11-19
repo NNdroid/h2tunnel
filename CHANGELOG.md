@@ -2,6 +2,14 @@
 
 This file records notable changes for library users. Dates are release dates (UTC+8).
 
+## 2026-11-20
+
+### Fixed
+- **The server's `transport: "all"` routing policy no longer admits cleartext h2c.** The CLI registers "all" as exactly the five TLS carriers — h2, h3, wt, masque, grpc (`parseTransports`) — and forces TLS for it, but the compiled routing policy the request hot path checks against mapped "all" onto the full transport mask, which includes h2c. A server built through the file-config path therefore passed `checkStrictTransportPolicy` for a plaintext HTTP/2 POST (classified h2c by `resumeWireTransport`) even though no user-facing surface of "all" ever promised plaintext, and the API path (`normalizeServerTransports`) cannot even express "all". "all" now compiles to the TLS transport family, matching the CLI bit for bit; cleartext h2c stays reachable only through an explicit `h2c` configuration, and the unset/programmatic fallback (empty transport) keeps its previous permissive mask. Pinned by mask assertions on `prepareServerConfig("all")` and new `TestStrictTransportRouting` rows covering "all" against cleartext h2, TLS h2 and TLS grpc. README documents the per-value semantics (carrier, listener stacks, TLS rule) in a new transport table.
+
+### Operational
+- **The server warns at startup when `transport` is `grpc` and the listener is plaintext.** The gRPC content-type tag exists to satisfy CDNs and middleboxes, and they only forward gRPC over TLS — a plaintext grpc-only listener is a local-development shape that previously looked deliberate while being unusable for its stated purpose. Like the missing-token warning this does not change behavior: the same config keeps running, and the log line says why it is probably not what was meant.
+
 ## 2026-11-07
 
 ### Added

@@ -555,8 +555,6 @@ When `cert` and `key` are both empty, the CLI generates an in-process self-signe
   "transport": "h2",
   "network": "tcp",
   "token": "replace-with-a-long-random-token",
-  "sni": "tunnel.example.com",
-  "host": "tunnel.example.com",
   "insecure": false,
   "utls": "chrome",
   "heartbeat_sec": 25,
@@ -602,7 +600,7 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `target` | client | required | target address the server should connect to |
 | `path` | shared | `/tunnel` | tunnel HTTP path; MASQUE endpoints are nested beneath it: `<path>/.well-known/masque/{tcp,udp}/...` (e.g. `path=/tunnel` → `/tunnel/.well-known/masque/...`; `path=/` yields the standard `/.well-known/masque`) |
 | `token` | shared | empty | pre-shared auth token; must be set in production. Empty is still valid for local development, but the CLI logs a startup WARN: every request then authenticates as one shared `"anonymous"` principal, so all clients share a session bucket, a per-principal cap and a Brutal connection group |
-| `transport` | shared | server `h2`; client inferred from URL | server accepts comma-separated lists or `all`; client picks exactly one |
+| `transport` | shared | server `h2`; client inferred from URL (`https://` → `h2`, `http://` → `h2c`) | server accepts comma-separated lists or `all`; client picks exactly one. Per-value semantics: see the transport table below |
 | `network` | shared | `tcp` | `tcp`, `udp`, or `all` |
 | `tls` | server | `false` | enable TLS; `h2/h3/wt/masque` imply TLS automatically, `h2c` forces plaintext |
 | `cert` / `key` | server | empty | TLS certificate and private key, must be set together |
@@ -633,6 +631,20 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `log_level` | shared | `info` | `debug`, `info`, `warn`, `error` |
 
 Every field can be overridden by an uppercased env var of the same name, e.g. `H2TUNNEL_SERVER`, `H2TUNNEL_TRANSPORT`, `H2TUNNEL_STANDBY_CONNECTIONS`, `H2TUNNEL_UTLS`, `H2TUNNEL_MASQUE_ALPN`, `H2TUNNEL_PADDING_MIN_RECORD_BYTES`, `H2TUNNEL_PADDING_MAX_RECORD_BYTES`, `H2TUNNEL_PPROF`, `H2TUNNEL_BRUTAL_ENABLED`, `H2TUNNEL_BRUTAL_RATE_BYTES`, `H2TUNNEL_BRUTAL_CWND_GAIN`, `H2TUNNEL_BRUTAL_GROUP_ID`, `H2TUNNEL_BRUTAL_NEGOTIATE`, `H2TUNNEL_SESSION_MAX`, `H2TUNNEL_SESSION_MAX_PER_PRINCIPAL`. Malformed boolean or integer env values also fail at startup.
+
+### Transport values
+
+`transport` is the server's carrier allow-list and the client's single carrier pick. The server compiles the list into a routing policy and rejects any request whose actual wire carrier falls outside it (`transport policy violation`), so the client's transport must appear in the server's list.
+
+| Value | Carrier | Listener stacks | TLS | Notes |
+| --- | --- | --- | --- | --- |
+| `h2` | HTTP/2 over TLS | TCP | forced | CDN-friendly default; a CDN downgraded to HTTP/1.1 still counts as the h2 family |
+| `h2c` | plaintext HTTP/2 | TCP | forbidden with `tls`/`cert`/`key` or any TLS transport | local development only |
+| `h3` | HTTP/3 | TCP + UDP (same port number) | forced | open the UDP port in firewalls/security groups |
+| `wt` | WebTransport (h3) | TCP + UDP (same port number) | forced | client rejects `standby_connections` alongside `wt` |
+| `masque` | RFC 9298, dual carrier h3/h2 | TCP + UDP (both bound) | forced | the h2 leg needs `GODEBUG=http2xconnect=1` at process start (see the MASQUE section) |
+| `grpc` | resume/2 tagged `Content-Type: application/grpc` (not real gRPC framing) | TCP | follows the listener | exists for CDNs/middleboxes that require gRPC (enable gRPC there, e.g. Cloudflare); a `grpc`-only plaintext config logs a startup WARN |
+| `all` | h2 + h3 + wt + masque + grpc | TCP + UDP | forced | every TLS carrier family — never includes `h2c` |
 
 ### MASQUE dual carriers (h3 / h2)
 
