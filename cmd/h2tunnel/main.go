@@ -124,6 +124,17 @@ func runServer(cfg *config, logger *slog.Logger) error {
 		!strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
 		logger.Warn("⚠️ MASQUE over h2 requires GODEBUG=http2xconnect=1 at process start (h3 carrier unaffected)")
 	}
+	serverTLS, err := serverTLSConfig(cfg)
+	if err != nil {
+		return err
+	}
+	// The gRPC tag exists to satisfy CDNs and middleboxes, and they only forward
+	// gRPC over TLS. Plain HTTP/2 with the tag — what a grpc-only config serves
+	// when TLS is off — is a local-development shape, so say it at startup
+	// instead of letting it look deliberate (same reasoning as the token warning).
+	if warnGrpcPlaintext(cfg.Transport, serverTLS != nil) {
+		logger.Warn("⚠️ transport \"grpc\" without TLS serves plaintext HTTP/2; CDNs only forward gRPC over TLS — keep plaintext grpc for local development only")
+	}
 	// An empty token is a documented default (the bare config must stay usable
 	// for local development), so it is not a validation error. But it is the
 	// difference between an authenticated tunnel and an open one: every request
@@ -133,7 +144,6 @@ func runServer(cfg *config, logger *slog.Logger) error {
 	if cfg.Token == "" {
 		logger.Warn("⚠️ no token set: every request authenticates as \"anonymous\". Set token or H2TUNNEL_TOKEN before exposing the listener.")
 	}
-	var err error
 	auth := h2tunnel.Authenticator(func(context.Context, *http.Request) (h2tunnel.Principal, error) {
 		return h2tunnel.Principal{ID: "anonymous"}, nil
 	})
@@ -142,10 +152,6 @@ func runServer(cfg *config, logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-	}
-	serverTLS, err := serverTLSConfig(cfg)
-	if err != nil {
-		return err
 	}
 	server, err := h2tunnel.NewServer(h2tunnel.ServerOptions{
 		Path:          cfg.Path,
@@ -453,6 +459,13 @@ func directTargetDialer(localOnly bool) h2tunnel.TargetDialer {
 		dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 		return dialer.DialContext(ctx, network, address)
 	}
+}
+
+// warnGrpcPlaintext reports whether a grpc-only transport ends up on a
+// plaintext listener: TLS is what makes the gRPC content-type tag meaningful
+// outside local development, and — unlike h2 — the CLI forces no TLS for grpc.
+func warnGrpcPlaintext(transport string, tlsEnabled bool) bool {
+	return strings.TrimSpace(strings.ToLower(transport)) == "grpc" && !tlsEnabled
 }
 
 func serverTLSConfig(cfg *config) (*tls.Config, error) {

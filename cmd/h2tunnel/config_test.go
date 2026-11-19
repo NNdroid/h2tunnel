@@ -322,6 +322,29 @@ func TestConfigDefaultsAreMinimalAndUsable(t *testing.T) {
 	}
 }
 
+func TestWarnGrpcPlaintext(t *testing.T) {
+	cases := []struct {
+		transport  string
+		tlsEnabled bool
+		want       bool
+	}{
+		{"grpc", false, true},
+		{"GRPC", false, true},
+		{" grpc ", false, true},
+		{"grpc", true, false},
+		{"h2", false, false},
+		{"h2c", false, false},
+		{"h2,grpc", false, false},
+		{"all", false, false},
+		{"", false, false},
+	}
+	for _, tt := range cases {
+		if got := warnGrpcPlaintext(tt.transport, tt.tlsEnabled); got != tt.want {
+			t.Fatalf("warnGrpcPlaintext(%q, %v) = %v, want %v", tt.transport, tt.tlsEnabled, got, tt.want)
+		}
+	}
+}
+
 func TestRepositoryExampleConfigsUseCurrentSchema(t *testing.T) {
 	for _, name := range []string{"config.server.json", "config.client.json"} {
 		cfg, err := loadConfig(filepath.Join("..", "..", name))
