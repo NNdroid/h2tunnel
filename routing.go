@@ -158,6 +158,11 @@ const (
 	maskMasque
 	maskGRPC
 	maskAllTransports = maskH2 | maskH2C | maskH3 | maskWT | maskMasque | maskGRPC
+	// maskTLSTransports is what the server's "all" compiles to: every TLS
+	// carrier family, never h2c. It mirrors the CLI's parseTransports("all")
+	// registration and prepareServerConfig forcing TLS for "all" — plaintext
+	// h2c stays reachable only through an explicit "h2c" configuration.
+	maskTLSTransports = maskH2 | maskH3 | maskWT | maskMasque | maskGRPC
 )
 
 type networkMask uint8
@@ -197,9 +202,16 @@ func compileRoutingPolicy(transport, network string) routingPolicy {
 	p := routingPolicy{ready: true}
 	normalized, err := normalizeTransportList(transport)
 	if err == nil {
-		if normalized == "" || normalized == transportAll {
+		switch normalized {
+		case "":
+			// Unconfigured (programmatic fallback): keep the permissive mask.
 			p.transports = maskAllTransports
-		} else {
+		case transportAll:
+			// "all" means every TLS carrier family — the same set the CLI
+			// registers and the same TLS-forcing rule prepareServerConfig
+			// applies. Cleartext h2c is never part of "all".
+			p.transports = maskTLSTransports
+		default:
 			for _, item := range strings.Split(normalized, ",") {
 				p.transports |= transportMaskFor(item)
 			}

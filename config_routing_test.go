@@ -225,6 +225,24 @@ func TestPrepareServerConfig(t *testing.T) {
 	}
 }
 
+// TestPrepareServerConfigAllIsTLSTransportFamily pins the compiled mask for
+// "all" to the TLS carrier set: the same transports the CLI registers and the
+// TLS rule prepareServerConfig applies. Cleartext h2c is never part of "all".
+func TestPrepareServerConfigAllIsTLSTransportFamily(t *testing.T) {
+	got, err := prepareServerConfig(serverConfig{Transport: transportAll})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.routingPolicy.allowsTransport(transportH2C) {
+		t.Fatal(`"all" compiled a policy that admits cleartext h2c`)
+	}
+	for _, carrier := range []string{transportH2, transportH3, transportWT, transportMasque, transportGRPC} {
+		if !got.routingPolicy.allowsTransport(carrier) {
+			t.Fatalf(`"all" should admit %q: policy %+v`, carrier, got.routingPolicy)
+		}
+	}
+}
+
 func TestBuildServerConfigHasCDNSafeDefault(t *testing.T) {
 	server, err := prepareServerConfig(buildServerConfig(&fileConfig{}))
 	if err != nil {
@@ -260,6 +278,9 @@ func TestStrictTransportRouting(t *testing.T) {
 		{name: "webtransport", allowed: "wt", method: http.MethodConnect, proto: "HTTP/3.0", major: 3, withTLS: true, wt: true, wantOK: true},
 		{name: "masque", allowed: "masque", method: http.MethodConnect, proto: "HTTP/3.0", major: 3, withTLS: true, masqueTCP: true, wantOK: true},
 		{name: "comma allow list", allowed: "h2,grpc", method: http.MethodPost, proto: "HTTP/2.0", major: 2, withTLS: true, content: "application/grpc", wantOK: true},
+		{name: "all rejects cleartext h2c", allowed: "all", method: http.MethodPost, proto: "HTTP/2.0", major: 2, wantOK: false},
+		{name: "all accepts tls h2", allowed: "all", method: http.MethodPost, proto: "HTTP/2.0", major: 2, withTLS: true, wantOK: true},
+		{name: "all accepts tls grpc", allowed: "all", method: http.MethodPost, proto: "HTTP/2.0", major: 2, withTLS: true, content: "application/grpc", wantOK: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
