@@ -206,6 +206,16 @@ func TestProtocolContinuousTransfers(t *testing.T) {
 							defer cancel()
 							c, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "bench-transfer")
 							if err != nil {
+								// One dial hiccup must not fail the transfer: a
+								// connect to a live local listener can be
+								// transiently refused under connection churn
+								// (the 2026-10 grpc/1 and 2026-11 h2c/1 Windows
+								// CI flakes both surfaced as HTTP 502 here).
+								// Retry once; a real failure repeats.
+								t.Logf("dial failed once, retrying: %v", err)
+								c, err = client.DialContext(ctx, h2tunnel.NetworkTCP, "bench-transfer")
+							}
+							if err != nil {
 								t.Error(err)
 								return
 							}

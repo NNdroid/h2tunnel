@@ -20,9 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -50,6 +52,35 @@ func (l *countedListener) Accept() (net.Conn, error) {
 	return c, err
 }
 
+// tbLogSink forwards slog diagnostics (server and client WARN/ERROR lines —
+// a tunnel rejection's underlying dial error, a session teardown) into the
+// test's own log section: without it the servers log through the discard
+// logger and a 502 arrives with its root cause invisible. The sink closes with
+// the env's last cleanup (registered before the server cleanups, so LIFO runs
+// it last); writes racing the test end are dropped under the same mutex, so
+// nothing can reach testing.TB after the test finished (which would panic).
+type tbLogSink struct {
+	mu   sync.Mutex
+	t    testing.TB
+	done bool
+}
+
+func (s *tbLogSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done {
+		return len(p), nil
+	}
+	s.t.Log(strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
+func (s *tbLogSink) close() {
+	s.mu.Lock()
+	s.done = true
+	s.mu.Unlock()
+}
+
 // protocolEnv is one shared test environment: real HTTP target + real DNS target +
 // TCP/UDP echo targets for throughput benchmarks + two tunnel servers, TLS / h2c
 // (h2c cannot share a listener with TLS, so they must be separate).
@@ -57,8 +88,9 @@ type protocolEnv struct {
 	httpListener *countedListener
 	dnsConn      net.PacketConn
 
-	tlsURL string // https://127.0.0.1:port
-	h2cURL string // http://127.0.0.1:port
+	logger  *slog.Logger // WARN/ERROR diagnostics from the servers and clients
+	tlsURL  string       // https://127.0.0.1:port
+	h2cURL  string       // http://127.0.0.1:port
 }
 
 // isBindForbidden reports whether a Windows excluded-port-range bind refusal occurred
@@ -124,6 +156,12 @@ func newProtocolEnvWithServerTuning(t testing.TB, tuning h2tunnel.ServerTuning) 
 	t.Helper()
 	env := &protocolEnv{}
 
+	// Registered FIRST so (cleanup LIFO) it closes LAST — after every server
+	// and client shutdown — closing the window for post-test log writes.
+	sink := &tbLogSink{t: t}
+	t.Cleanup(sink.close)
+	env.logger = slog.New(slog.NewTextHandler(sink, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
 	// —— real HTTP target: /iter-N returns hello-iter-N ——
 	rawHTTP, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -188,6 +226,7 @@ func newProtocolEnvWithServerTuning(t testing.TB, tuning h2tunnel.ServerTuning) 
 		Authenticator: authenticator,
 		Dialer:        dialer,
 		Tuning:        tuning,
+		Logger:        env.logger,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -213,6 +252,7 @@ func newProtocolEnvWithServerTuning(t testing.TB, tuning h2tunnel.ServerTuning) 
 		Authenticator: authenticator,
 		Dialer:        dialer,
 		Tuning:        tuning,
+		Logger:        env.logger,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -376,6 +416,7 @@ func newProtocolClientWithPaddingALPN(t testing.TB, env *protocolEnv, transport 
 		Transport:   transport,
 		TLSConfig:   tlsConfig,
 		Credentials: credentials,
+		Logger:      env.logger,
 		Tuning:      h2tunnel.ClientTuning{Padding: padding, MasqueALPN: masqueALPN},
 	})
 	if err != nil {
