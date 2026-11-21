@@ -73,42 +73,8 @@ func normalizeTransportList(value string) (string, error) {
 }
 
 // resolveClientTransport makes the transport string the client's single source of truth.
-func resolveClientTransport(cfg *fileConfig) (string, error) {
-	transport := canonicalTransport(cfg.Transport)
-	if transport == "" {
-		return transportH2, nil
-	}
-	if !validTransport(transport, false) {
-		return "", fmt.Errorf("unsupported client transport %q", cfg.Transport)
-	}
-	return transport, nil
-}
-
-func resolveClientEndpointTransport(cfg *fileConfig, serverURL string) (string, error) {
-	transport, err := resolveClientTransport(cfg)
-	if err != nil {
-		return "", err
-	}
-	lowerURL := strings.ToLower(strings.TrimSpace(serverURL))
-	isHTTP := strings.HasPrefix(lowerURL, "http://")
-	isHTTPS := strings.HasPrefix(lowerURL, "https://")
-	switch transport {
-	case transportH2:
-		if isHTTP {
-			return transportH2C, nil
-		}
-	case transportH2C:
-		if !isHTTP {
-			return "", fmt.Errorf("h2c requires an http:// server URL")
-		}
-	case transportH3, transportWT, transportMasque:
-		if !isHTTPS {
-			return "", fmt.Errorf("%s requires an https:// server URL", transport)
-		}
-	}
-	return transport, nil
-}
-
+// (Moved to config_file_test.go with the legacy file-config loader it serves;
+// the library API path goes through ClientOptions → NewClient instead.)
 func (cfg clientConfig) transportName() string {
 	transport := canonicalTransport(cfg.Transport)
 	if transport != "" {
@@ -332,10 +298,10 @@ type tunnelRequest struct {
 }
 
 func classifyTunnelRequest(r *http.Request, cfg serverConfig, wtAvailable bool) tunnelRequest {
-	// The bandwidth-exchange sentinel is matched on the raw header before
-	// getRequestDestination runs: an underscore-leading label is not a valid DNS
-	// name, and the destination resolver's fallback would otherwise substitute a
-	// real address (127.0.0.1:22) for it, turning a no-dial request into a dial.
+	// The bandwidth-exchange sentinel is matched on the raw header before generic
+	// classification: an underscore-leading label is not a valid DNS name and must
+	// not fall into the resume classification path, where it would be rejected as
+	// an ordinary (unusable) target.
 	if target := rawTunnelTarget(r); target == brutalBwExchangeTarget {
 		return tunnelRequest{kind: kindBrutalExchange, transport: resumeWireTransport(r), network: networkTCP, target: target}
 	}
@@ -374,17 +340,11 @@ func rawTunnelTarget(r *http.Request) string {
 
 // masqueRequestTarget resolves the MASQUE target: X-Target (logical service name
 // or address) first, then the RFC 9298 URI template. If neither yields a usable
-// target it returns an empty string and lets the handler reject the request.
-//
-// The legacy getXDst resolution is deliberately NOT consulted here, in either
-// direction. getXDst never returns an empty target: it substitutes 127.0.0.1:22
-// (tcp) or 127.0.0.1:53 (udp) for an empty OR invalid value. The old code read
-// that already-resolved value first, so a mistyped URI became a silent dial of
-// the server's own localhost SSH or DNS, and an X-Target the client mistyped
-// into garbage was replaced by the same loopback default. Both substitutes
-// cleared checkTargetIsAvailable and, over loopback, targetAllowedByRuntime's
-// LocalOnly check too, so no policy stopped them. The Brutal sentinel above is
-// guarded for exactly this reason; the MASQUE path was not.
+// target it returns an empty string and lets the handler reject the request —
+// the same fail-closed rule the legacy destination path now follows via
+// getRequestDestination. (Historically this path was fixed first: the old
+// resolver substituted the server's own loopback SSH/DNS for unusable targets,
+// which cleared both the availability and the local_only checks.)
 func masqueRequestTarget(protocol string, r *http.Request, cfg serverConfig) string {
 	target := strings.TrimSpace(r.Header.Get("X-Target"))
 	if target != "" {

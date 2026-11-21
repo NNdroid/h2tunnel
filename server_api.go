@@ -75,37 +75,48 @@ const (
 	h2MaxConcurrentStreams = 256
 )
 
+// validateServerOptions checks the required hooks and resolves the tuning
+// layer NewServer assembles into the runtime config: transport/network
+// allow-lists, the session window and the compiled padding/brutal policies.
+func validateServerOptions(options ServerOptions) (transportList, networkList string, windowKB int, padding paddingPolicy, brutal brutalPolicy, err error) {
+	if options.Authenticator == nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, errors.New("h2tunnel: ServerOptions.Authenticator is required")
+	}
+	if options.Dialer == nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, errors.New("h2tunnel: ServerOptions.Dialer is required")
+	}
+	transportList, err = normalizeServerTransports(options.Transports)
+	if err != nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, err
+	}
+	networkList, err = normalizeServerNetworks(options.Networks)
+	if err != nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, err
+	}
+	windowKB, err = windowBytesToKB(options.Tuning.SessionWindowBytes)
+	if err != nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, err
+	}
+	padding, err = compilePaddingPolicy(options.Tuning.Padding)
+	if err != nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, err
+	}
+	brutal, err = compileBrutalPolicy(options.Tuning.Brutal)
+	if err != nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, err
+	}
+	warnBrutalUnavailable(options.Logger, brutal)
+	if err = options.Tuning.QUICReceiveWindow.Validate(); err != nil {
+		return "", "", 0, paddingPolicy{}, brutalPolicy{}, err
+	}
+	return transportList, networkList, windowKB, padding, brutal, nil
+}
+
 // NewServer validates options and creates a server without opening sockets or
 // starting goroutines.
 func NewServer(options ServerOptions) (*Server, error) {
-	if options.Authenticator == nil {
-		return nil, errors.New("h2tunnel: ServerOptions.Authenticator is required")
-	}
-	if options.Dialer == nil {
-		return nil, errors.New("h2tunnel: ServerOptions.Dialer is required")
-	}
-	transportList, err := normalizeServerTransports(options.Transports)
+	transportList, networkList, windowKB, padding, brutal, err := validateServerOptions(options)
 	if err != nil {
-		return nil, err
-	}
-	networkList, err := normalizeServerNetworks(options.Networks)
-	if err != nil {
-		return nil, err
-	}
-	windowKB, err := windowBytesToKB(options.Tuning.SessionWindowBytes)
-	if err != nil {
-		return nil, err
-	}
-	padding, err := compilePaddingPolicy(options.Tuning.Padding)
-	if err != nil {
-		return nil, err
-	}
-	brutal, err := compileBrutalPolicy(options.Tuning.Brutal)
-	if err != nil {
-		return nil, err
-	}
-	warnBrutalUnavailable(options.Logger, brutal)
-	if err := options.Tuning.QUICReceiveWindow.Validate(); err != nil {
 		return nil, err
 	}
 

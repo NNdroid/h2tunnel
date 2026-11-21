@@ -97,20 +97,8 @@ func TestConfigPaddingValidationAndEnvironment(t *testing.T) {
 	if cfg.Padding != (paddingConfig{MinRecordBytes: 600, MaxRecordBytes: 1200}) {
 		t.Fatalf("padding = %+v", cfg.Padding)
 	}
-
-	for _, padding := range []paddingConfig{
-		{MaxRecordBytes: 1200},
-		{MinRecordBytes: 16, MaxRecordBytes: 600},
-		{MinRecordBytes: 600, MaxRecordBytes: 599},
-		{MinRecordBytes: 600, MaxRecordBytes: 607},
-		{MinRecordBytes: 600, MaxRecordBytes: 65536},
-		{MinRecordBytes: 65528},
-	} {
-		cfg := config{Mode: "server", Padding: padding}
-		if err := cfg.validate(); err == nil {
-			t.Fatalf("validate accepted padding %+v", padding)
-		}
-	}
+	// The range table itself lives in the library (compilePaddingPolicy, re-run
+	// at NewServer/NewClient); the CLI no longer mirrors it.
 }
 
 func TestConfigBrutalSectionAndValidation(t *testing.T) {
@@ -170,7 +158,9 @@ func TestConfigBrutalSectionAndValidation(t *testing.T) {
 		t.Fatalf("cwnd_gain 0 must stay 0 for the library to default it: %+v", got)
 	}
 
-	reject(t, mk(`"brutal":{"cwnd_gain":`+strconv.Itoa(brutalCwndGainMax+1)+`}`))
+	// Range rules moved to the library (compileBrutalPolicy at NewServer), but
+	// negative JSON values into the uint fields are still rejected — by the
+	// decoder, before any validate runs.
 	reject(t, mk(`"brutal":{"cwnd_gain":-1}`))
 	reject(t, mk(`"brutal":{"rate_bytes":-1}`))
 
@@ -270,11 +260,17 @@ func TestConfigBrutalEnvironment(t *testing.T) {
 			t.Fatalf("%s=%s was accepted", tc.env, tc.value)
 		}
 	}
-	// A gain above the library's bound is a parseable uint32, so it is caught
-	// by validate rather than by ParseUint.
-	t.Setenv("H2TUNNEL_BRUTAL_CWND_GAIN", strconv.Itoa(brutalCwndGainMax+1))
-	if _, err := loadConfig(path); err == nil {
-		t.Fatal("a cwnd_gain above the bound was accepted")
+	// A gain above the library's bound is a parseable uint32, so it passes
+	// loadConfig and is caught by NewServer's compileBrutalPolicy instead —
+	// the CLI no longer mirrors that bound. The invalid loop above poisoned
+	// every BRUTAL_* env value; reset them all before this load.
+	t.Setenv("H2TUNNEL_BRUTAL_ENABLED", "true")
+	t.Setenv("H2TUNNEL_BRUTAL_NEGOTIATE", "true")
+	t.Setenv("H2TUNNEL_BRUTAL_RATE_BYTES", "1")
+	t.Setenv("H2TUNNEL_BRUTAL_GROUP_ID", "1")
+	t.Setenv("H2TUNNEL_BRUTAL_CWND_GAIN", strconv.Itoa(1001))
+	if _, err := loadConfig(path); err != nil {
+		t.Fatalf("a parseable cwnd_gain must load; NewServer rejects it later: %v", err)
 	}
 }
 
@@ -341,6 +337,30 @@ func TestWarnGrpcPlaintext(t *testing.T) {
 	for _, tt := range cases {
 		if got := warnGrpcPlaintext(tt.transport, tt.tlsEnabled); got != tt.want {
 			t.Fatalf("warnGrpcPlaintext(%q, %v) = %v, want %v", tt.transport, tt.tlsEnabled, got, tt.want)
+		}
+	}
+}
+
+func TestWarnH2CToken(t *testing.T) {
+	cases := []struct {
+		transport  string
+		tlsEnabled bool
+		hasToken   bool
+		want       bool
+	}{
+		{"h2c", false, true, true},
+		{"H2C", false, true, true},
+		{"h2c", false, false, false},
+		{"h2c", true, true, false},
+		{"h2c,grpc", false, true, true},
+		{"grpc", false, true, false},
+		{"h2", false, true, false},
+		{"all", false, true, false},
+		{"", false, true, false},
+	}
+	for _, tt := range cases {
+		if got := warnH2CToken(tt.transport, tt.tlsEnabled, tt.hasToken); got != tt.want {
+			t.Fatalf("warnH2CToken(%q, %v, %v) = %v, want %v", tt.transport, tt.tlsEnabled, tt.hasToken, got, tt.want)
 		}
 	}
 }

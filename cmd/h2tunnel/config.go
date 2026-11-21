@@ -94,48 +94,12 @@ func (b brutalConfig) tuning() h2tunnel.BrutalTuning {
 	}
 }
 
-// brutalCwndGainMax mirrors brutalMaxCwndGain in the library. The library
-// re-checks at NewClient/NewServer and fails loudly either way, so a drift here
-// only weakens this early, config-load-time message.
-const brutalCwndGainMax = 1000
-
-// validate applies the same range rule the library enforces, so a bad value is
-// reported at config load instead of at NewClient/NewServer.
-func (b brutalConfig) validate() error {
-	if b.CwndGain == 0 {
-		return nil // 0 selects the 1.5x default
-	}
-	if b.CwndGain > brutalCwndGainMax {
-		return fmt.Errorf("brutal.cwnd_gain must be between 1 and %d tenths, got %d", brutalCwndGainMax, b.CwndGain)
-	}
-	return nil
-}
-
-func (p paddingConfig) validate() error {
-	if p.MinRecordBytes < 0 || p.MaxRecordBytes < 0 {
-		return errors.New("padding record sizes must be non-negative")
-	}
-	if p.MinRecordBytes == 0 {
-		if p.MaxRecordBytes != 0 {
-			return errors.New("padding max_record_bytes requires min_record_bytes")
-		}
-		return nil
-	}
-	if p.MinRecordBytes <= 16 || p.MinRecordBytes > 65527 {
-		return errors.New("padding min_record_bytes must be between 17 and 65527")
-	}
-	maxBytes := p.MaxRecordBytes
-	if maxBytes == 0 {
-		maxBytes = p.MinRecordBytes + p.MinRecordBytes/4
-		if maxBytes > 65535 {
-			maxBytes = 65535
-		}
-	}
-	if maxBytes > 65535 || maxBytes-p.MinRecordBytes < 8 {
-		return errors.New("padding max_record_bytes must be at least 8 bytes above min_record_bytes and not exceed 65535")
-	}
-	return nil
-}
+// Padding and brutal range rules live in the library alone (compilePaddingPolicy /
+// compileBrutalPolicy, enforced again at NewServer/NewClient): hand-mirroring
+// them here drifted twice already — the constants hard-coded as literals and the
+// negotiate default diverging between the two loaders. A bad value now fails at
+// NewServer/NewClient startup with the library's message instead of a
+// config-load-time duplicate.
 
 func loadConfig(path string) (*config, error) {
 	data, err := os.ReadFile(path)
@@ -190,12 +154,8 @@ func (cfg *config) validate() error {
 	if cfg.SessionMax < 0 || cfg.SessionMaxPerPrincipal < 0 {
 		return errors.New("session_max and session_max_per_principal must be non-negative (0 selects the built-in default)")
 	}
-	if err := cfg.Padding.validate(); err != nil {
-		return err
-	}
-	if err := cfg.Brutal.validate(); err != nil {
-		return err
-	}
+	// Padding/brutal ranges are the library's rules (see the note above the
+	// constants they used to mirror); NewServer/NewClient fail loudly on them.
 	if err := cfg.QUICReceiveWindow.Validate(); err != nil {
 		return err
 	}
