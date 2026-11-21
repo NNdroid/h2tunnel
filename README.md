@@ -483,7 +483,7 @@ of directives to write:
 | --- | --- |
 | `X-Auth-Token` or `Authorization: Bearer <token>` | Authentication. The client sends both, so either surviving is enough. Strip them and every dial dies with 401. |
 | `X-Tunnel-Proto`, `X-Session-ID`, `X-Resume-Version`, `X-Resume-Caps`, `X-Resume-Params`, `X-Resume-Role` | The resume/2 handshake, read before any data flows. A proxy that rewrites them produces 426/400 errors instead of a tunnel. |
-| `X-Network`, `X-Target` | Routing. Missing or altered, the legacy resolver silently falls back to a default target (`127.0.0.1:22` for TCP, `127.0.0.1:53` for UDP) instead of your destination — the most misleading failure mode in this list. `masque` does not: it resolves only from `X-Target` (an address, or a logical name registered with `ServerOptions.Dialer`) and then the RFC 9298 URI template (`/tunnel/tcp/<host>/<port>`), and an unresolvable target is rejected with 403. The fallback is refused there on purpose, because it dials the server's own loopback and clears both the availability check and the `local_only` check over loopback. |
+| `X-Network`, `X-Target` | Routing. A missing or unusable `X-Target` is rejected with 403 (fail-closed). The historical silent fallback to a default target (`127.0.0.1:22` for TCP, `127.0.0.1:53` for UDP) is gone: it dialed the server's own loopback and cleared both the availability check and the `local_only` check over loopback. `masque` additionally resolves logical names registered with `ServerOptions.Dialer` and the RFC 9298 URI template (`/tunnel/tcp/<host>/<port>`); an unresolvable target is likewise rejected with 403. |
 | `X-Client-Group` | Brutal connection-group derivation. Losing it degrades grouping from per-client to per-session granularity, so adding links multiplies the allowance instead of sharing one bucket. |
 | `X-Brutal-Offer`, `X-Brutal-Params` | TCP Brutal negotiation. The 16-byte replay-prevention nonce is a field inside these two values, not a header of its own. |
 | `Content-Length`, `Content-Type`, `Accept-Encoding: identity` | Must not be re-chunked or re-encoded; keep `proxy_request_buffering off` and `gzip off`. |
@@ -541,7 +541,7 @@ The heartbeat interval must be smaller than the shortest idle timeout on the pat
 }
 ```
 
-When `cert` and `key` are both empty, the CLI generates an in-process self-signed certificate; for public production origins provide a real certificate. `local_only: true` resolves the target host and rejects any non-loopback address, reducing SSRF risk.
+When `cert` and `key` are both empty, the CLI generates an in-process self-signed certificate; for public production origins provide a real certificate. `local_only: true` resolves the target host and rejects any non-loopback address, reducing SSRF risk. The default dialer additionally refuses link-local targets (169.254.0.0/16, fe80::/10 — the cloud-metadata endpoint lives there) even when `local_only` is off, and the server logs a startup WARN while `local_only` is disabled; embedders who genuinely need a link-local target supply their own `ServerOptions.Dialer`.
 
 ### Client configuration
 
@@ -625,8 +625,8 @@ Config parsing is strict: unknown fields, removed fields, wrong types, and field
 | `session_max` | server | `4096` | cap on concurrent resume sessions. Bounds memory under a flood of distinct (never-resumed) session ids. `0` selects the built-in default; values above the hard cap are clamped, not rejected |
 | `session_max_per_principal` | server | `256` | per-principal session cap, so one principal cannot consume the whole table. `0` selects the built-in default |
 | `handshake_ack_ms` | client | `3000` | data-plane handshake ack timeout |
-| `keepalive_sec` | client | `15` | session/backup-line keepalive interval |
-| `standby_connections` | client | `0` | number of hot standby connections |
+| `keepalive_sec` | client | `15` | session/backup-line keepalive interval; `1..300` (aligned with the heartbeat ceiling), the server holds a backup lane for at most 3× this |
+| `standby_connections` | client | `0` | number of hot standby connections; `0..32` — each is a full backup lane holding a probe stream on the server, and the per-principal probe quota is also 32 |
 | `drain_timeout_sec` | shared | `30` | seconds to wait for existing sessions at exit |
 | `log_level` | shared | `info` | `debug`, `info`, `warn`, `error` |
 
@@ -695,6 +695,8 @@ h2tunnel gen-nginx -domain tunnel.example.com -path /tunnel -backend 127.0.0.1:8
 h2tunnel gen-systemd -bin /usr/local/bin/h2tunnel -listen :8443 -path /tunnel -token 'TOKEN'
 h2tunnel gen-uri -host tunnel.example.com -port 443 -path /tunnel -token 'TOKEN'
 ```
+
+`gen-uri` defaults to a verified URI (`insecure=false`); passing `-insecure` embeds `insecure=1` — recipients then skip TLS verification, so the tunnel is readable to anyone on the path, and the command prints a warning. The generated PIN is the only gate on an offline brute force of a captured `stun://` URI, so it is now 9 digits (numeric, unchanged wire format; the PBKDF2 iteration count stays pinned by the Stun Android/TV reference implementation).
 
 ## Performance and reliability
 
