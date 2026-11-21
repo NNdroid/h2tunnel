@@ -46,6 +46,12 @@ const (
 	TunnelDeathDataGap = "data gap"
 	// TunnelDeathCanceled: the caller's context was canceled or the Client closed.
 	TunnelDeathCanceled = "canceled"
+	// TunnelDeathTargetDenied: the server denied the target with 403 (policy,
+	// registry or local_only does not include the address).
+	TunnelDeathTargetDenied = "target denied"
+	// TunnelDeathStreamError: the stream broke for a cause not covered by the
+	// specific constants above.
+	TunnelDeathStreamError = "stream error"
 )
 
 // ClientEvent is the client event payload.
@@ -180,13 +186,13 @@ func tunnelDeathReason(ctxErr error, err error) (reason string, cause error) {
 	case errors.Is(err, ErrUnauthenticated):
 		return TunnelDeathAuthRejected, err
 	case errors.Is(err, ErrForbidden):
-		return "target denied", err
+		return TunnelDeathTargetDenied, err
 	case errors.Is(err, errGap):
 		return TunnelDeathDataGap, err
 	case errors.Is(err, errResumeAttemptsExhausted):
 		return TunnelDeathMaxRetries, err
 	}
-	return "stream error", err
+	return TunnelDeathStreamError, err
 }
 
 // errResumeAttemptsExhausted: a TCP/WT session exhausted its redial attempts.

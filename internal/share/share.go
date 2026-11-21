@@ -98,11 +98,15 @@ func Generate(transport, host, port, path, target, token, serverName, name, pin 
 
 func encrypt(plain []byte, pin string) (string, string, error) {
 	if pin == "" {
-		value, err := rand.Int(rand.Reader, big.NewInt(1000000))
+		// 9 digits, mirroring h2tunnel.generateRandomPIN: the PIN is the only
+		// gate on the offline brute force of a captured URI, and its length is
+		// invisible to the stun:// format (it travels out-of-band and keys
+		// PBKDF2 on both sides).
+		value, err := rand.Int(rand.Reader, big.NewInt(1000000000))
 		if err != nil {
 			return "", "", err
 		}
-		pin = fmt.Sprintf("%06d", value.Int64())
+		pin = fmt.Sprintf("%09d", value.Int64())
 	}
 	raw := plain
 	var compressed bytes.Buffer

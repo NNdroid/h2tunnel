@@ -135,6 +135,12 @@ func runServer(cfg *config, logger *slog.Logger) error {
 	if warnGrpcPlaintext(cfg.Transport, serverTLS != nil) {
 		logger.Warn("⚠️ transport \"grpc\" without TLS serves plaintext HTTP/2; CDNs only forward gRPC over TLS — keep plaintext grpc for local development only")
 	}
+	// h2c is the same plaintext shape as the grpc warning above, but the risk is
+	// sharper: the auth token rides X-Auth-Token / Authorization headers in
+	// cleartext, so anyone on the wire reads it directly.
+	if warnH2CToken(cfg.Transport, serverTLS != nil, cfg.Token != "") {
+		logger.Warn("⚠️ transport \"h2c\" serves plaintext HTTP/2 with a token configured: X-Auth-Token and Authorization ride the wire in cleartext — use a TLS transport on any link that is not loopback-only")
+	}
 	// An empty token is a documented default (the bare config must stay usable
 	// for local development), so it is not a validation error. But it is the
 	// difference between an authenticated tunnel and an open one: every request
@@ -143,6 +149,14 @@ func runServer(cfg *config, logger *slog.Logger) error {
 	// group. Say it at startup instead of letting it look deliberate later.
 	if cfg.Token == "" {
 		logger.Warn("⚠️ no token set: every request authenticates as \"anonymous\". Set token or H2TUNNEL_TOKEN before exposing the listener.")
+	}
+	// local_only defaults to false, and turning it off is exactly how a tunnel
+	// becomes an open relay onto the server's own network: every authenticated
+	// client can dial anything the server can reach. The default dialer refuses
+	// link-local (cloud-metadata) targets, but private ranges stay reachable by
+	// design — say the posture at startup instead of letting it look deliberate.
+	if !cfg.LocalOnly {
+		logger.Warn("⚠️ local_only is disabled: clients may dial any address the server can reach (private networks included; link-local/metadata targets are still refused)")
 	}
 	auth := h2tunnel.Authenticator(func(context.Context, *http.Request) (h2tunnel.Principal, error) {
 		return h2tunnel.Principal{ID: "anonymous"}, nil
@@ -433,22 +447,40 @@ func serveUntilSignal(server *h2tunnel.Server, address string, drain time.Durati
 	return <-serveErr
 }
 
+// directTargetDialer is the CLI's default target dialer. Two policies apply:
+//
+//   - local_only=true resolves the target host and requires every resolved IP
+//     to be loopback — the SSRF boundary for a server that should only forward
+//     to its own services.
+//   - Link-local addresses (169.254.0.0/16, fe80::/10) are refused regardless
+//     of local_only: the cloud-metadata endpoint (169.254.169.254) lives there,
+//     so a tunnel that forwards to "anywhere" would otherwise hand every
+//     authenticated client a working instance-credential oracle. Embedders who
+//     really need a link-local target supply their own TargetDialer.
+//
+// The dial always uses the resolved IP, so the address that was checked is
+// exactly the address that gets dialed (no check-then-resolve window).
 func directTargetDialer(localOnly bool) h2tunnel.TargetDialer {
 	return func(ctx context.Context, request h2tunnel.DialRequest) (net.Conn, error) {
 		network := string(request.Network)
 		if network != h2tunnel.NetworkTCP && network != h2tunnel.NetworkUDP {
 			return nil, h2tunnel.ErrUnsupportedNetwork
 		}
+		host, port, err := net.SplitHostPort(request.Target)
+		if err != nil {
+			return nil, h2tunnel.ErrForbidden
+		}
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil || len(ips) == 0 {
+			return nil, h2tunnel.ErrForbidden
+		}
+		for _, ip := range ips {
+			if ip.IP.IsLinkLocalUnicast() {
+				return nil, h2tunnel.ErrForbidden
+			}
+		}
 		address := request.Target
 		if localOnly {
-			host, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, h2tunnel.ErrForbidden
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil || len(ips) == 0 {
-				return nil, h2tunnel.ErrForbidden
-			}
 			for _, ip := range ips {
 				if !ip.IP.IsLoopback() {
 					return nil, h2tunnel.ErrForbidden
@@ -466,6 +498,14 @@ func directTargetDialer(localOnly bool) h2tunnel.TargetDialer {
 // outside local development, and — unlike h2 — the CLI forces no TLS for grpc.
 func warnGrpcPlaintext(transport string, tlsEnabled bool) bool {
 	return strings.TrimSpace(strings.ToLower(transport)) == "grpc" && !tlsEnabled
+}
+
+// warnH2CToken reports whether a cleartext h2c listener carries an auth token:
+// the token rides X-Auth-Token / Authorization headers in plaintext, so anyone
+// on the wire can read it. h2c cannot coexist with TLS transports, so any
+// "h2c" in the list means a plaintext leg.
+func warnH2CToken(transport string, tlsEnabled, hasToken bool) bool {
+	return !tlsEnabled && hasToken && strings.Contains(strings.ToLower(transport), "h2c")
 }
 
 func serverTLSConfig(cfg *config) (*tls.Config, error) {
@@ -549,7 +589,7 @@ func runGenURI(args []string) error {
 	token := fs.String("token", "", "token")
 	sni := fs.String("sni", "", "TLS server name")
 	remark := fs.String("name", "H2Tunnel Node", "node name")
-	insecure := fs.Bool("insecure", true, "skip TLS verification")
+	insecure := fs.Bool("insecure", false, "embed insecure=1 (recipients skip TLS verification; the tunnel becomes MITM-readable) — only for self-signed testing")
 	pin := fs.String("pin", "", "sharing PIN")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -589,6 +629,9 @@ func runGenURI(args []string) error {
 	uri, usedPIN, direct, err := share.Generate(*transport, *host, *port, *path, *target, *token, *sni, *remark, *pin, *insecure)
 	if err != nil {
 		return err
+	}
+	if *insecure {
+		fmt.Println("⚠️ insecure=1 written into the URI: recipients will skip TLS verification, so the tunnel is readable to anyone on the path. Prefer a publicly trusted certificate.")
 	}
 	fmt.Printf("Encrypted Stun URI:\n%s\n\nPIN: %s\n\nDirect URI:\n%s\n", uri, usedPIN, direct)
 	return nil

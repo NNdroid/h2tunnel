@@ -106,6 +106,17 @@ func handleH2StreamResumeServer(w http.ResponseWriter, r *http.Request, sessionI
 	// HANDSHAKE-ACK, failing the probe handshake. So probe lanes must skip target
 	// dialing and session creation.
 	if isBackup {
+		// Probe streams skip the session table entirely (no dial, no business
+		// session), so the session caps never bound them — the per-principal
+		// quota is their only bound on goroutine + frame-buffer cost.
+		principalID := requestState(r).principal.ID
+		if !sessions.acquireProbeStream(principalID) {
+			lgWarnf(sessions.lg(), "[%s] 🚫 probe-stream quota exhausted for principal %q, refusing the stream", sessionID, principalID)
+			http.Error(w, "probe stream quota exceeded", http.StatusTooManyRequests)
+			return
+		}
+		defer sessions.releaseProbeStream(principalID)
+
 		flusher, _ := w.(http.Flusher)
 		writer := &resumeSessionWriter{w: w, flusher: flusher, padding: cfg.Padding}
 		defer writer.close()

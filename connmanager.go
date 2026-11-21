@@ -40,6 +40,12 @@ const (
 	primaryDialDefault     = 30 * time.Second // default primary redial throttle
 	backupDialDefault      = 15 * time.Second // default backup refill throttle
 	defaultBackupMissedAck = 3
+	// maxStandbyConnections caps ClientTuning.StandbyConnections: each standby
+	// is a full backup lane holding a probe stream on the server for up to 3×
+	// the keepalive interval, and hot standbys beyond a handful add nothing to
+	// failover. Matches the server-side maxProbeStreamsPerPrincipal, so one
+	// client cannot exhaust a principal's whole probe budget by itself.
+	maxStandbyConnections = 32
 	// manager monitor and establish-check period
 	connManagerTick = 200 * time.Millisecond
 	// max time PickClient waits for a given type's primary lane to establish

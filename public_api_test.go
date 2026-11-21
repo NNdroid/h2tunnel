@@ -136,6 +136,13 @@ func TestPublicAPIDialReportsAuthenticationFailure(t *testing.T) {
 	if _, err := client.DialContext(ctx, h2tunnel.NetworkTCP, "forbidden"); err == nil {
 		t.Fatal("DialContext unexpectedly succeeded")
 	}
+	// The documented auth-failure counter must actually move: the increment is
+	// synchronous with the 401, so it is observable as soon as the dial fails.
+	// The counter counts rejected *requests*, and one dial can carry more than
+	// one (probe lane + data lane), so only the nonzero direction is pinned.
+	if got := server.Stats().AuthFailures.Load(); got < 1 {
+		t.Fatalf("AuthFailures = %d after rejected request(s), want >= 1", got)
+	}
 }
 
 func TestPublicAPIRequiresSecureServerHooks(t *testing.T) {

@@ -50,15 +50,19 @@ type Client struct {
 	activeWG  sync.WaitGroup
 }
 
-// NewClient validates options without performing network I/O.
-func NewClient(options ClientOptions) (*Client, error) {
+// normalizeClientOptions validates ClientOptions and resolves everything the
+// runtime config needs — endpoint/transport/carrier rules, the compiled
+// padding/brutal policies, the window and cadence defaults, the TLS config, the
+// uTLS camouflage adapter and the MASQUE carrier pin — without any network I/O
+// or goroutine work. NewClient keeps only the Client wiring.
+func normalizeClientOptions(options ClientOptions) (cfg clientConfig, tlsConfig *tls.Config, camouflage *tlsCamouflage, masquePinned *atomic.Bool, logger *slog.Logger, err error) {
 	endpoint := strings.TrimSpace(options.Endpoint)
 	if endpoint == "" {
-		return nil, errors.New("h2tunnel: ClientOptions.Endpoint is required")
+		return cfg, nil, nil, nil, nil, errors.New("h2tunnel: ClientOptions.Endpoint is required")
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, fmt.Errorf("h2tunnel: invalid endpoint %q", endpoint)
+		return cfg, nil, nil, nil, nil, fmt.Errorf("h2tunnel: invalid endpoint %q", endpoint)
 	}
 	transport := strings.ToLower(strings.TrimSpace(string(options.Transport)))
 	if transport == "" {
@@ -69,70 +73,72 @@ func NewClient(options ClientOptions) (*Client, error) {
 		}
 	}
 	if !validTransport(transport, false) {
-		return nil, fmt.Errorf("%w: %q", ErrUnsupportedTransport, transport)
+		return cfg, nil, nil, nil, nil, fmt.Errorf("%w: %q", ErrUnsupportedTransport, transport)
 	}
 	if transport == transportH2C && u.Scheme != "http" {
-		return nil, errors.New("h2tunnel: h2c requires an http:// endpoint")
+		return cfg, nil, nil, nil, nil, errors.New("h2tunnel: h2c requires an http:// endpoint")
 	}
 	if transport == transportH2 && u.Scheme != "https" {
-		return nil, errors.New("h2tunnel: h2 requires an https:// endpoint; use h2c for cleartext")
+		return cfg, nil, nil, nil, nil, errors.New("h2tunnel: h2 requires an https:// endpoint; use h2c for cleartext")
 	}
 	if u.Scheme == "http" && options.TLSConfig != nil {
-		return nil, errors.New("h2tunnel: TLSConfig has no effect with an http:// endpoint")
+		return cfg, nil, nil, nil, nil, errors.New("h2tunnel: TLSConfig has no effect with an http:// endpoint")
 	}
 	if (transport == transportH3 || transport == transportWT || transport == transportMasque) && u.Scheme != "https" {
-		return nil, fmt.Errorf("h2tunnel: %s requires an https:// endpoint", transport)
+		return cfg, nil, nil, nil, nil, fmt.Errorf("h2tunnel: %s requires an https:// endpoint", transport)
 	}
 	alpn := strings.ToLower(strings.TrimSpace(options.Tuning.MasqueALPN))
 	if alpn != "" {
 		if transport != transportMasque {
-			return nil, errors.New("h2tunnel: MasqueALPN is only meaningful with Transport=masque")
+			return cfg, nil, nil, nil, nil, errors.New("h2tunnel: MasqueALPN is only meaningful with Transport=masque")
 		}
 		if alpn != alpnH2 && alpn != alpnH3 {
-			return nil, fmt.Errorf("h2tunnel: MasqueALPN must be %q or %q, got %q", alpnH2, alpnH3, options.Tuning.MasqueALPN)
+			return cfg, nil, nil, nil, nil, fmt.Errorf("h2tunnel: MasqueALPN must be %q or %q, got %q", alpnH2, alpnH3, options.Tuning.MasqueALPN)
 		}
 	}
-	var camouflage *tlsCamouflage
 	if fp := strings.ToLower(strings.TrimSpace(options.UtlxFingerprint)); fp != "" {
 		if u.Scheme == "http" {
-			return nil, errors.New("h2tunnel: UtlxFingerprint has no effect with an http:// endpoint (no TLS to camouflage)")
+			return cfg, nil, nil, nil, nil, errors.New("h2tunnel: UtlxFingerprint has no effect with an http:// endpoint (no TLS to camouflage)")
 		}
 		if transport == transportH3 || transport == transportWT || transport == transportMasque {
-			return nil, fmt.Errorf("h2tunnel: UtlxFingerprint is not supported by %s (QUIC performs TLS internally)", transport)
+			return cfg, nil, nil, nil, nil, fmt.Errorf("h2tunnel: UtlxFingerprint is not supported by %s (QUIC performs TLS internally)", transport)
 		}
-		cam, err := resolveUTLSFingerprint(fp)
-		if err != nil {
-			return nil, err
+		cam, camErr := resolveUTLSFingerprint(fp)
+		if camErr != nil {
+			return cfg, nil, nil, nil, nil, camErr
 		}
 		camouflage = cam
 	}
 	if options.Tuning.StandbyConnections < 0 {
-		return nil, errors.New("h2tunnel: StandbyConnections must be non-negative")
+		return cfg, nil, nil, nil, nil, errors.New("h2tunnel: StandbyConnections must be non-negative")
+	}
+	if options.Tuning.StandbyConnections > maxStandbyConnections {
+		return cfg, nil, nil, nil, nil, fmt.Errorf("h2tunnel: StandbyConnections must be between 0 and %d — each standby is a full backup lane holding a probe stream on the server for up to 3× the keepalive interval", maxStandbyConnections)
 	}
 	if options.Tuning.DatagramQueueSize < 0 || options.Tuning.DatagramQueueSize > 65536 {
-		return nil, errors.New("h2tunnel: DatagramQueueSize must be between 0 and 65536")
+		return cfg, nil, nil, nil, nil, errors.New("h2tunnel: DatagramQueueSize must be between 0 and 65536")
 	}
 	if transport == transportWT && options.Tuning.StandbyConnections != 0 {
-		return nil, errors.New("h2tunnel: StandbyConnections is not supported by WebTransport")
+		return cfg, nil, nil, nil, nil, errors.New("h2tunnel: StandbyConnections is not supported by WebTransport")
 	}
 	padding, err := compilePaddingPolicy(options.Tuning.Padding)
 	if err != nil {
-		return nil, err
+		return cfg, nil, nil, nil, nil, err
 	}
 	brutal, err := compileBrutalPolicy(options.Tuning.Brutal)
 	if err != nil {
-		return nil, err
+		return cfg, nil, nil, nil, nil, err
 	}
 	warnBrutalUnavailable(options.Logger, brutal)
 	if err := options.Tuning.QUICReceiveWindow.Validate(); err != nil {
-		return nil, err
+		return cfg, nil, nil, nil, nil, err
 	}
 	if options.Tuning.H2StreamReceiveWindowBytes < 0 {
-		return nil, fmt.Errorf("h2tunnel: H2StreamReceiveWindowBytes must be non-negative")
+		return cfg, nil, nil, nil, nil, fmt.Errorf("h2tunnel: H2StreamReceiveWindowBytes must be non-negative")
 	}
 	windowKB, err := windowBytesToKB(options.Tuning.SessionWindowBytes)
 	if err != nil {
-		return nil, err
+		return cfg, nil, nil, nil, nil, err
 	}
 	heartbeat := options.Tuning.HeartbeatInterval
 	if heartbeat == 0 {
@@ -144,14 +150,13 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	keepaliveSec, err := durationSeconds(options.Tuning.KeepaliveInterval, defaultKeepaliveSec, maxKeepaliveSec, "KeepaliveInterval")
 	if err != nil {
-		return nil, err
+		return cfg, nil, nil, nil, nil, err
 	}
 	handshakeMs, err := durationMilliseconds(options.Tuning.HandshakeTimeout, defaultHandshakeAckMs, maxHandshakeAckMs, "HandshakeTimeout")
 	if err != nil {
-		return nil, err
+		return cfg, nil, nil, nil, nil, err
 	}
 
-	var tlsConfig *tls.Config
 	if u.Scheme == "https" {
 		if options.TLSConfig != nil {
 			tlsConfig = options.TLSConfig.Clone()
@@ -159,12 +164,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 			tlsConfig = &tls.Config{}
 		}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	logger := options.Logger
+	logger = options.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	cfg := clientConfig{
+	cfg = clientConfig{
 		QUICReceiveWindow:     options.Tuning.QUICReceiveWindow,
 		H2StreamReceiveWindow: resolveH2StreamReceiveWindow(options.Tuning.H2StreamReceiveWindowBytes),
 		ServerUrl:             strings.TrimRight(endpoint, "/"),
@@ -210,10 +214,19 @@ func NewClient(options ClientOptions) (*Client, error) {
 		cfg.ServerName = tlsConfig.ServerName
 	}
 	// auto carrier needs a pin bit shared across lanes (a rebuild creates a new transport).
-	var masquePinned *atomic.Bool
 	if transport == transportMasque && alpn == "" {
 		masquePinned = &atomic.Bool{}
 	}
+	return cfg, tlsConfig, camouflage, masquePinned, logger, nil
+}
+
+// NewClient validates options without performing network I/O.
+func NewClient(options ClientOptions) (*Client, error) {
+	cfg, tlsConfig, camouflage, masquePinned, logger, err := normalizeClientOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	ret := &Client{
 		cfg:          cfg,
 		masquePinned: masquePinned,
@@ -606,7 +619,7 @@ func (c *Client) DialContext(ctx context.Context, network, target string) (net.C
 					Target:    target,
 					Network:   NetworkTCP,
 					Transport: dialCfg.transportValue(),
-					Reason:    "target denied",
+					Reason:    TunnelDeathTargetDenied,
 					Err:       err,
 				})
 			}
@@ -712,7 +725,7 @@ func (c *Client) DialPacketContext(ctx context.Context, network, target string) 
 					Target:    target,
 					Network:   NetworkUDP,
 					Transport: dialCfg.transportValue(),
-					Reason:    "target denied",
+					Reason:    TunnelDeathTargetDenied,
 					Err:       err,
 				})
 			}

@@ -102,15 +102,18 @@ func dialClientSettings(t *testing.T, windowBytes int) (initialWindow, maxFrame 
 	return 0, 0
 }
 
-// Zero keeps the x/net stock behavior: 4MiB per-stream window, spec-default
-// frame size, and no bound net/http Transport.
+// Zero keeps the x/net stock behavior: 4MiB per-stream window and the stock
+// frame size, with no bound net/http Transport.
 func TestH2StreamWindowDefaultUnchanged(t *testing.T) {
 	initialWindow, maxFrame := dialClientSettings(t, 0)
 	if initialWindow != uint32(h2StreamWindowDefault) {
 		t.Fatalf("default initial window %d, want the x/net 4MiB default", initialWindow)
 	}
-	if maxFrame != 0 && maxFrame != 16384 {
-		t.Fatalf("default MAX_FRAME_SIZE %d, want spec default 16384 (or absent)", maxFrame)
+	// x/net ≥ v0.59 unconditionally advertises SettingMaxFrameSize carrying its
+	// defaultMaxReadFrameSize (1 MiB); older stacks sent nothing (spec default
+	// 16384). Both are the stock behavior this test pins.
+	if maxFrame != 0 && maxFrame != 16384 && maxFrame != 1<<20 {
+		t.Fatalf("default MAX_FRAME_SIZE %d, want spec default 16384, absent, or the x/net 1MiB default", maxFrame)
 	}
 }
 

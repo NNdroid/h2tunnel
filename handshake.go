@@ -31,7 +31,13 @@ const (
 	defaultKeepaliveSec   = 15
 	maxWindowKB           = 65536
 	maxHandshakeAckMs     = 30000
-	maxKeepaliveSec       = 3600
+	// maxKeepaliveSec is the ceiling for the client's keepalive interval — and
+	// therefore for the server's backup-lane hold time, which waits 3× it. 300s
+	// aligns it with the heartbeat ceiling: a backup stream idles at most 15
+	// minutes instead of 3 hours. Deliberate breaking change (no wire or config
+	// compat): an old peer negotiating more is clamped to the default here, so
+	// upgrade both sides together.
+	maxKeepaliveSec = 300
 )
 
 // resumeCaps is the capability set (for intersection computation).

@@ -177,27 +177,16 @@ func getXTarget(r *http.Request) string {
 	return target
 }
 
-func getXDst(r *http.Request) (string, string) {
-	network := getXNetwork(r)
-	target := getXTarget(r)
-
-	if target == "" || !isValidTargetAddr(target) { // fall back to a default when empty/invalid
-		switch network {
-		case "udp":
-			target = "127.0.0.1:53" // DNS
-		default:
-			target = "127.0.0.1:22" // SSH
-		}
-	}
-
-	return network, target
-}
-
-func getRequestDestination(r *http.Request, cfg serverConfig) (string, string) {
-	if cfg.TargetDialer != nil {
-		return getXNetwork(r), strings.TrimSpace(getXTarget(r))
-	}
-	return getXDst(r)
+// getRequestDestination resolves the routing target for the legacy (non-MASQUE)
+// data plane: the X-Network / X-Target headers verbatim. It is fail-closed like
+// the MASQUE resolver (see masqueRequestTarget): the historical default
+// substitution — the server's own localhost SSH (127.0.0.1:22) or DNS
+// (127.0.0.1:53) for an empty or invalid X-Target — is gone, because those
+// substitutes cleared checkTargetIsAvailable and, over loopback, the local_only
+// check too. An unusable target now reaches the runtime policy as-is and is
+// rejected with 403.
+func getRequestDestination(r *http.Request, _ serverConfig) (string, string) {
+	return getXNetwork(r), strings.TrimSpace(getXTarget(r))
 }
 
 func setXNetwork(h http.Header, network string) {
@@ -351,20 +340,30 @@ func parseMasqueTarget(protocol, reqPath string) (string, error) {
 }
 
 // --- QUIC VarInt (called extremely often; keep only severe error logs) ---
+
+// putVarInt encodes val into dst (which must have room for 8 bytes) and
+// returns the encoded length. writeUDPCapsule uses it to batch several varints
+// into one Write; writeVarInt is its writer-facing form.
+func putVarInt(dst []byte, val uint64) int {
+	switch {
+	case val <= 0x3f:
+		dst[0] = byte(val)
+		return 1
+	case val <= 0x3fff:
+		binary.BigEndian.PutUint16(dst[:2], uint16(val)|0x4000)
+		return 2
+	case val <= 0x3fffffff:
+		binary.BigEndian.PutUint32(dst[:4], uint32(val)|0x80000000)
+		return 4
+	default:
+		binary.BigEndian.PutUint64(dst[:8], val|0xc000000000000000)
+		return 8
+	}
+}
+
 func writeVarInt(w io.Writer, val uint64) error {
 	var buf [8]byte
-	if val <= 0x3f {
-		buf[0] = byte(val)
-		return writeAll(w, buf[:1])
-	} else if val <= 0x3fff {
-		binary.BigEndian.PutUint16(buf[:2], uint16(val)|0x4000)
-		return writeAll(w, buf[:2])
-	} else if val <= 0x3fffffff {
-		binary.BigEndian.PutUint32(buf[:4], uint32(val)|0x80000000)
-		return writeAll(w, buf[:4])
-	}
-	binary.BigEndian.PutUint64(buf[:], val|0xc000000000000000)
-	return writeAll(w, buf[:])
+	return writeAll(w, buf[:putVarInt(buf[:], val)])
 }
 
 func varIntLen(val uint64) int {
@@ -380,21 +379,42 @@ func varIntLen(val uint64) int {
 	}
 }
 
-func readVarInt(r io.Reader) (uint64, error) {
-	var b [1]byte
-	if _, err := io.ReadFull(r, b[:]); err != nil {
+// udpDecodeScratch pools the byte scratch and LimitedReader used while
+// decoding UDP capsules and packets: one warm-pool object per datagram loop
+// instead of a LimitedReader plus 2-4 escaping varint buffers per packet.
+// The old make-per-varint and hdr-array both escaped to the heap because the
+// buffers cross an io.Reader interface call.
+type udpDecodeScratch struct {
+	scratch [8]byte
+	lr      io.LimitedReader
+}
+
+var udpDecodeScratchPool = sync.Pool{New: func() any { return new(udpDecodeScratch) }}
+
+func getUDPDecodeScratch() *udpDecodeScratch {
+	return udpDecodeScratchPool.Get().(*udpDecodeScratch)
+}
+
+func putUDPDecodeScratch(s *udpDecodeScratch) {
+	s.lr.R = nil // drop the body reference before recycle
+	udpDecodeScratchPool.Put(s)
+}
+
+// readVarInt reads a QUIC varint through scratch (at least 8 bytes, caller
+// owned) so the hot decode loops allocate nothing.
+func readVarInt(r io.Reader, scratch []byte) (uint64, error) {
+	if _, err := io.ReadFull(r, scratch[:1]); err != nil {
 		return 0, err
 	}
-	prefix := b[0] >> 6
+	prefix := scratch[0] >> 6
 	length := 1 << prefix
-	val := uint64(b[0] & 0x3f)
+	val := uint64(scratch[0] & 0x3f)
 
 	if length > 1 {
-		buf := make([]byte, length-1)
-		if _, err := io.ReadFull(r, buf); err != nil {
+		if _, err := io.ReadFull(r, scratch[1:length]); err != nil {
 			return 0, err
 		}
-		for _, v := range buf {
+		for _, v := range scratch[1:length] {
 			val = (val << 8) | uint64(v)
 		}
 	}
@@ -446,6 +466,15 @@ func capsulePaddingForTarget(dataWireLen, target int) int {
 	return padLen
 }
 
+// writeUDPCapsule emits one CONNECT-UDP datagram plus its optional padding
+// capsule. Wire order: [padding capsule][DATAGRAM capsule].
+//
+// Small datagrams (DNS, DHCP, game ticks — the hot case) assemble header,
+// padding and payload into one pooled buffer so the whole emission rides ONE
+// w.Write: on the h2 carrier every Write is a DATA frame (plus a flush/syscall
+// on the pipe path), and the old per-varint writes turned one datagram into
+// 4-7 frames. Only datagrams too big for the pool fall back to separate
+// header/payload writes, sparing the 64KB memcpy.
 func writeUDPCapsule(w io.Writer, p []byte, padding paddingPolicy) error {
 	if len(p) > maxTunnelUDPPayload {
 		return fmt.Errorf("UDP payload > %d", maxTunnelUDPPayload)
@@ -457,40 +486,66 @@ func writeUDPCapsule(w io.Writer, p []byte, padding paddingPolicy) error {
 	if addPadding {
 		padLen = capsulePaddingForTarget(dataWireLen, target)
 	}
+
 	// Unknown capsule types are ignored by the peer. Keeping padding in its own
 	// capsule preserves the CONNECT-UDP datagram payload exactly.
+	var hdr [16]byte
+	hdrLen := 0
+	hdrLen += putVarInt(hdr[hdrLen:], 0x00)             // DATAGRAM capsule type
+	hdrLen += putVarInt(hdr[hdrLen:], uint64(1+len(p))) // capsule length = context ID + payload
+	hdrLen += putVarInt(hdr[hdrLen:], 0x00)             // context ID
+	total := hdrLen + len(p)
 	if addPadding {
-		if err := writeVarInt(w, paddingCapsuleType); err != nil {
-			return err
+		total += varIntLen(paddingCapsuleType) + varIntLen(uint64(padLen)) + padLen
+	}
+
+	if total <= udpBufPoolLen {
+		bufPtr := udpBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		n := 0
+		if addPadding {
+			n += putVarInt(buf[n:], paddingCapsuleType)
+			n += putVarInt(buf[n:], uint64(padLen))
+			fillPadding(buf[n : n+padLen])
+			n += padLen
 		}
-		if err := writeVarInt(w, uint64(padLen)); err != nil {
+		copy(buf[n:], hdr[:hdrLen])
+		n += hdrLen
+		copy(buf[n:], p)
+		err := writeAll(w, buf[:n+len(p)])
+		udpBufPool.Put(bufPtr)
+		return err
+	}
+
+	// Oversized datagram: padding capsule then datagram, headers batched where
+	// they are adjacent. Two-to-three writes instead of the old four-to-seven.
+	if addPadding {
+		var padHdr [8]byte
+		n := putVarInt(padHdr[:], paddingCapsuleType)
+		n += putVarInt(padHdr[n:], uint64(padLen))
+		if err := writeAll(w, padHdr[:n]); err != nil {
 			return err
 		}
 		if err := writePadding(w, padLen); err != nil {
 			return err
 		}
 	}
-
-	// Write the Datagram capsule (type 0x00).
-	if err := writeVarInt(w, 0x00); err != nil {
-		return err
-	}
-	if err := writeVarInt(w, uint64(1+len(p))); err != nil {
-		return err
-	}
-	if err := writeVarInt(w, 0x00); err != nil {
+	if err := writeAll(w, hdr[:hdrLen]); err != nil {
 		return err
 	}
 	return writeAll(w, p)
 }
 
 func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
+	s := getUDPDecodeScratch()
+	defer putUDPDecodeScratch(s)
+	s.lr.R = r
 	for {
-		capsuleType, err := readVarInt(r)
+		capsuleType, err := readVarInt(r, s.scratch[:])
 		if err != nil {
 			return 0, err
 		}
-		capsuleLen, err := readVarInt(r)
+		capsuleLen, err := readVarInt(r, s.scratch[:])
 		if err != nil {
 			return 0, err
 		}
@@ -498,22 +553,22 @@ func readUDPCapsule(r io.Reader, payloadBuf []byte) (int, error) {
 			return 0, fmt.Errorf("UDP capsule length %d exceeds limit %d", capsuleLen, maxCapsuleLen)
 		}
 
-		lr := &io.LimitedReader{R: r, N: int64(capsuleLen)}
+		s.lr.N = int64(capsuleLen)
 		if capsuleType == 0x00 {
-			contextID, err := readVarInt(lr)
+			contextID, err := readVarInt(&s.lr, s.scratch[:])
 			if err != nil {
 				return 0, err
 			}
 			if contextID == 0 {
-				if lr.N > int64(len(payloadBuf)) {
+				if s.lr.N > int64(len(payloadBuf)) {
 					return 0, fmt.Errorf("UDP capsule too large for buffer")
 				}
-				n, err := io.ReadFull(lr, payloadBuf[:lr.N]) // read straight into the pooled buffer, no GC
+				n, err := io.ReadFull(&s.lr, payloadBuf[:s.lr.N]) // read straight into the pooled buffer, no GC
 				return n, err
 			}
 		}
-		if lr.N > 0 {
-			io.Copy(io.Discard, lr)
+		if s.lr.N > 0 {
+			io.Copy(io.Discard, &s.lr)
 		}
 	}
 }
@@ -546,13 +601,14 @@ func writeUDPPacket(w io.Writer, p []byte, padding paddingPolicy) error {
 }
 
 func readUDPPacket(r io.Reader, payloadBuf []byte) (int, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+	s := getUDPDecodeScratch()
+	defer putUDPDecodeScratch(s)
+	if _, err := io.ReadFull(r, s.scratch[:4]); err != nil {
 		return 0, err
 	}
 
-	length := binary.BigEndian.Uint16(hdr[0:2])
-	padLen := binary.BigEndian.Uint16(hdr[2:4])
+	length := binary.BigEndian.Uint16(s.scratch[0:2])
+	padLen := binary.BigEndian.Uint16(s.scratch[2:4])
 
 	if int(length) > len(payloadBuf) {
 		return 0, fmt.Errorf("UDP packet too large for buffer: %d", length)

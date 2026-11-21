@@ -129,6 +129,17 @@ type tunnelSession struct {
 	// ever send small frames.
 	uplinkBuf     []byte
 	uplinkFlushAt time.Time
+	// uplinkFlushTimer drives the batch tail flush with ONE timer + ONE resident
+	// consumer per bulk-sending session, created lazily on the first bulk frame
+	// and stopped in close. The old arm-per-batch time.AfterFunc spawned a fresh
+	// timer AND a fresh callback goroutine for every 128KiB batch — ≈950/s per
+	// session at bulk rates, most of them no-ops against a size-flushed buffer.
+	// Guarded by writeMu, like the batch buffer above. uplinkFlushStop is built
+	// in the constructor (readable under s.mu in close) and may be nil for
+	// white-box fixtures.
+	uplinkFlushTimer *time.Timer
+	uplinkFlushArmed bool
+	uplinkFlushStop  chan struct{}
 
 	// uplinkAccepted is the continuity reference for incoming uplink seqs: the
 	// highest accepted frame end, advancing as frames are admitted (before they
@@ -530,7 +541,7 @@ func (s *tunnelSession) appendUplinkLocked(conn net.Conn, data []byte) error {
 		// request that ends mid-batch stalls the target until the app writes
 		// again. At bulk rates the 128KiB size flush fires long before this
 		// timer, so it only ever runs for the sub-target tail.
-		time.AfterFunc(uplinkFlushDelay, s.flushExpiredUplink)
+		s.armUplinkFlushLocked()
 	}
 	s.uplinkBuf = append(s.uplinkBuf, data...)
 	if len(s.uplinkBuf) >= uplinkFlushTargetBytes {
@@ -590,16 +601,53 @@ func (s *tunnelSession) flushUplinkLocked(conn net.Conn) error {
 	return s.writeUplinkConfirmed(conn, data)
 }
 
-// flushExpiredUplink is the batch timer callback: it flushes a batch that has
-// outlived uplinkFlushDelay. TryLock keeps the callback out of the way when a
-// writer is active (it flushes anyway) and prevents timer goroutines from
-// piling up behind a stalled target write. Best effort: bytes that cannot be
-// flushed stay uncommitted and the client replays them.
-func (s *tunnelSession) flushExpiredUplink() {
-	if !s.writeMu.TryLock() {
-		return
+// armUplinkFlushLocked lazily starts the tail-flush timer + consumer (bulk
+// sessions only — interactive-only sessions never touch the batch) and
+// schedules the next fire. Caller holds writeMu.
+func (s *tunnelSession) armUplinkFlushLocked() {
+	if s.uplinkFlushTimer == nil {
+		s.uplinkFlushTimer = time.NewTimer(uplinkFlushDelay)
+		go s.uplinkFlushLoop(s.uplinkFlushStop)
 	}
-	defer s.writeMu.Unlock()
+	if !s.uplinkFlushArmed {
+		s.uplinkFlushArmed = true
+		s.uplinkFlushTimer.Reset(uplinkFlushDelay)
+	}
+}
+
+// uplinkFlushLoop consumes the batch tail-flush timer. The invariant: while
+// uplinkBuf is non-empty, exactly one timer fire is pending. A fire that lands
+// on a non-empty, unexpired batch reschedules the remainder. A nil stop
+// (white-box fixture without the constructor-built channel) means the consumer
+// runs for the process lifetime, which is what those fixtures want anyway.
+func (s *tunnelSession) uplinkFlushLoop(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-s.uplinkFlushTimer.C:
+		}
+		s.writeMu.Lock()
+		if len(s.uplinkBuf) > 0 {
+			if d := time.Until(s.uplinkFlushAt); d <= 0 {
+				s.flushExpiredUplinkLocked()
+			} else {
+				// The fire was consumed before the batch's new deadline: the
+				// arm path skipped its Reset, so schedule the remainder here.
+				s.uplinkFlushTimer.Reset(d)
+			}
+		}
+		s.uplinkFlushArmed = false
+		s.writeMu.Unlock()
+	}
+}
+
+// flushExpiredUplinkLocked flushes a batch that has outlived uplinkFlushDelay.
+// Best effort: bytes that cannot be flushed stay uncommitted and the client
+// replays them. Caller holds writeMu — the single consumer never queues behind
+// a stalled target write the way the old stacked AfterFunc callbacks did, so
+// the TryLock is gone.
+func (s *tunnelSession) flushExpiredUplinkLocked() {
 	if len(s.uplinkBuf) == 0 || time.Now().Before(s.uplinkFlushAt) {
 		return
 	}
@@ -637,6 +685,17 @@ func (s *tunnelSession) flushPendingUplink() error {
 
 // sessionTable is the server-side session table (instance-level, owned by a
 // Server; embedded libraries do not share tables across Servers).
+// maxProbeStreamsPerPrincipal caps concurrent probe/backup streams (the
+// X-Resume-Role=backup lanes that never dial and never create a business
+// session) per principal, across all of that principal's connections. The
+// session caps bound business sessions, not these dial-less keepalive streams;
+// without the quota one authenticated principal could park unbounded goroutines
+// and 64KB frame buffers for up to 3× its keepalive interval each. 32 is far
+// above what any real client holds (its standby lanes plus transient resume
+// probes — NewClient caps StandbyConnections at the same number) and far below
+// the fan-out a flood would produce.
+const maxProbeStreamsPerPrincipal = 32
+
 type sessionTable struct {
 	events            *serverEventSink
 	logger            *slog.Logger
@@ -644,6 +703,7 @@ type sessionTable struct {
 	mu                sync.Mutex
 	sessions          map[string]*tunnelSession
 	perPrincipal      map[string]int // active session count per principal (for the per-principal cap)
+	probeStreams      map[string]int // concurrent probe/backup streams per principal (their only cap)
 	idleTimeout       time.Duration
 	maxSessions       int // global cap on concurrent sessions (0 = unlimited)
 	maxPerPrincipal   int // per-principal cap (0 = unlimited)
@@ -661,6 +721,35 @@ type sessionBinding struct {
 
 func (b sessionBinding) matches(other sessionBinding) bool {
 	return b.network == other.network && b.target == other.target && b.principalID == other.principalID
+}
+
+// acquireProbeStream takes one probe-stream slot for the principal; false means
+// the quota is exhausted and the stream must be refused. Probe streams bypass
+// the session caps entirely (no dial, no business session), so this quota is
+// their only per-principal bound.
+func (t *sessionTable) acquireProbeStream(principalID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.probeStreams[principalID] >= maxProbeStreamsPerPrincipal {
+		return false
+	}
+	if t.probeStreams == nil {
+		t.probeStreams = make(map[string]int)
+	}
+	t.probeStreams[principalID]++
+	return true
+}
+
+// releaseProbeStream returns the slot taken by acquireProbeStream; safe to call
+// for an unknown principal.
+func (t *sessionTable) releaseProbeStream(principalID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n := t.probeStreams[principalID]; n <= 1 {
+		delete(t.probeStreams, principalID)
+	} else {
+		t.probeStreams[principalID] = n - 1
+	}
 }
 
 var errSessionIDRequired = errors.New("resume session id is required")
@@ -781,6 +870,7 @@ func (t *sessionTable) getOrCreateBound(id string, binding sessionBinding, dialT
 		binding:           binding,
 		frameW:            frameW,
 		frameR:            frameR,
+		uplinkFlushStop:   make(chan struct{}),
 	}
 	if !datagram {
 		s.downlinkRing = newRingBuffer(sizeKB)
@@ -904,6 +994,11 @@ func (s *tunnelSession) close() {
 	if !s.closed {
 		s.closed = true
 		s.signalWriterChangedLocked()
+		// Stop the tail-flush consumer: production sessions always carry the
+		// constructor-built channel; white-box fixtures may not have one.
+		if s.uplinkFlushStop != nil {
+			close(s.uplinkFlushStop)
+		}
 	}
 	s.targetCloseOnce.Do(func() {
 		if s.targetConn != nil {

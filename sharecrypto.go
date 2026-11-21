@@ -38,14 +38,24 @@ type shareEnvelope struct {
 	C string `json:"c"`
 }
 
-// generateRandomPIN returns a random 6-digit PIN string, identical to ShareCryptoUtils.generateRandomPIN.
-// Numeric only, so UTF-8 and Java's char[] (ISO-8859-1) encodings are byte-identical during PBKDF2.
+// generateRandomPIN returns a random 9-digit PIN string, same shape as
+// ShareCryptoUtils.generateRandomPIN (Stun Android / TV client). Numeric only,
+// so UTF-8 and Java's char[] (ISO-8859-1) encodings are byte-identical during
+// PBKDF2, and the length is invisible to the format: the PIN travels
+// out-of-band, so both sides simply key PBKDF2 with the same string.
+//
+// Nine digits is a deliberate stopgap: the PIN is the only gate on the offline
+// brute force of a captured stun:// URI, and 10^9 candidates at the frozen
+// 10k PBKDF2 iterations moves that attack from GPU-seconds to GPU-days. The
+// iteration count itself is pinned by the Android reference implementation
+// (see the sync note above) — a v2 envelope with a stronger KDF is the real
+// fix and needs that client to move first.
 func generateRandomPIN() string {
-	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
+	n, err := rand.Int(rand.Reader, big.NewInt(1000000000))
 	if err != nil {
-		return "000000"
+		return "000000000"
 	}
-	return fmt.Sprintf("%06d", n.Int64())
+	return fmt.Sprintf("%09d", n.Int64())
 }
 
 func gzipData(b []byte) ([]byte, error) {

@@ -287,6 +287,50 @@ func runResumeWTTry(sessionID string, serverUplink, clientDownlink *uint64,
 	return runResumeWTTryContext(context.Background(), sessionID, serverUplink, clientDownlink, localConn, ringBuf, cfg, wtManager, nil, nil)
 }
 
+// wtClientHandshake performs the client's layer-B handshake on a fresh WT
+// stream: send the HANDSHAKE frame (payload = this stream's clientDownlink
+// refill point — WT has no per-stream HTTP headers) and read the HANDSHAKE-ACK.
+// The ACK payload is the server's committed uplink watermark: one WT session
+// serves many business streams and each resumes from a different offset, so
+// the value cannot live in the CONNECT headers — it arrives once per stream.
+// Without it the client replays its ring from 0, and once the ring has rolled
+// past 0 that is an unrecoverable gap rather than a wasted retransmit.
+// present=false means the payload was empty or unparseable (a server that
+// predates the field) and the caller keeps its previous value.
+func wtClientHandshake(stream *webtransport.Stream, cfg clientConfig, clientDownlink uint64, lg *slog.Logger) (watermark uint64, present bool, err error) {
+	payload := strconv.FormatUint(clientDownlink, 10)
+	if err = writeFrame(stream, resumeFrameHandshake, 0, []byte(payload), cfg.Padding.paddingFor(resumeHeaderLen+len(payload))); err != nil {
+		lgWarnf(lg, "[Resume/WT] ❌ failed to write HANDSHAKE control frame: %v", err)
+		return 0, false, err
+	}
+	hsBufPtr := getFrameBuf()
+	hsBuf := *hsBufPtr
+	typ, _, n, readErr := readFrame(stream, hsBuf)
+	// Copy the payload out before the buffer returns to the pool: another
+	// goroutine may overwrite it the moment it is handed back.
+	var ackPayload string
+	if n > 0 {
+		ackPayload = string(hsBuf[:n])
+	}
+	putFrameBuf(hsBufPtr)
+	if readErr != nil {
+		lgWarnf(lg, "[Resume/WT] ❌ failed to read HANDSHAKE-ACK: %v", readErr)
+		return 0, false, readErr
+	}
+	if typ != resumeFrameHandshakeAck {
+		lgWarnf(lg, "[Resume/WT] ❌ expected HANDSHAKE-ACK, got frame 0x%02x", typ)
+		return 0, false, errors.New("h2tunnel: invalid WebTransport handshake response")
+	}
+	if ackPayload == "" {
+		return 0, false, nil
+	}
+	v, errParse := strconv.ParseUint(ackPayload, 10, 64)
+	if errParse != nil {
+		return 0, false, nil
+	}
+	return v, true, nil
+}
+
 func runResumeWTTryContext(parent context.Context, sessionID string, serverUplink, clientDownlink *uint64,
 	localConn net.Conn, ringBuf *resumeClientRingBuf, cfg clientConfig,
 	wtManager *wtSessionManager, onReady func(), force <-chan struct{},
@@ -355,39 +399,12 @@ func runResumeWTTryContext(parent context.Context, sessionID string, serverUplin
 	defer stream.Close()
 
 	// ===== layer-B handshake: HANDSHAKE frame payload carries clientDownlink, wait for HANDSHAKE-ACK =====
-	payload := strconv.FormatUint(*clientDownlink, 10)
-	if err := writeFrame(stream, resumeFrameHandshake, 0, []byte(payload), cfg.Padding.paddingFor(resumeHeaderLen+len(payload))); err != nil {
-		lgWarnf(cfg.lg(), "[Resume/WT] ❌ failed to write HANDSHAKE control frame: %v", err)
-		return false, err
+	watermark, present, hsErr := wtClientHandshake(stream, cfg, *clientDownlink, cfg.lg())
+	if hsErr != nil {
+		return false, hsErr
 	}
-	hsBufPtr := getFrameBuf()
-	hsBuf := *hsBufPtr
-	typ, _, n, err := readFrame(stream, hsBuf)
-	// Copy the payload out before the buffer returns to the pool: another
-	// goroutine may overwrite it the moment it is handed back.
-	var ackPayload string
-	if n > 0 {
-		ackPayload = string(hsBuf[:n])
-	}
-	putFrameBuf(hsBufPtr)
-	if err != nil {
-		lgWarnf(cfg.lg(), "[Resume/WT] ❌ failed to read HANDSHAKE-ACK: %v", err)
-		return false, err
-	}
-	if typ != resumeFrameHandshakeAck {
-		lgWarnf(cfg.lg(), "[Resume/WT] ❌ expected HANDSHAKE-ACK, got frame 0x%02x", typ)
-		return false, errors.New("h2tunnel: invalid WebTransport handshake response")
-	}
-	// The ACK payload is the server's committed uplink watermark. One WT session
-	// serves many business streams and each resumes from a different offset, so
-	// the value cannot live in the CONNECT headers — it arrives once per stream.
-	// Without it the client replays its ring from 0, and once the ring has rolled
-	// past 0 that is an unrecoverable gap rather than a wasted retransmit. An
-	// empty payload is a server that predates the field; keep the previous value.
-	if ackPayload != "" {
-		if v, errParse := strconv.ParseUint(ackPayload, 10, 64); errParse == nil {
-			*serverUplink = v
-		}
+	if present {
+		*serverUplink = watermark
 	}
 	lgInfof(cfg.lg(), "[Resume/WT] ✅ layer-B handshake confirmed (clientDownlink=%d serverUplink=%d)", *clientDownlink, *serverUplink)
 	if onReady != nil {
@@ -481,29 +498,26 @@ func resumeRecvLoopWT(stream io.Reader, localConn net.Conn, clientDownlink *uint
 }
 
 // ---> server WT: dispatch each business stream to the resume/2 session table (resumable across drops)
-func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg serverConfig, wtServer *webtransport.Server, sessions *sessionTable) {
-	network, target := getRequestDestination(r, cfg)
-	if !targetAllowedByRuntime(cfg, target) {
-		lgWarnf(sessions.lg(), "[%s] 🚫 Access denied for target address: %s", sessionID, target)
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-
+// negotiateWTLayerA validates the resume/2 headers and runs the layer-A
+// (version / capabilities / params) negotiation, writing the confirmation
+// response headers. ok=false means the response is already written (status +
+// X-Resume-Error) and the request must not be upgraded.
+func negotiateWTLayerA(w http.ResponseWriter, r *http.Request, cfg serverConfig, sessionID string, lg *slog.Logger) (resumeParams, bool) {
 	// resume/2 is the only data plane: WT also goes through the resume session
 	// table uniformly (resumable across drops). Layer-A negotiation headers
 	// (X-Tunnel-Proto / X-Session-ID / X-Resume-Version/Caps/Params) are
 	// carried by the client in the WebTransport CONNECT request and can be
 	// read and validated before Upgrade.
 	if r.Header.Get("X-Tunnel-Proto") != resumeFrameTypeResume {
-		lgWarnf(sessions.lg(), "[%s] ❌ WT request lacks resume/2 headers, rejecting (v1 removed)", sessionID)
+		lgWarnf(lg, "[%s] ❌ WT request lacks resume/2 headers, rejecting (v1 removed)", sessionID)
 		w.Header().Set("X-Resume-Error", resumeErrVersionUnsupported.String())
 		http.Error(w, "resume/2 required", http.StatusUpgradeRequired)
-		return
+		return resumeParams{}, false
 	}
 	if err := validateSessionID(r.Header.Get("X-Session-ID")); err != nil {
 		w.Header().Set("X-Resume-Error", resumeErrInvalidParams.String())
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return resumeParams{}, false
 	}
 
 	// ===== layer-A handshake: version / capabilities / params negotiation =====
@@ -511,9 +525,9 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 	negotiated := negotiateVersion(clientVersion, 2)
 	if negotiated == 0 {
 		w.Header().Set("X-Resume-Error", resumeErrVersionUnsupported.String())
-		lgWarnf(sessions.lg(), "[%s] ❌ version negotiation failed: client=%d server=2", sessionID, clientVersion)
+		lgWarnf(lg, "[%s] ❌ version negotiation failed: client=%d server=2", sessionID, clientVersion)
 		http.Error(w, "resume version unsupported", http.StatusUpgradeRequired)
-		return
+		return resumeParams{}, false
 	}
 	clientCaps := parseCaps(r.Header.Get("X-Resume-Caps"))
 	serverCaps := serverCapabilities(cfg)
@@ -529,6 +543,107 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 	w.Header().Set("X-Resume-Caps", caps.String())
 	w.Header().Set("X-Resume-Params", params.String())
 	w.Header().Set("X-Resume-Ack", "ok")
+	return params, true
+}
+
+// serveWTStream serves one accepted WT stream as an independent resume data
+// plane, resumed with the same X-Session-ID. Backup (probe) streams get no
+// target dial and no business session — only the A+B handshake + KEEPALIVE.
+func serveWTStream(s *webtransport.Stream, sID string, r *http.Request, cfg serverConfig,
+	sessions *sessionTable, params resumeParams, datagram bool, network, target string,
+) {
+	// Backup (probe) line: no target dial, no business session, only
+	// the A+B handshake + KEEPALIVE.
+	if r.Header.Get("X-Resume-Role") == "backup" {
+		// Same quota as the h2 backup lane: probe streams bypass the session
+		// caps entirely, so this is their only per-principal bound.
+		principalID := requestState(r).principal.ID
+		if !sessions.acquireProbeStream(principalID) {
+			lgWarnf(sessions.lg(), "[%s] 🚫 probe-stream quota exhausted for principal %q, resetting the stream", sID, principalID)
+			s.CancelWrite(1)
+			return
+		}
+		defer sessions.releaseProbeStream(principalID)
+
+		writer := &resumeSessionWriter{w: s, padding: cfg.Padding}
+		if !datagram {
+			if !doServerHandshakeAck(s, writer, params.handshakeAckMs, sID, sessions.lg()) {
+				return
+			}
+		}
+		serveBackupKeepaliveOnly(s, writer, params, sID, sessions.lg())
+		return
+	}
+
+	dialTarget := func() (net.Conn, error) {
+		return dialTargetForRequest(r, cfg, network, target)
+	}
+	sess, isNew, err := sessions.prepareResumeSession(r, dialTarget, cfg.SessionWindow)
+	if err != nil {
+		lgErrorf(sessions.lg(), "[%s] ❌ WT Resume dial failed: %v", sID, err)
+		s.CancelWrite(1)
+		return
+	}
+	if cfg.stats != nil {
+		if isNew {
+			cfg.stats.SessionsCreated.Add(1)
+		} else {
+			cfg.stats.SessionsResumed.Add(1)
+		}
+	}
+	if cfg.events != nil {
+		kind := ServerEventSessionOpened
+		if !isNew {
+			kind = ServerEventSessionResumed
+		}
+		cfg.events.dispatch(ServerEvent{
+			Kind:       kind,
+			SessionID:  sID,
+			Target:     target,
+			Network:    Network(network),
+			Transport:  TransportWebTransport,
+			Principal:  requestState(r).principal,
+			RemoteAddr: clientIP(r),
+		})
+	}
+	if isNew {
+		lgInfof(sessions.lg(), "[%s] 🆕 WT Resume new session established | Target: %s (%s, %s)", sID, target, network, modeLabel(datagram))
+	} else {
+		lgInfof(sessions.lg(), "[%s] 🔄 WT Resume existing session recovered | Target: %s (%s, %s)", sID, target, network, modeLabel(datagram))
+	}
+
+	writer := &resumeSessionWriter{w: s, padding: cfg.Padding}
+	// Note: mounting the activeWriter happens in serveResumeDataPlane
+	// only after the layer-B handshake completes, so the downlinkPump
+	// never writes DATA frames into the new stream before the
+	// HANDSHAKE-ACK (the client's first frame must be HANDSHAKE-ACK).
+	serverUplink, hasServerUplink := sess.uplinkCommitted()
+	var clientDownlink uint64
+	handshakeDone := false
+	if !datagram {
+		cd, ok := doWTStreamHandshake(s, writer, params.handshakeAckMs, sID, serverUplink, hasServerUplink, sessions.lg())
+		if !ok {
+			return
+		}
+		clientDownlink = cd
+		handshakeDone = true
+	}
+	serveResumeDataPlane(sess, s, writer, params, clientDownlink, sID, handshakeDone, sess.clearActiveWriter)
+	s.CancelRead(0)
+}
+
+func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID string, cfg serverConfig, wtServer *webtransport.Server, sessions *sessionTable) {
+	network, target := getRequestDestination(r, cfg)
+	if !targetAllowedByRuntime(cfg, target) {
+		lgWarnf(sessions.lg(), "[%s] 🚫 Access denied for target address: %s", sessionID, target)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	params, ok := negotiateWTLayerA(w, r, cfg, sessionID, sessions.lg())
+	if !ok {
+		return
+	}
 
 	session, err := wtServer.Upgrade(w, r)
 	if err != nil {
@@ -538,7 +653,6 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 	lgInfof(sessions.lg(), "[%s] ✅ WT Session established | Target: %s (%s)", sessionID, target, network)
 
 	datagram := network == "udp"
-	isBackup := r.Header.Get("X-Resume-Role") == "backup"
 
 	// Each accepted stream costs one goroutine, one 64KB frame buffer and, on a
 	// primary stream, a target dial. The session caps bound sessions, not
@@ -563,80 +677,10 @@ func handleWebTransportServer(w http.ResponseWriter, r *http.Request, sessionID 
 		}
 
 		streamID := fmt.Sprintf("%s-ST%d", sessionID, time.Now().UnixNano()%10000)
-
-		// Each WT stream is an independent resume data plane, resumed with the
-		// same X-Session-ID.
 		go func(s *webtransport.Stream, sID string) {
 			defer func() { <-streams }()
 			defer s.Close()
-			// Backup (probe) line: no target dial, no business session, only
-			// the A+B handshake + KEEPALIVE.
-			if isBackup {
-				writer := &resumeSessionWriter{w: s, padding: cfg.Padding}
-				if !datagram {
-					if !doServerHandshakeAck(s, writer, params.handshakeAckMs, sID, sessions.lg()) {
-						return
-					}
-				}
-				serveBackupKeepaliveOnly(s, writer, params, sID, sessions.lg())
-				return
-			}
-
-			dialTarget := func() (net.Conn, error) {
-				return dialTargetForRequest(r, cfg, network, target)
-			}
-			sess, isNew, err := sessions.prepareResumeSession(r, dialTarget, cfg.SessionWindow)
-			if err != nil {
-				lgErrorf(sessions.lg(), "[%s] ❌ WT Resume dial failed: %v", sID, err)
-				s.CancelWrite(1)
-				return
-			}
-			if cfg.stats != nil {
-				if isNew {
-					cfg.stats.SessionsCreated.Add(1)
-				} else {
-					cfg.stats.SessionsResumed.Add(1)
-				}
-			}
-			if cfg.events != nil {
-				kind := ServerEventSessionOpened
-				if !isNew {
-					kind = ServerEventSessionResumed
-				}
-				cfg.events.dispatch(ServerEvent{
-					Kind:       kind,
-					SessionID:  sID,
-					Target:     target,
-					Network:    Network(network),
-					Transport:  TransportWebTransport,
-					Principal:  requestState(r).principal,
-					RemoteAddr: clientIP(r),
-				})
-			}
-			if isNew {
-				lgInfof(sessions.lg(), "[%s] 🆕 WT Resume new session established | Target: %s (%s, %s)", sID, target, network, modeLabel(datagram))
-			} else {
-				lgInfof(sessions.lg(), "[%s] 🔄 WT Resume existing session recovered | Target: %s (%s)", sID, target, modeLabel(datagram))
-			}
-
-			writer := &resumeSessionWriter{w: s, padding: cfg.Padding}
-			// Note: mounting the activeWriter happens in serveResumeDataPlane
-			// only after the layer-B handshake completes, so the downlinkPump
-			// never writes DATA frames into the new stream before the
-			// HANDSHAKE-ACK (the client's first frame must be HANDSHAKE-ACK).
-			serverUplink, hasServerUplink := sess.uplinkCommitted()
-			var clientDownlink uint64
-			handshakeDone := false
-			if !datagram {
-				cd, ok := doWTStreamHandshake(s, writer, params.handshakeAckMs, sID, serverUplink, hasServerUplink, sessions.lg())
-				if !ok {
-					return
-				}
-				clientDownlink = cd
-				handshakeDone = true
-			}
-			serveResumeDataPlane(sess, s, writer, params, clientDownlink, sID, handshakeDone, sess.clearActiveWriter)
-			s.CancelRead(0)
+			serveWTStream(s, sID, r, cfg, sessions, params, datagram, network, target)
 		}(stream, streamID)
 	}
 }
@@ -712,6 +756,126 @@ func handshakeAckPayload(serverUplink uint64, present bool) []byte {
 	return []byte(strconv.FormatUint(serverUplink, 10))
 }
 
+// ensureWTUDPStream returns a live session and stream for the next attempt.
+// ok=false means the round consumed a backoff (retry the loop) or hit a
+// terminal condition: err != nil is terminal (fatal tunnel error / AutoRedial
+// exhausted / done-or-ctx fired inside the backoff), err == nil with ok=false
+// is a retriable failure whose backoff already ran. A failed stream open drops
+// the session so the next round re-evaluates it (revive or redial) instead of
+// hammering a dead one.
+func ensureWTUDPStream(ctx context.Context, cfg clientConfig, mgr *wtSessionManager,
+	session *webtransport.Session, attempt int, done <-chan struct{},
+) (*webtransport.Session, *webtransport.Stream, bool, error) {
+	// Session-level self-heal: when the WT session dies, GetSession promotes the
+	// backup or dials now.
+	if session == nil || session.Context().Err() != nil {
+		sess, err := mgr.GetSession(ctx)
+		if err != nil {
+			if isFatalTunnelError(err) || (!cfg.AutoRedial && isPermanentTunnelError(err)) {
+				return nil, nil, false, err
+			}
+			if !backoffWTUDP(ctx, cfg, done, attempt) {
+				return nil, nil, false, wtUDPTerminalErr(ctx)
+			}
+			return session, nil, false, nil
+		}
+		session = sess
+	}
+	dctx, dcancel := context.WithCancel(ctx)
+	if cfg.RedialBudget > 0 {
+		dctx, dcancel = context.WithTimeout(ctx, cfg.RedialBudget)
+	}
+	stream, err := session.OpenStreamSync(dctx)
+	dcancel()
+	if err != nil {
+		session = nil
+		if !backoffWTUDP(ctx, cfg, done, attempt) {
+			return nil, nil, false, wtUDPTerminalErr(ctx)
+		}
+		return session, nil, false, nil
+	}
+	return session, stream, true, nil
+}
+
+// runWTUDPAttempt drives one stream's attempt lifecycle: uplink packets from
+// the queue, downlink datagrams from the stream, converging when either side
+// fails or done/ctx fires — both goroutines exit before the return, so the
+// next round starts with a single upstream consumer. The side errors feed the
+// reconnect event.
+func runWTUDPAttempt(ctx context.Context, cfg clientConfig, stream *webtransport.Stream,
+	upstream *datagramQueue, packet *virtualPacketConn, done <-chan struct{},
+) (upErr, downErr error) {
+	// attempt lifecycle: when either side fails or done/ctx fires, over()
+	// closes the stream and converges.
+	attemptDone := make(chan struct{})
+	var overOnce sync.Once
+	over := func() {
+		overOnce.Do(func() {
+			close(attemptDone)
+			_ = stream.Close()
+		})
+	}
+	upExited := make(chan struct{})
+	downExited := make(chan struct{})
+	go func() {
+		defer close(upExited)
+		for {
+			select {
+			case <-attemptDone:
+				return
+			case pkt := <-upstream.packets:
+				err := writeUDPPacket(stream, pkt.Data, cfg.Padding)
+				if err == nil && cfg.stats != nil {
+					cfg.stats.UplinkBytes.Add(int64(len(pkt.Data)))
+				}
+				releaseDatagram(pkt)
+				if err != nil {
+					upErr = err
+					over()
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		defer close(downExited)
+		// deliver() copies, so a pooled scratch buffer is safe here; it lives
+		// only as long as this goroutine.
+		bufPtr := getFrameBuf()
+		buf := *bufPtr
+		defer putFrameBuf(bufPtr)
+		for {
+			n, err := readUDPPacket(stream, buf)
+			if err != nil {
+				downErr = err
+				over()
+				return
+			}
+			// deliver failure (local side already closed) also converges;
+			// when done is closed the main loop treats it as local close.
+			if err := packet.deliver(buf[:n]); err != nil {
+				downErr = err
+				over()
+				return
+			}
+			if cfg.stats != nil {
+				cfg.stats.DownlinkBytes.Add(int64(n))
+			}
+		}
+	}()
+
+	select {
+	case <-attemptDone:
+	case <-done:
+		over()
+	case <-ctx.Done():
+		over()
+	}
+	<-upExited
+	<-downExited
+	return upErr, downErr
+}
+
 // runWTUDPDatagramLoop is the redial loop for the WT-UDP datagram plane. The
 // first stream is opened synchronously by the caller (DialPacketContext's
 // ready semantics); this loop owns the rest of the lifecycle: after a stream
@@ -719,7 +883,9 @@ func handshakeAckPayload(serverUplink uint64, present bool) []byte {
 // socket by X-Session-ID (no seq replay — UDP is unordered; uplink packets
 // arriving during the redial gap queue up). When redials are exhausted,
 // AutoRedial decides revive or terminate; RedialBudget only constrains each
-// stream-open's dialing phase.
+// stream-open's dialing phase. The loop delegates to ensureWTUDPStream (one
+// round of session revival + stream open, with its backoff) and
+// runWTUDPAttempt (one stream's up/down lifecycle).
 func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionManager,
 	packet *virtualPacketConn, session *webtransport.Session, firstStream *webtransport.Stream,
 	upstream *datagramQueue, done <-chan struct{}, force <-chan struct{},
@@ -757,111 +923,21 @@ func runWTUDPDatagramLoop(ctx context.Context, cfg clientConfig, mgr *wtSessionM
 		}
 
 		if stream == nil {
-			// Open a new stream (session-level self-heal: when the WT session
-			// dies, GetSession promotes the backup or dials now).
-			if session == nil || session.Context().Err() != nil {
-				session = nil
-				sess, err := mgr.GetSession(ctx)
-				if err != nil {
-					if isFatalTunnelError(err) || (!cfg.AutoRedial && isPermanentTunnelError(err)) {
-						return err
-					}
-					if !backoffWTUDP(ctx, cfg, done, attempt) {
-						return wtUDPTerminalErr(ctx)
-					}
-					continue
-				}
-				session = sess
-			}
-			dctx, dcancel := context.WithCancel(ctx)
-			if cfg.RedialBudget > 0 {
-				dctx, dcancel = context.WithTimeout(ctx, cfg.RedialBudget)
-			}
-			s, err := session.OpenStreamSync(dctx)
-			dcancel()
+			var ok bool
+			var err error
+			session, stream, ok, err = ensureWTUDPStream(ctx, cfg, mgr, session, attempt, done)
 			if err != nil {
-				session = nil
-				if !backoffWTUDP(ctx, cfg, done, attempt) {
-					return wtUDPTerminalErr(ctx)
-				}
+				return err
+			}
+			if !ok {
 				continue
 			}
-			stream = s
 			current.Store(stream)
 		}
 		lgInfof(cfg.lg(), "[WT-UDP:%s] ✅ tunnel ready", cfg.TargetAddr)
 
-		// attempt lifecycle: when either side fails or done/ctx fires, over()
-		// closes the stream and converges; the next round starts only after
-		// both goroutines exit (guaranteeing a single upstream consumer).
-		attemptDone := make(chan struct{})
-		var overOnce sync.Once
-		over := func() {
-			overOnce.Do(func() {
-				close(attemptDone)
-				_ = stream.Close()
-			})
-		}
 		readyAt := time.Now()
-		var upErr, downErr error
-		upExited := make(chan struct{})
-		downExited := make(chan struct{})
-		go func() {
-			defer close(upExited)
-			for {
-				select {
-				case <-attemptDone:
-					return
-				case pkt := <-upstream.packets:
-					err := writeUDPPacket(stream, pkt.Data, cfg.Padding)
-					if err == nil && cfg.stats != nil {
-						cfg.stats.UplinkBytes.Add(int64(len(pkt.Data)))
-					}
-					releaseDatagram(pkt)
-					if err != nil {
-						upErr = err
-						over()
-						return
-					}
-				}
-			}
-		}()
-		go func() {
-			defer close(downExited)
-			// deliver() copies, so a pooled scratch buffer is safe here; it lives
-			// only as long as this goroutine.
-			bufPtr := getFrameBuf()
-			buf := *bufPtr
-			defer putFrameBuf(bufPtr)
-			for {
-				n, err := readUDPPacket(stream, buf)
-				if err != nil {
-					downErr = err
-					over()
-					return
-				}
-				// deliver failure (local side already closed) also converges;
-				// when done is closed the main loop treats it as local close.
-				if err := packet.deliver(buf[:n]); err != nil {
-					downErr = err
-					over()
-					return
-				}
-				if cfg.stats != nil {
-					cfg.stats.DownlinkBytes.Add(int64(n))
-				}
-			}
-		}()
-
-		select {
-		case <-attemptDone:
-		case <-done:
-			over()
-		case <-ctx.Done():
-			over()
-		}
-		<-upExited
-		<-downExited
+		upErr, downErr := runWTUDPAttempt(ctx, cfg, stream, upstream, packet, done)
 		current.Store(nil)
 		stream = nil
 		if time.Since(readyAt) >= resumeStableInterval {

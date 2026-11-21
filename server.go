@@ -210,6 +210,11 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 	r, authErr = authenticateServerRequest(r, cfg, tr.transport)
 	if authErr != nil {
 		lgWarnf(cfg.lg(), "[%s] 🚫 authentication failed: access denied (IP: %s)", sessionID, clientPhysicalAddr)
+		// AuthFailures is a documented ServerStats counter; without this line it
+		// would read 0 forever and feed a false all-clear into monitoring.
+		if cfg.stats != nil {
+			cfg.stats.AuthFailures.Add(1)
+		}
 		if cfg.events != nil {
 			cfg.events.dispatch(ServerEvent{
 				Kind:       ServerEventAuthRejected,
@@ -300,6 +305,13 @@ func routeTunnelRequest(w http.ResponseWriter, r *http.Request, cfg serverConfig
 
 func serveResumeDataPlane(sess *tunnelSession, up io.Reader, writer *resumeSessionWriter, params resumeParams, clientDownlink uint64, sessionID string, handshakeAlreadyDone bool, clearWriter func(*resumeSessionWriter)) {
 	datagram := sess.datagram
+
+	// Read-ahead merges the 16-byte frame-header read with the payload read
+	// into one body hop; r.Body is exclusively owned for the whole function
+	// (handshake + data-plane reads), so buffering ahead is safe.
+	frameReader := getFrameReader(up)
+	defer putFrameReader(frameReader)
+	up = frameReader
 
 	if !datagram && !handshakeAlreadyDone {
 		if !doServerHandshakeAck(up, writer, params.handshakeAckMs, sessionID, sess.lg()) {

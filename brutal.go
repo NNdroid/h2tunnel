@@ -69,10 +69,10 @@ const (
 	brutalCongestionName = "brutal"
 
 	// brutalBwExchangeTarget is the sentinel target carrying the explicit bandwidth
-	// exchange. An underscore-leading label is not a valid DNS name (RFC 952/1123),
-	// so it can never resolve to a real upstream even if the short-circuit were
-	// bypassed; it also fails isValidTargetAddr, which is why it must be matched
-	// before the legacy getXDst default-substitution runs.
+	// exchange. An underscore-leading label is not a valid DNS name (RFC 952/1123)
+	// and fails isValidTargetAddr, so it can never resolve to a real upstream even
+	// if the short-circuit were bypassed; the classifier must still match it
+	// before generic classification turns it into an ordinary (rejected) resume.
 	brutalBwExchangeTarget = "_BrutalBwExchange"
 
 	brutalDefaultCwndGain = 15 // tenths: 1.5x

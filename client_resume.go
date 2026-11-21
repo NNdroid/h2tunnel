@@ -614,6 +614,11 @@ func resumeRecvLoop(body io.Reader, localConn net.Conn, clientDownlink *uint64, 
 	payloadBufPtr := getFrameBuf()
 	payloadBuf := *payloadBufPtr
 	defer putFrameBuf(payloadBufPtr)
+	// Read-ahead merges the 16-byte frame-header read with the payload read
+	// into one body hop; the response body is exclusively owned by this loop.
+	frameReader := getFrameReader(body)
+	defer putFrameReader(frameReader)
+	body = frameReader
 	expected := *clientDownlink
 	for {
 		typ, seq, n, err := readFrame(body, payloadBuf)

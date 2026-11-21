@@ -343,8 +343,12 @@ func (s *udpSession) runOneStream() error {
 		bufPtr := udpBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer udpBufPool.Put(bufPtr)
+		// Read-ahead merges the per-capsule varint reads into one body hop;
+		// the response body is exclusively owned by this loop.
+		bodyReader := getFrameReader(resp.Body)
+		defer putFrameReader(bodyReader)
 		for {
-			n, rErr := s.frameR(resp.Body, buf)
+			n, rErr := s.frameR(bodyReader, buf)
 			if rErr != nil {
 				lgDebugf(s.cfg.lg(), "[UDP-Resume:%s] downlink read ended: %v", s.sessionID, rErr)
 				return

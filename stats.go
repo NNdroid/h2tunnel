@@ -62,11 +62,6 @@ type sessionCounters struct {
 	resumed  *atomic.Int64
 }
 
-func clientStatsPtr(o *ClientOptions) *ClientStats {
-	// dialCfg is a value copy; the stats pointer lets all copies share one set of counters.
-	return nil // filled in by NewClient (avoids an options import cycle)
-}
-
 func (c *Client) Stats() *ClientStats { return &c.stats.client }
 
 func (s *Server) Stats() *ServerStats {

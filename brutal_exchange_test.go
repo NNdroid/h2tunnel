@@ -28,8 +28,7 @@ func TestBrutalSentinelIsMatchedBeforeDefaultSubstitution(t *testing.T) {
 	}
 
 	// The serverConfig here deliberately has no TargetDialer, so
-	// getRequestDestination takes the getXDst fallback and would substitute a
-	// real address for an unrecognized target.
+	// getRequestDestination resolves X-Target verbatim (fail-closed).
 	cfg := serverConfig{}
 
 	tr := classifyTunnelRequest(mk(brutalBwExchangeTarget), cfg, false)
@@ -46,14 +45,16 @@ func TestBrutalSentinelIsMatchedBeforeDefaultSubstitution(t *testing.T) {
 		t.Fatalf("sentinel transport = %q, want the resume carrier label", tr.transport)
 	}
 
-	// A missing target takes the legacy fallback path and must NOT be treated as
-	// a bandwidth exchange: only the exact sentinel string qualifies.
+	// A missing target must NOT be treated as a bandwidth exchange: only the
+	// exact sentinel string qualifies. It stays empty (fail-closed) and is
+	// rejected downstream with 403 instead of being substituted with a real
+	// address.
 	tr = classifyTunnelRequest(mk(""), cfg, false)
 	if tr.kind == kindBrutalExchange {
 		t.Fatalf("a request without a target must not become a bandwidth exchange: %+v", tr)
 	}
-	if tr.target != "127.0.0.1:22" {
-		t.Fatalf("fallback target = %q, want 127.0.0.1:22", tr.target)
+	if tr.target != "" {
+		t.Fatalf("empty target = %q, want it to stay empty (fail-closed)", tr.target)
 	}
 
 	// Near misses must not qualify either. Surrounding whitespace is trimmed
